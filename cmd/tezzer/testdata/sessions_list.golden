@@ -1,0 +1,6 @@
+SESSION ID                      NAME COMMAND         ROWS COLS  CLIENTS STATUS DETACHED            LAST ACTIVE CREATED
+sess-AAAAAAAAAAAAAAAA           work zsh               24   80        2 active -                   -           2026-01-02 03:04:05
+  - UDS (c1)
+  - UDP (c2) from 198.51.100.2:40000 [UDP ClientID=1234 Addrs=[198.51.100.2:40000]]
+sess-BBBBBBBBBBBBBBBB           -    vim               50  120        0 closed 2026-01-02 03:10:00 -           2026-01-02 03:04:05
+sess-CCCCCCCCCCCCCCCCCCCCCCCCCC -    long-running-command-name   10   40        1 active -                   -           2026-01-02 03:04:05

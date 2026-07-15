@@ -1,0 +1,318 @@
+#!/bin/bash
+# tezzer-ssh: SSH経由Tezzer接続ラッパースクリプト (サブコマンド方式)
+#
+# このスクリプトは以下を自動的に行います:
+# 1. リモートでtezzerdを起動（まだ起動していない場合）
+# 2. SSH Unix Socket フォワーディングを設定
+# 3. tezzerクライアントを起動（UDP通信も自動的に有効化）
+#
+# 使い方:
+#   tezzer-ssh <target> <subcommand> [options...] [-- <cmd> [args...]]
+#
+# 例:
+#   tezzer-ssh example-host run -- screen -RxU
+#   tezzer-ssh example-host run --ipv4-only -- screen -RxU
+#   tezzer-ssh example-host run --name work -- zsh
+#   tezzer-ssh example-host list
+#   tezzer-ssh example-host resume
+#   tezzer-ssh example-host resume --session eQAJHANNIhFVZQ5lSKr0GQ
+#   tezzer-ssh example-host resume --name work
+#   tezzer-ssh example-host forward --name work -L 8080:localhost:3000
+#   tezzer-ssh example-host info --session eQAJHANNIhFVZQ5lSKr0GQ
+#   tezzer-ssh example-host kill --session eQAJHANNIhFVZQ5lSKr0GQ
+#   tezzer-ssh example-host wait --name build && notify-send done
+#   tezzer-ssh example-host peek --name agent
+
+set -euo pipefail
+
+TEZZER_CLIENT=${TEZZER_CLIENT:-tezzer}
+TEZZER_SERVER=${TEZZER_SERVER:-tezzerd}
+
+show_usage() {
+    cat >&2 <<'EOF'
+Usage: tezzer-ssh <target> <subcommand> [options...] [-- <cmd> [args...]]
+
+Arguments:
+  <target>      SSH host name from ~/.ssh/config
+  <subcommand>  One of: run, list, resume, forward, info, kill, wait, peek
+
+Subcommands:
+  run     Run a new tezzer session: tezzer-ssh HOST run [opts] -- CMD [args]
+          Example: tezzer-ssh example-host run --ipv4-only -- screen -RxU
+          With --name <name>, attach if the named session exists, else create it
+  list    List all tezzer sessions
+  resume  Attach to the most recent session (or specific via --session <id>,
+          or by name via --name <name>: attach-or-create)
+  forward Forward-only attach (no terminal; tezzer -N). Select the session via
+          --session <id> / --name <name> (default: most recent), plus -L specs:
+            tezzer-ssh example-host forward --name work -L 8080:localhost:3000
+  info    Show session info:  --session <id>
+  kill    Kill a session:     --session <id>
+  wait    Wait for the session command to exit; the exit code is propagated.
+          Select via --session <id> / --name <name> (default: most recent):
+            tezzer-ssh example-host wait --name build && notify-send done
+  peek    Read-only attach (tezzer -peek): view output but never send input.
+          Select via --session <id> / --name <name> (default: most recent)
+
+Environment Variables:
+  TEZZER_CLIENT   Path to tezzer client binary (default: tezzer)
+  TEZZER_SERVER   Path to tezzerd server binary (default: tezzerd)
+  TEZZER_INSTANCE Instance name for running side-by-side (e.g. "dev").
+                  Uses a separate remote socket (tezzer-<name>.sock) and a
+                  dedicated tezzerd started with -listen-unix, coexisting with
+                  the default instance. Combine with TEZZER_CLIENT/TEZZER_SERVER
+                  to point at a different build.
+                    Example: TEZZER_INSTANCE=dev TEZZER_SERVER=tezzerd-quic \
+                             TEZZER_CLIENT=tezzer-quic tezzer-ssh host resume
+EOF
+}
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+    show_usage; exit 0
+fi
+if [ $# -lt 2 ]; then
+    show_usage; exit 1
+fi
+
+SSH_TARGET="$1"
+SUBCOMMAND="$2"
+shift 2
+
+case "$SUBCOMMAND" in
+    run|list|resume|forward|info|kill|wait|peek) ;;
+    *)
+        echo "Error: Unknown subcommand '$SUBCOMMAND'" >&2
+        echo "" >&2
+        show_usage; exit 1 ;;
+esac
+
+# 引数処理
+TEZZER_OPTS=()
+CMD_ARGS=()
+
+if [ "$SUBCOMMAND" = "run" ]; then
+    MODE="tezzer_opts"
+    while [ $# -gt 0 ]; do
+        if [ "$1" = "--" ]; then
+            MODE="cmd"
+        elif [ "$MODE" = "tezzer_opts" ]; then
+            TEZZER_OPTS+=("$1")
+        else
+            CMD_ARGS+=("$1")
+        fi
+        shift
+    done
+    if [ ${#CMD_ARGS[@]} -eq 0 ]; then
+        echo "Error: 'run' subcommand requires a command after '--'" >&2
+        exit 1
+    fi
+else
+    TEZZER_OPTS=("$@")
+fi
+
+# ローカルソケットパスとControlMasterパスを設定
+if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "${XDG_RUNTIME_DIR:-}" ]; then
+    LOCAL_SOCKET="$XDG_RUNTIME_DIR/tezzer-ssh-$$.sock"
+    SSH_CONTROL_DIR="$XDG_RUNTIME_DIR/tezzer-ssh"
+else
+    LOCAL_SOCKET="/tmp/tezzer-ssh-$$.sock"
+    SSH_CONTROL_DIR="/tmp/tezzer-ssh-${USER:-$(id -un)}"
+fi
+mkdir -p "$SSH_CONTROL_DIR"
+SSH_CONTROL_PATH="$SSH_CONTROL_DIR/control-${SSH_TARGET//\//_}"
+
+# クリーンアップ（EXIT時に実行）
+REUSE_MASTER=false
+SSH_FORWARD_PID=""
+REMOTE_SOCKET=""
+
+cleanup() {
+    rm -f "$LOCAL_SOCKET"
+    if [ "$REUSE_MASTER" = "false" ]; then
+        ssh -S "$SSH_CONTROL_PATH" -O exit "$SSH_TARGET" 2>/dev/null || true
+    elif [ -n "$SSH_FORWARD_PID" ]; then
+        kill "$SSH_FORWARD_PID" 2>/dev/null || true
+    elif [ -n "$REMOTE_SOCKET" ]; then
+        ssh -S "$SSH_CONTROL_PATH" -O cancel -L "$LOCAL_SOCKET:$REMOTE_SOCKET" "$SSH_TARGET" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+
+# インスタンス（prod/dev 共存用）。TEZZER_INSTANCE が空なら従来どおりの単一インスタンス。
+# 例: TEZZER_INSTANCE=dev TEZZER_SERVER=tezzerd-dev TEZZER_CLIENT=tezzer-dev \
+#       tezzer-ssh host run -- ...  で dev 用ソケット/プロセス/バイナリを使う。
+INSTANCE="${TEZZER_INSTANCE:-}"
+if [ -n "$INSTANCE" ]; then
+    REMOTE_SOCK_NAME="tezzer-$INSTANCE.sock"
+else
+    REMOTE_SOCK_NAME="tezzer.sock"
+fi
+
+# Step 1: tezzerd確認・起動 + リモートソケットパス取得（1回のSSH接続で実施）
+echo "Connecting to $SSH_TARGET..." >&2
+REMOTE_SOCKET=$(ssh "$SSH_TARGET" "
+    SOCK_DIR=\${XDG_RUNTIME_DIR:-\$HOME/.tezzer}
+    mkdir -p \"\$SOCK_DIR\"
+    SOCK_PATH=\"\$SOCK_DIR/$REMOTE_SOCK_NAME\"
+    if [ -n \"$INSTANCE\" ]; then
+        # 名前付きインスタンス: 専用ソケットで起動。-listen-unix をコマンドラインに含めるので
+        # pgrep -f でインスタンス単位に存在判定でき、既定の tezzerd と共存できる。
+        if ! pgrep -f -- \"-listen-unix \$SOCK_PATH\" > /dev/null 2>&1; then
+            echo \"Starting tezzerd (instance: $INSTANCE) on remote host...\" >&2
+            nohup $TEZZER_SERVER -listen-unix \"\$SOCK_PATH\" > \"\$SOCK_DIR/tezzerd-$INSTANCE.log\" 2>&1 &
+        fi
+    else
+        # 既定インスタンス: 従来どおり（挙動不変）。
+        if ! pgrep -u \"\$USER\" -x tezzerd > /dev/null 2>&1; then
+            echo 'Starting tezzerd on remote host...' >&2
+            nohup $TEZZER_SERVER > \"\$SOCK_DIR/tezzerd.log\" 2>&1 &
+        fi
+    fi
+    echo \"\$SOCK_PATH\"
+")
+
+# Step 2: SSH Unix Socket フォワーディングを開始
+echo "Setting up SSH socket forwarding..." >&2
+
+if ssh -S "$SSH_CONTROL_PATH" -O check "$SSH_TARGET" 2>/dev/null; then
+    REUSE_MASTER=true
+    echo "Reusing existing SSH connection..." >&2
+    if ! ssh -S "$SSH_CONTROL_PATH" -O forward -L "$LOCAL_SOCKET:$REMOTE_SOCKET" "$SSH_TARGET" 2>/dev/null; then
+        echo "Setting up dedicated forwarding connection..." >&2
+        ssh -S none -fNT -L "$LOCAL_SOCKET:$REMOTE_SOCKET" "$SSH_TARGET" &
+        SSH_FORWARD_PID=$!
+    fi
+else
+    ssh -M -S "$SSH_CONTROL_PATH" -fNT -L "$LOCAL_SOCKET:$REMOTE_SOCKET" "$SSH_TARGET"
+fi
+
+# ソケットが作成されるまで待機（最大5秒）
+WAIT_COUNT=0
+until [ -S "$LOCAL_SOCKET" ] || [ "$WAIT_COUNT" -ge 10 ]; do
+    sleep 0.5
+    WAIT_COUNT=$((WAIT_COUNT + 1))
+done
+
+if [ ! -S "$LOCAL_SOCKET" ]; then
+    echo "Error: Failed to create local socket forwarding" >&2
+    exit 1
+fi
+echo "SSH socket forwarding established." >&2
+
+# Step 3: tezzerクライアントを起動
+export TEZZER_SOCKET="$LOCAL_SOCKET"
+
+case "$SUBCOMMAND" in
+    run)
+        TEZZER_ARGS=()
+        [ ${#TEZZER_OPTS[@]} -gt 0 ] && TEZZER_ARGS+=("${TEZZER_OPTS[@]}")
+        TEZZER_ARGS+=(-cmd "${CMD_ARGS[0]}" --)
+        [ ${#CMD_ARGS[@]} -gt 1 ] && TEZZER_ARGS+=("${CMD_ARGS[@]:1}")
+        $TEZZER_CLIENT "${TEZZER_ARGS[@]}"
+        ;;
+    list)
+        TEZZER_ARGS=(-list)
+        [ ${#TEZZER_OPTS[@]} -gt 0 ] && TEZZER_ARGS+=("${TEZZER_OPTS[@]}")
+        $TEZZER_CLIENT "${TEZZER_ARGS[@]}"
+        ;;
+    resume)
+        SESSION_ID=""
+        SESSION_NAME=""
+        EXTRA_OPTS=()
+        i=0
+        while [ "$i" -lt ${#TEZZER_OPTS[@]} ]; do
+            if [ "${TEZZER_OPTS[i]}" = "--session" ] && [ $((i+1)) -lt ${#TEZZER_OPTS[@]} ]; then
+                i=$((i+1))
+                SESSION_ID="${TEZZER_OPTS[i]}"
+            elif [ "${TEZZER_OPTS[i]}" = "--name" ] && [ $((i+1)) -lt ${#TEZZER_OPTS[@]} ]; then
+                i=$((i+1))
+                SESSION_NAME="${TEZZER_OPTS[i]}"
+            else
+                EXTRA_OPTS+=("${TEZZER_OPTS[i]}")
+            fi
+            i=$((i+1))
+        done
+        if [ -n "$SESSION_ID" ]; then
+            TEZZER_ARGS=(-session "$SESSION_ID")
+        elif [ -n "$SESSION_NAME" ]; then
+            # 名前で attach-or-create（クライアントの -name に委譲）
+            TEZZER_ARGS=(-name "$SESSION_NAME")
+        else
+            TEZZER_ARGS=(-resume)
+        fi
+        [ ${#EXTRA_OPTS[@]} -gt 0 ] && TEZZER_ARGS+=("${EXTRA_OPTS[@]}")
+        $TEZZER_CLIENT "${TEZZER_ARGS[@]}"
+        ;;
+    forward)
+        # 転送専用 attach（tezzer -N）。--session/--name でセッションを選び、
+        # 残りのオプション（-L 等）はそのままクライアントへ渡す
+        SESSION_ID=""
+        SESSION_NAME=""
+        EXTRA_OPTS=()
+        i=0
+        while [ "$i" -lt ${#TEZZER_OPTS[@]} ]; do
+            if [ "${TEZZER_OPTS[i]}" = "--session" ] && [ $((i+1)) -lt ${#TEZZER_OPTS[@]} ]; then
+                i=$((i+1))
+                SESSION_ID="${TEZZER_OPTS[i]}"
+            elif [ "${TEZZER_OPTS[i]}" = "--name" ] && [ $((i+1)) -lt ${#TEZZER_OPTS[@]} ]; then
+                i=$((i+1))
+                SESSION_NAME="${TEZZER_OPTS[i]}"
+            else
+                EXTRA_OPTS+=("${TEZZER_OPTS[i]}")
+            fi
+            i=$((i+1))
+        done
+        TEZZER_ARGS=(-N)
+        if [ -n "$SESSION_ID" ]; then
+            TEZZER_ARGS+=(-session "$SESSION_ID")
+        elif [ -n "$SESSION_NAME" ]; then
+            TEZZER_ARGS+=(-name "$SESSION_NAME")
+        else
+            TEZZER_ARGS+=(-resume)
+        fi
+        [ ${#EXTRA_OPTS[@]} -gt 0 ] && TEZZER_ARGS+=("${EXTRA_OPTS[@]}")
+        $TEZZER_CLIENT "${TEZZER_ARGS[@]}"
+        ;;
+    info)
+        if [ ${#TEZZER_OPTS[@]} -lt 2 ] || [ "${TEZZER_OPTS[0]}" != "--session" ]; then
+            echo "Error: 'info' subcommand requires --session <id>" >&2; exit 1
+        fi
+        $TEZZER_CLIENT -info "${TEZZER_OPTS[1]}"
+        ;;
+    kill)
+        if [ ${#TEZZER_OPTS[@]} -lt 2 ] || [ "${TEZZER_OPTS[0]}" != "--session" ]; then
+            echo "Error: 'kill' subcommand requires --session <id>" >&2; exit 1
+        fi
+        $TEZZER_CLIENT -kill "${TEZZER_OPTS[1]}"
+        ;;
+    wait|peek)
+        # 終了待ち（tezzer -wait）/ 読み取り専用 attach（tezzer -peek）。
+        # --session/--name でセッションを選び、未指定なら最新セッション（-resume）
+        SESSION_ID=""
+        SESSION_NAME=""
+        EXTRA_OPTS=()
+        i=0
+        while [ "$i" -lt ${#TEZZER_OPTS[@]} ]; do
+            if [ "${TEZZER_OPTS[i]}" = "--session" ] && [ $((i+1)) -lt ${#TEZZER_OPTS[@]} ]; then
+                i=$((i+1))
+                SESSION_ID="${TEZZER_OPTS[i]}"
+            elif [ "${TEZZER_OPTS[i]}" = "--name" ] && [ $((i+1)) -lt ${#TEZZER_OPTS[@]} ]; then
+                i=$((i+1))
+                SESSION_NAME="${TEZZER_OPTS[i]}"
+            else
+                EXTRA_OPTS+=("${TEZZER_OPTS[i]}")
+            fi
+            i=$((i+1))
+        done
+        TEZZER_ARGS=(-$SUBCOMMAND)
+        if [ -n "$SESSION_ID" ]; then
+            TEZZER_ARGS+=(-session "$SESSION_ID")
+        elif [ -n "$SESSION_NAME" ]; then
+            TEZZER_ARGS+=(-name "$SESSION_NAME")
+        else
+            TEZZER_ARGS+=(-resume)
+        fi
+        [ ${#EXTRA_OPTS[@]} -gt 0 ] && TEZZER_ARGS+=("${EXTRA_OPTS[@]}")
+        $TEZZER_CLIENT "${TEZZER_ARGS[@]}"
+        ;;
+esac

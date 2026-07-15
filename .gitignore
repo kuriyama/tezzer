@@ -1,0 +1,49 @@
+# Binaries
+bin/
+bin.dev/
+dist/
+/qtermd
+/qtermc
+/tezzerd
+/tezzer
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Go workspace file
+go.work
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Session logs
+.session.log
+.session-result.log
+
+# Debug files (but allow debug_test.go files)
+debug_*.go
+!**/*debug_test.go
+
+# Claude Code
+.claude/
+.cl-title
+
+# Test results
+test-result-*.txt
+test-output-*.txt
+test_result.txt

@@ -1,0 +1,30 @@
+# nfpm（https://nfpm.goreleaser.com）による deb / rpm パッケージ定義。
+# make dist から GOARCH / DIST_VERSION を環境変数で渡して呼ばれる想定。
+# nfpm は contents.src では環境変数を展開しないため、対象アーキテクチャの
+# バイナリは make 側で dist/.nfpm/ に置いてから nfpm を呼ぶ。
+name: tezzer
+arch: ${GOARCH}
+platform: linux
+version: ${DIST_VERSION}
+section: net
+priority: optional
+maintainer: Jun Kuriyama <kuriyama@s2factory.co.jp>
+homepage: https://github.com/kuriyama/tezzer
+license: Apache-2.0
+description: |
+  Lightweight, SSH-like terminal transport with persistent sessions
+  and automatic reconnection.
+# mode はソースの umask に依存させず 0755 に固定する
+contents:
+  - src: dist/.nfpm/tezzer
+    dst: /usr/bin/tezzer
+    file_info:
+      mode: 0755
+  - src: dist/.nfpm/tezzerd
+    dst: /usr/bin/tezzerd
+    file_info:
+      mode: 0755
+  - src: scripts/tezzer-ssh
+    dst: /usr/bin/tezzer-ssh
+    file_info:
+      mode: 0755

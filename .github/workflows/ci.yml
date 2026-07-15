@@ -1,0 +1,25 @@
+name: ci
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '17 18 * * 1'  # 毎週月曜 (UTC) に nightly
+jobs:
+  ci:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - run: make ci
+  ci-nightly:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - run: make ci-nightly
