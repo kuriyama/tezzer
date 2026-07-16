@@ -22,10 +22,16 @@ protocol and command-line interface may change without notice until 1.0.
   in-flight TCP connections alive across sleep/roaming, and tunnel definitions
   survive full reconnects. Binds are loopback-only by design; disable
   server-wide with `tezzerd --no-tcp-forwarding`. Dial targets are logged on
-  the server. See docs/dev/port-forwarding.md and docs/security-model.md.
+  the server. See docs/security-model.md.
 - Named sessions: `tezzer -name work` attaches the session named "work" if it
   exists, otherwise creates it (like `tmux new -A -s work`). Names are unique
   among active sessions. `tezzer-ssh` supports `run --name` / `resume --name`,
   and names appear in `-list` / `-info` (including JSON output).
 - `tezzer -list -json` / `tezzer -info <id> -json`: machine-readable JSON output
   for scripting (status bars, prompts, monitoring). Timestamps are RFC3339.
+- STUN discovery now queries IPv4 and IPv6 independently and reports every
+  address family that succeeds, instead of whichever one the OS resolver
+  happened to pick. `SESSION_CREATED.stun_addr` (single string) is replaced by
+  `stun_addrs` (list, 0–2 entries); this increases the initial-connection
+  candidate set on dual-stack hosts. `--ipv4-only` still disables the IPv6
+  query on both client and server.

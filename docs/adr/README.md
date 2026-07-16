@@ -8,6 +8,7 @@ philosophy is in [../design-philosophy.md](../design-philosophy.md).
 |---|---|
 | [0001](0001-no-vt-emulation.md) | No virtual-terminal emulation; relay PTY output verbatim |
 | [0002](0002-no-disk-persistence.md) | No disk persistence; bounded in-memory buffers only |
-| [0003](0003-custom-reliable-udp-not-kcp.md) | Keep the custom reliable-UDP layer instead of adopting KCP |
+| [0003](0003-custom-reliable-udp-not-kcp.md) | Keep the custom reliable-UDP layer instead of adopting KCP — *superseded by 0006* |
 | [0004](0004-no-upnp.md) | No UPnP automatic port mapping (for now) |
-| [0005](0005-output-retransmit-session-layer-fallback.md) | Recover aged-out output from the session-layer ring buffer |
+| [0005](0005-output-retransmit-session-layer-fallback.md) | Recover aged-out output from the session-layer ring buffer — *superseded by 0006* |
+| [0006](0006-adopt-quic.md) | Replace the custom reliable-UDP layer with QUIC (quic-go) |

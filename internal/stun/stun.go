@@ -47,7 +47,8 @@ const (
 type Client struct {
 	ServerAddr string
 	Timeout    time.Duration
-	IPv4Only   bool // IPv4のみ使用する場合true
+	IPv4Only   bool   // IPv4のみ使用する場合true（Networkが空の場合のみ参照）
+	Network    string // "udp4"/"udp6" で family を明示指定。空なら IPv4Only を見て "udp"/"udp4" を選ぶ
 }
 
 // NewClient は新しいSTUNクライアントを作成します。
@@ -60,9 +61,11 @@ func NewClient(serverAddr string) *Client {
 
 // GetMappedAddr はSTUNサーバーに問い合わせて、NAT越しの公開アドレスを取得します。
 func (c *Client) GetMappedAddr() (*net.UDPAddr, error) {
-	// UDP接続を作成（IPv4Onlyの場合はudp4を使用）
+	// UDP接続を作成（Network指定があれば優先、なければIPv4Onlyの場合にudp4を使用）
 	network := "udp"
-	if c.IPv4Only {
+	if c.Network != "" {
+		network = c.Network
+	} else if c.IPv4Only {
 		network = "udp4"
 	}
 	conn, err := net.DialTimeout(network, c.ServerAddr, c.Timeout)

@@ -20,8 +20,8 @@ emulation or screen management. If an application works correctly over raw SSH,
 it is expected to work the same way over tezzer.
 
 tezzer focuses on being a transparent transport layer while providing better
-observability — especially for its encrypted UDP transport (packet loss,
-reordering, local drops, RTT).
+observability — especially for its QUIC transport (packet loss, reordering,
+local drops, RTT).
 
 > **If raw SSH would not do it, tezzer should not do it either.**
 
@@ -39,11 +39,12 @@ session requires the same SSH access you already have. Details in the
 
 - SSH-like behavior and compatibility
 - Verbatim PTY output forwarding (no escape-sequence rewriting, no VT emulation)
-- Works naturally with full-screen apps such as `less`, `vim`, `tmux`, `screen`
+- Works naturally with full-screen apps such as `less`, `vim`, `tmux`, `zellij`, `screen`
 - Persistent sessions that survive client disconnects
 - Automatic reconnection with session resume, across sleep and roaming
-- Encrypted UDP transport (AES-256-GCM) with NAT traversal, plus a Unix-domain-socket
-  control channel (forwarded over SSH for remote use)
+- QUIC over UDP (TLS 1.3, mutual key pinning bootstrapped through SSH) with NAT
+  traversal, plus a Unix-domain-socket control channel (forwarded over SSH for
+  remote use)
 - TCP port forwarding (`-L`) whose tunnels survive sleep and roaming
 - Transport-level observability
 
@@ -161,7 +162,7 @@ tezzer-ssh <ssh-target> <subcommand> [options] [-- <cmd> [args...]]
 Subcommands:
 
 ```bash
-tezzer-ssh myserver run -- screen -RxU   # run a new session
+tezzer-ssh myserver run -- tmux new -A   # run a new session
 tezzer-ssh myserver run --name work -- zsh   # named session (attach-or-create)
 tezzer-ssh myserver list                 # list sessions
 tezzer-ssh myserver resume               # attach the most recent session
@@ -173,7 +174,7 @@ tezzer-ssh myserver kill --session <id>
 tezzer-ssh myserver wait --name build    # block until the session command exits
                                          # (exit code propagated)
 tezzer-ssh myserver peek --name agent    # read-only attach (never sends input)
-tezzer-ssh myserver run --ipv4-only -- screen -RxU
+tezzer-ssh myserver run --ipv4-only -- tmux new -A
 ```
 
 ### Keyboard shortcuts (while connected)

@@ -296,9 +296,9 @@ func escapeKeyDisplay(b byte) string {
 type UDPInfo struct {
 	Port      int
 	Key       []byte
-	SessionID []byte // 共有UDPモード時のSessionID（nilの場合はセッションIDからハッシュを生成）
-	STUNAddr  string // サーバーのSTUN経由アドレス（NAT越え用）
-	LocalAddr string // サーバーのローカルアドレス（LAN内接続用）
+	SessionID []byte   // 共有UDPモード時のSessionID（nilの場合はセッションIDからハッシュを生成）
+	STUNAddrs []string // サーバーのSTUN経由アドレス候補（NAT越え用、family別）
+	LocalAddr string   // サーバーのローカルアドレス（LAN内接続用）
 }
 
 // udpInfoFromSessionCreated は SESSION_CREATED 応答（create/attach 共通）から
@@ -311,22 +311,33 @@ func udpInfoFromSessionCreated(m *proto.SessionCreatedMsg) *UDPInfo {
 		Port:      m.UDPPort,
 		Key:       m.UDPKey,
 		SessionID: m.UDPSessionID, // 共有UDPモード時のみ設定される
-		STUNAddr:  m.STUNAddr,
+		STUNAddrs: m.STUNAddrs,
 		LocalAddr: m.LocalAddr,
 	}
 }
 
-// buildUDPCandidateAddrs はサーバー情報とクライアント STUN アドレスから
+// buildUDPCandidateAddrs はサーバー情報とクライアント STUN アドレス候補から
 // 接続候補リストを生成する純粋関数。startUDPManager と候補リフレッシャーの両方で使用。
-func buildUDPCandidateAddrs(udpInfo *UDPInfo, clientSTUNAddr string) []string {
+func buildUDPCandidateAddrs(udpInfo *UDPInfo, clientSTUNAddrs []string) []string {
 	var candidates []string
 
+	// クライアント・サーバー双方に STUN アドレスがあり、どの family の組でも
+	// IP が一致しなければリモート接続とみなす（同一ホストなら少なくとも1つの
+	// family で一致するはず）。
 	isRemoteConnection := false
-	if clientSTUNAddr != "" && udpInfo.STUNAddr != "" {
-		clientIP, _, _ := net.SplitHostPort(clientSTUNAddr)
-		serverIP, _, _ := net.SplitHostPort(udpInfo.STUNAddr)
-		if clientIP != "" && serverIP != "" && clientIP != serverIP {
-			isRemoteConnection = true
+	if len(clientSTUNAddrs) > 0 && len(udpInfo.STUNAddrs) > 0 {
+		isRemoteConnection = true
+		for _, ca := range clientSTUNAddrs {
+			clientIP, _, _ := net.SplitHostPort(ca)
+			if clientIP == "" {
+				continue
+			}
+			for _, sa := range udpInfo.STUNAddrs {
+				serverIP, _, _ := net.SplitHostPort(sa)
+				if serverIP != "" && clientIP == serverIP {
+					isRemoteConnection = false
+				}
+			}
 		}
 	}
 
@@ -336,11 +347,13 @@ func buildUDPCandidateAddrs(udpInfo *UDPInfo, clientSTUNAddr string) []string {
 	if !isRemoteConnection && udpInfo.LocalAddr != "" && !strings.HasPrefix(udpInfo.LocalAddr, "127.") {
 		candidates = append(candidates, udpInfo.LocalAddr)
 	}
-	if udpInfo.STUNAddr != "" {
-		candidates = append(candidates, udpInfo.STUNAddr)
+	for _, addr := range udpInfo.STUNAddrs {
+		if addr != "" {
+			candidates = append(candidates, addr)
+		}
 	}
 	// 候補ゼロ（完全オフライン環境などで LocalAddr も STUN も取れない）の場合、
-	// 最後の頼みとして loopback を試す。ローカル利用（UDS 直結）ならこれで繋がる。
+	// 最後の頼みとして loopback を試す。ローカル利用(UDS 直結)ならこれで繋がる。
 	// サーバが実際には別ホストでも mTLS（K の pinning）検証で安全に失敗するだけ。
 	if len(candidates) == 0 && !isRemoteConnection {
 		candidates = append(candidates, fmt.Sprintf("127.0.0.1:%d", udpInfo.Port))
@@ -793,16 +806,15 @@ func (c *Client) startUDPManager(udsAddr string, udpInfo *UDPInfo) error {
 	}
 	clientID := binary.LittleEndian.Uint16(clientIDBytes[:])
 
-	// クライアント側もSTUNで自分の公開アドレスを取得（リモート接続判定 =
+	// クライアント側もSTUNで自分の公開アドレス候補を取得（リモート接続判定 =
 	// 候補アドレス生成にクライアントローカルで使うだけで、サーバへは送らない）
-	var clientSTUNAddr string
-	if udpInfo.STUNAddr != "" {
-		clientSTUN, err := c.getClientSTUNAddr()
-		if err != nil {
-			c.setStatusMessage(fmt.Sprintf("warning: failed to get client STUN address: %v", err))
+	var clientSTUNAddrs []string
+	if len(udpInfo.STUNAddrs) > 0 {
+		clientSTUNAddrs = c.getClientSTUNAddrs()
+		if len(clientSTUNAddrs) > 0 {
+			c.setStatusMessage(fmt.Sprintf("client STUN address: %s", strings.Join(clientSTUNAddrs, ", ")))
 		} else {
-			clientSTUNAddr = clientSTUN.String()
-			c.setStatusMessage(fmt.Sprintf("client STUN address: %s", clientSTUNAddr))
+			c.setStatusMessage("warning: failed to get client STUN address")
 		}
 	}
 
@@ -811,15 +823,7 @@ func (c *Client) startUDPManager(udsAddr string, udpInfo *UDPInfo) error {
 		c.setStatusMessage(fmt.Sprintf("warning: failed to send UDP client info: %v", err))
 	}
 
-	if c.isDebugEnabled() && clientSTUNAddr != "" && udpInfo.STUNAddr != "" {
-		clientIP, _, _ := net.SplitHostPort(clientSTUNAddr)
-		serverIP, _, _ := net.SplitHostPort(udpInfo.STUNAddr)
-		if clientIP != "" && serverIP != "" && clientIP != serverIP {
-			log.Printf("UDP: remote connection detected (client=%s, server=%s)", clientIP, serverIP)
-		}
-	}
-
-	candidateAddrs = buildUDPCandidateAddrs(udpInfo, clientSTUNAddr)
+	candidateAddrs = buildUDPCandidateAddrs(udpInfo, clientSTUNAddrs)
 
 	// 候補アドレスを常時ログ＆通知（debug 不要で「どのアドレス/ポートを叩いたか」を診断できる）
 	if len(candidateAddrs) > 0 {
@@ -910,11 +914,9 @@ func (c *Client) startUDPManager(udsAddr string, udpInfo *UDPInfo) error {
 	// reconnect がすべて失敗した場合のみ呼ばれる（通常 reconnect にはコスト増なし）。
 	udpInfoCopy := udpInfo // クロージャにコピーを渡す
 	ct.SetCandidatesRefresher(func() []string {
-		var clientSTUN string
-		if udpInfoCopy.STUNAddr != "" {
-			if addr, err := c.getClientSTUNAddr(); err == nil {
-				clientSTUN = addr.String()
-			}
+		var clientSTUN []string
+		if len(udpInfoCopy.STUNAddrs) > 0 {
+			clientSTUN = c.getClientSTUNAddrs()
 		}
 		fresh := buildUDPCandidateAddrs(udpInfoCopy, clientSTUN)
 		if len(fresh) > 0 {
@@ -953,15 +955,29 @@ func (c *Client) retryUDPManager(udsAddr string, udpInfo *UDPInfo) {
 	}
 }
 
-// getClientSTUNAddr はクライアント側のSTUNアドレスを取得
-// NAT hole punchingのために使用される
-func (c *Client) getClientSTUNAddr() (*net.UDPAddr, error) {
+// getClientSTUNAddrs はクライアント側のSTUNアドレス候補を family ごとに取得する
+// （NAT hole punching・接続候補生成のため。ipv4Only なら v4 のみ問い合わせる）。
+func (c *Client) getClientSTUNAddrs() []string {
+	var addrs []string
+	if addr, err := c.getClientSTUNAddr("udp4"); err == nil {
+		addrs = append(addrs, addr.String())
+	}
+	if !c.ipv4Only {
+		if addr, err := c.getClientSTUNAddr("udp6"); err == nil {
+			addrs = append(addrs, addr.String())
+		}
+	}
+	return addrs
+}
+
+// getClientSTUNAddr はクライアント側のSTUNアドレスを指定 family（"udp4"/"udp6"）で取得する。
+func (c *Client) getClientSTUNAddr(network string) (*net.UDPAddr, error) {
 	// STUN A/Bサーバー（Google STUN使用）
 	serverA := "stun.l.google.com:19302"
 	serverB := "stun1.l.google.com:19302"
 
 	stunClient := stun.NewClient(serverA)
-	stunClient.IPv4Only = c.ipv4Only
+	stunClient.Network = network
 
 	// NAT判別と公開アドレス取得
 	natType, mappedAddr, err := stunClient.DetectNATType(serverA, serverB)
@@ -980,12 +996,7 @@ func (c *Client) getClientSTUNAddr() (*net.UDPAddr, error) {
 		natTypeStr = "Unknown"
 	}
 
-	c.setStatusMessage(fmt.Sprintf("Client NAT type: %s", natTypeStr))
-
-	// IPv4Onlyモードでv6アドレスが返ってきた場合はエラー
-	if c.ipv4Only && mappedAddr.IP.To4() == nil {
-		return nil, fmt.Errorf("STUN returned IPv6 address but IPv4-only mode is enabled")
-	}
+	c.setStatusMessage(fmt.Sprintf("Client NAT type (%s): %s", network, natTypeStr))
 
 	return mappedAddr, nil
 }

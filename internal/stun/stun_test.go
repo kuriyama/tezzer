@@ -1,6 +1,7 @@
 package stun
 
 import (
+	"encoding/binary"
 	"net"
 	"testing"
 	"time"
@@ -90,44 +91,98 @@ func TestParseXorMappedAddress(t *testing.T) {
 	}
 }
 
-// TestGetMappedAddr は実際のSTUNサーバーへの接続をテストします。
-// ネットワーク接続が必要なため、環境によっては失敗する可能性があります。
+// TestGetMappedAddr はSTUNサーバーとの実際のUDP往復（Client.GetMappedAddr）を
+// テストします。外部ネットワークには依存せず、ループバック上に立てた最小の
+// STUNサーバー（startLoopbackStunServer）を使うため、隔離環境でも常に実行される。
 func TestGetMappedAddr(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping network test in short mode")
+	server := startLoopbackStunServer(t)
+
+	client := NewClient(server)
+	client.Timeout = 2 * time.Second
+
+	addr, err := client.GetMappedAddr()
+	if err != nil {
+		t.Fatalf("failed to get mapped addr from %s: %v", server, err)
 	}
 
-	// Google Public STUN serverを使用
-	servers := []string{
-		"stun.l.google.com:19302",
-		"stun1.l.google.com:19302",
+	if addr.IP == nil {
+		t.Errorf("got nil IP")
 	}
-
-	var lastErr error
-	for _, server := range servers {
-		client := NewClient(server)
-		client.Timeout = 10 * time.Second
-
-		addr, err := client.GetMappedAddr()
-		if err != nil {
-			lastErr = err
-			t.Logf("failed to get mapped addr from %s: %v", server, err)
-			continue
-		}
-
-		t.Logf("successfully got mapped address from %s: %v", server, addr)
-
-		if addr.IP == nil {
-			t.Errorf("got nil IP")
-		}
-		if addr.Port == 0 {
-			t.Errorf("got port 0")
-		}
-
-		// 成功したら終了
-		return
+	if addr.Port == 0 {
+		t.Errorf("got port 0")
 	}
+}
 
-	// すべてのサーバーで失敗した場合
-	t.Errorf("failed to get mapped addr from all servers, last error: %v", lastErr)
+// TestClientNetworkOverride は Client.Network を明示指定した場合に、
+// その family でダイヤルされることを確認する（v4/v6 個別STUN問い合わせの土台）。
+func TestClientNetworkOverride(t *testing.T) {
+	server := startLoopbackStunServer(t)
+
+	client := NewClient(server)
+	client.Network = "udp4"
+	client.Timeout = 2 * time.Second
+
+	addr, err := client.GetMappedAddr()
+	if err != nil {
+		t.Fatalf("GetMappedAddr with Network=udp4 failed: %v", err)
+	}
+	if addr.IP.To4() == nil {
+		t.Errorf("expected an IPv4 address, got %v", addr.IP)
+	}
+}
+
+// startLoopbackStunServer はテスト用の最小STUNサーバーをループバックに起動する。
+// 受け取ったBinding RequestのTransaction IDと送信元アドレスをそのまま使い、
+// XOR-MAPPED-ADDRESSにその送信元を詰めたBinding Success Responseを返すだけで、
+// 認証やNAT越しの実挙動など本来のSTUNサーバーの複雑さは扱わない。
+func startLoopbackStunServer(t *testing.T) string {
+	t.Helper()
+
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("failed to start loopback STUN server: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			n, src, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				return // Cleanup がconnを閉じたら終了
+			}
+			if n < HeaderSize {
+				continue
+			}
+			txID := append([]byte(nil), buf[8:20]...)
+			_, _ = conn.WriteToUDP(makeBindingSuccessResponse(txID, src), src)
+		}
+	}()
+
+	return conn.LocalAddr().String()
+}
+
+// makeBindingSuccessResponse はXOR-MAPPED-ADDRESS属性1つだけを持つ
+// Binding Success Response（IPv4限定）を組み立てる。makeBindingRequest /
+// parseBindingResponse の鏡像。
+func makeBindingSuccessResponse(txID []byte, addr *net.UDPAddr) []byte {
+	ip4 := addr.IP.To4()
+
+	attrValue := make([]byte, 8)
+	attrValue[1] = 0x01 // Family: IPv4
+	xport := uint16(addr.Port) ^ uint16(MagicCookie>>16)
+	binary.BigEndian.PutUint16(attrValue[2:4], xport)
+	xaddr := binary.BigEndian.Uint32(ip4) ^ MagicCookie
+	binary.BigEndian.PutUint32(attrValue[4:8], xaddr)
+
+	msgLen := 4 + len(attrValue) // attribute header + value
+	msg := make([]byte, HeaderSize+msgLen)
+	binary.BigEndian.PutUint16(msg[0:2], BindingResponse)
+	binary.BigEndian.PutUint16(msg[2:4], uint16(msgLen))
+	binary.BigEndian.PutUint32(msg[4:8], MagicCookie)
+	copy(msg[8:20], txID)
+	binary.BigEndian.PutUint16(msg[20:22], AttrXorMappedAddress)
+	binary.BigEndian.PutUint16(msg[22:24], uint16(len(attrValue)))
+	copy(msg[24:], attrValue)
+	return msg
 }

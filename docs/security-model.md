@@ -65,8 +65,7 @@ transport for a terminal you already have the right to use.
 ## TCP port forwarding (`-L`)
 
 `tezzer -L [bind:]port:host:hostport` forwards TCP connections over the QUIC
-connection; the server dials the target on behalf of the client
-(design: [docs/dev/port-forwarding.md](dev/port-forwarding.md)).
+connection; the server dials the target on behalf of the client.
 
 - **No new privilege.** A K holder already has the PTY (= arbitrary code
   execution); dialing from the server host is equivalent to running `curl` in

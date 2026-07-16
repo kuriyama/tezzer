@@ -33,7 +33,7 @@ tezzer intentionally does not implement:
 - **Disk persistence.** Restoring a running PTY process is not practical; a
   server restart loses sessions (use systemd or similar to auto-restart). See
   [ADR 0002](adr/0002-no-disk-persistence.md).
-- **Session multiplexing / window management.** That is left to tmux/screen.
+- **Session multiplexing / window management.** That is left to tmux/zellij/screen.
 - **Acting as a terminal UI framework.**
 - **Its own public-key authentication.** tezzer relies on SSH for that.
 - **Multi-host / cluster features.** Single host, single binary.

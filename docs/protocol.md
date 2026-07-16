@@ -9,10 +9,11 @@ tezzer has two channels:
   forwarding, and survives roaming, sleep, and NAT rebinding.
 
 The QUIC channel is **required** for terminal I/O on new sessions: the server
-withholds PTY startup until QUIC is established (this prevents terminal query
-responses, e.g. DA, from leaking down both paths), and aborts session creation
-with a `QUIC_TIMEOUT` error if QUIC is not up within 15 seconds
-(see [dev/da-response-leak.md](dev/da-response-leak.md)).
+withholds PTY startup until QUIC is established, and aborts session creation
+with a `QUIC_TIMEOUT` error if QUIC is not up within 15 seconds. This closes a
+window where a terminal query response (e.g. Device Attributes) sent to the
+still-UDS-only client could leak into the PTY a second time once QUIC came up
+and replayed the same output.
 
 > tezzer is pre-1.0: this protocol changes without notice.
 
@@ -54,7 +55,8 @@ Selected fields:
 - `ATTACH_SESSION.from_seq` — request output from this sequence number onward.
 - `SESSION_CREATED` carries the QUIC parameters: `udp_port`, `udp_key`
   (**K**, the 32-byte shared key distributed over the trusted control channel;
-  see [security-model.md](security-model.md)), `udp_session_id`, `stun_addr`,
+  see [security-model.md](security-model.md)), `udp_session_id`, `stun_addrs`
+  (0–2 STUN-derived candidate addresses, one per address family available),
   and `local_addr` (for same-LAN connections).
 - `UDP_CLIENT_INFO` — the client announces its 16-bit `client_id` and STUN
   address before dialing QUIC (needed for routing on a shared transport).
@@ -152,8 +154,7 @@ suspend).
 
 ### TCP port forwarding
 
-Design: [dev/port-forwarding.md](dev/port-forwarding.md); security notes in
-[security-model.md](security-model.md).
+Security notes: [security-model.md](security-model.md).
 
 For each accepted TCP connection the client opens a new bidi stream and sends
 `FwdOpen{msg: "host:port"}`. The server dials the target (timeout 10 s),

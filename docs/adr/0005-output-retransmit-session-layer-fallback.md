@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted.
+Superseded by [0006](0006-adopt-quic.md): the UDP send buffer and NACK-based
+recovery this decision was about no longer exist under QUIC. The ring-buffer
+recovery idea survives in a different form — see 0006's Consequences.
 
 ## Context
 

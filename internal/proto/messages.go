@@ -120,8 +120,10 @@ type SessionCreatedMsg struct {
 	// InitialOutput: PTYが即座に終了した場合のバッファ出力（envコマンド等の非インタラクティブコマンド用）
 	InitialOutput []byte `msgpack:"initial_output,omitempty"`
 	// UDP接続アドレス情報
-	STUNAddr  string `msgpack:"stun_addr,omitempty"`  // STUN経由で取得したサーバーの公開アドレス（例: "203.0.113.1:54321"）
-	LocalAddr string `msgpack:"local_addr,omitempty"` // サーバーのローカルアドレス（LAN内接続用、例: "192.168.1.10"）
+	// STUNAddrs: STUN経由で取得したサーバーの公開アドレス候補（family別、最大2件:
+	// IPv4/IPv6。片方の family が利用不可なら省かれる。例: ["203.0.113.1:54321", "[2001:db8::1]:54321"]）
+	STUNAddrs []string `msgpack:"stun_addrs,omitempty"`
+	LocalAddr string   `msgpack:"local_addr,omitempty"` // サーバーのローカルアドレス（LAN内接続用、例: "192.168.1.10"）
 }
 
 type ErrorMsg struct {

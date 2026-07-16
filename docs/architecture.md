@@ -12,7 +12,7 @@ let you reconnect, and stay pleasant to type on.**
 - **Verbatim PTY relay**: input/output is relayed raw; no VT state is kept.
 - **Multiple clients**: clients attached to the same PTY all receive its output.
 - **Low CPU**: no VT parser, no diffing — just byte relay.
-- **Compatibility**: screen/tmux/zsh/vim/less and friends run unmodified.
+- **Compatibility**: tmux/zellij/screen/zsh/vim/less and friends run unmodified.
 - **Robustness**: no shared bottlenecks or unbounded buffers, to minimize the
   risk of a stall affecting everyone.
 
@@ -25,14 +25,15 @@ let you reconnect, and stay pleasant to type on.**
 - **Session manager** and **per-session PTY runner**.
 - **Output relay**: PTY output is delivered raw (no VT interpretation).
 - **Client fan-out**: each client has an independent send queue.
-- **UDP manager**: provides the encrypted UDP channel.
+- **QUIC transport manager**: establishes and maintains the QUIC connection
+  (terminal I/O and TCP port forwarding).
 
 ### `tezzer` (client)
 
 - Connects over the Unix domain socket (SSH-forwarded for remote use).
 - Creates or attaches a session; forwards stdin; displays PTY output.
 - Detects disconnects and reconnects automatically; propagates terminal resizes.
-- Runs a UDP manager for the parallel encrypted UDP channel.
+- Runs a QUIC transport manager for the parallel encrypted channel.
 
 ## Session model
 
@@ -69,21 +70,27 @@ Input (client → server): stdin → input message → UDS/UDP → written to th
 - **Remote**: the socket is forwarded over SSH (`tezzer-ssh`), so SSH provides
   authentication. tezzer has no public-key auth of its own.
 
-## UDP channel
+## QUIC channel
 
-- **Encryption**: AES-256-GCM.
-- **Key derivation**: HKDF derives separate keys per direction (client→server,
-  server→client) to avoid nonce reuse.
-- **Key exchange**: the shared key is distributed over the trusted UDS/TCP
-  control channel.
-- See [protocol.md](protocol.md) for the packet format and the reconnection
-  (REATTACH) flow.
+- **Transport**: QUIC (via [quic-go](https://github.com/quic-go/quic-go)) over
+  UDP, carrying terminal I/O and TCP port forwarding.
+- **Encryption**: QUIC's TLS 1.3. The connection is authenticated by mutual
+  proof of knowledge of the shared key **K** (mTLS pinned to K-derived Ed25519
+  identities; no PKI) — see [security-model.md](security-model.md).
+- **Key exchange**: K is distributed over the trusted UDS control channel.
+- See [protocol.md](protocol.md) for the stream layout, frame types, and the
+  migration/reconnect flow.
 
 ## Reconnection
 
 - **Control channel**: application-level Ping/Pong; missing Pongs trigger a
   disconnect.
-- **UDP channel**: periodic KeepAlive; missing replies trigger a re-handshake.
+- **QUIC channel**: idle timeout 60 s, keep-alive 15 s. Below the idle timeout,
+  an address change (roaming, NAT rebind, sleep/resume) is handled as
+  **migration** — the connection, and every stream on it, survives. Beyond it,
+  the client performs a full **reconnect**: a new connection dialed in
+  parallel to all candidate addresses, with output resync driven by the last
+  received offset.
 - **Retry**: exponential backoff (1s → 2s → 4s → … capped at 60s).
 
 ## Memory
@@ -91,6 +98,7 @@ Input (client → server): stdin → input message → UDS/UDP → written to th
 - Output ring buffer: per session, 4 MB raw (hot tier) + 32 MB compressed
   (cold tier; terminal output typically compresses 5–20×, so this covers
   hundreds of MB of raw output). Typical interactive use is far smaller.
-- Per UDP client: a bounded send queue, a send buffer (≤16 MiB) for
-  retransmission, and a receive buffer (≤8 MiB) for reordering. These are caps;
-  real usage depends on output volume and disconnect duration.
+- Per QUIC client: send/receive buffering and retransmission/reordering are
+  managed by quic-go (per-stream flow-control windows); tezzer does not keep
+  its own buffers on this path. Real usage depends on output volume and
+  disconnect duration.

@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted.
+Superseded by [0006](0006-adopt-quic.md): the custom reliable-UDP layer this
+decision was about has since been replaced by QUIC. The reasoning below about
+KCP specifically is kept as a historical record.
 
 ## Context
 

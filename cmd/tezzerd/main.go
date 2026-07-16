@@ -356,7 +356,7 @@ func handleConnection(conn net.Conn, mgr *session.Manager, stunServer string, ip
 			return
 		}
 
-		stunAddr, localAddr := resolveUDPAddrs(sess, stunServer, ipv4Only)
+		stunAddrs, localAddr := resolveUDPAddrs(sess, stunServer, ipv4Only)
 
 		udpSessionID := sess.GetUDPSessionID()
 		if debugEnabled != 0 {
@@ -369,7 +369,7 @@ func handleConnection(conn net.Conn, mgr *session.Manager, stunServer string, ip
 			UDPPort:      sess.GetUDPPort(),
 			UDPKey:       sess.GetUDPKey(),
 			UDPSessionID: udpSessionID,
-			STUNAddr:     stunAddr,
+			STUNAddrs:    stunAddrs,
 			LocalAddr:    localAddr,
 		}
 
@@ -429,7 +429,7 @@ func handleConnection(conn net.Conn, mgr *session.Manager, stunServer string, ip
 		client = sess.AttachClient(m.FromSeq, protocol, remoteAddr, m.ClientID)
 
 		// Send SESSION_CREATED (attach成功の通知として)
-		stunAddr, localAddr := resolveUDPAddrs(sess, stunServer, ipv4Only)
+		stunAddrs, localAddr := resolveUDPAddrs(sess, stunServer, ipv4Only)
 
 		attachUDPSessionID := sess.GetUDPSessionID()
 		if debugEnabled != 0 {
@@ -442,7 +442,7 @@ func handleConnection(conn net.Conn, mgr *session.Manager, stunServer string, ip
 			UDPPort:      sess.GetUDPPort(),
 			UDPKey:       sess.GetUDPKey(),
 			UDPSessionID: attachUDPSessionID, // 共有UDPモード時のみ設定される
-			STUNAddr:     stunAddr,
+			STUNAddrs:    stunAddrs,
 			LocalAddr:    localAddr,
 			PTYClosed:    sess.IsPTYClosed(),
 		}
@@ -767,35 +767,20 @@ func waitSessionAndRespond(conn net.Conn, mgr *session.Manager, sessionID string
 	}
 }
 
-// resolveUDPAddrs はセッションのSTUNアドレスとローカルアドレスを解決する
-func resolveUDPAddrs(sess *session.Session, stunServer string, ipv4Only bool) (stunAddr, localAddr string) {
+// resolveUDPAddrs はセッションのSTUNアドレス候補（IPv4/IPv6、取得できた分）と
+// ローカルアドレスを解決する。初回接続の候補を増やすため両familyを問い合わせる。
+func resolveUDPAddrs(sess *session.Session, stunServer string, ipv4Only bool) (stunAddrs []string, localAddr string) {
 	if !sess.IsUDPEnabled() {
 		return
 	}
 
 	if stunServer != "" {
-		stunClient := stun.NewClient(stunServer)
-		stunClient.IPv4Only = ipv4Only
-		natType, mappedAddr, err := stunClient.DetectNATType(
-			"stun.l.google.com:19302",
-			"stun.cloudflare.com:3478",
-		)
-		if err != nil {
-			log.Printf("session %s: STUN query failed (continuing without STUN): %v", sess.ID, err)
-		} else {
-			natTypeName := "Unknown"
-			switch natType {
-			case stun.NATTypeFullCone:
-				natTypeName = "Full Cone (or Port Restricted)"
-			case stun.NATTypeSymmetric:
-				natTypeName = "Symmetric"
-			}
-			log.Printf("session %s: NAT type: %s", sess.ID, natTypeName)
-			if ipv4Only && mappedAddr.IP.To4() == nil {
-				log.Printf("session %s: STUN returned IPv6 address but IPv4-only mode is enabled, skipping", sess.ID)
-			} else {
-				stunAddr = fmt.Sprintf("%s:%d", mappedAddr.IP, sess.GetUDPPort())
-				log.Printf("session %s: STUN address: %s", sess.ID, stunAddr)
+		if ip := queryStunMappedIP(sess.ID, "udp4"); ip != nil {
+			stunAddrs = append(stunAddrs, net.JoinHostPort(ip.String(), strconv.Itoa(sess.GetUDPPort())))
+		}
+		if !ipv4Only {
+			if ip := queryStunMappedIP(sess.ID, "udp6"); ip != nil {
+				stunAddrs = append(stunAddrs, net.JoinHostPort(ip.String(), strconv.Itoa(sess.GetUDPPort())))
 			}
 		}
 	}
@@ -804,6 +789,32 @@ func resolveUDPAddrs(sess *session.Session, stunServer string, ipv4Only bool) (s
 		localAddr = fmt.Sprintf("%s:%d", localIP, sess.GetUDPPort())
 	}
 	return
+}
+
+// queryStunMappedIP は指定family（"udp4"/"udp6"）でGoogle/Cloudflareの STUN
+// サーバーに問い合わせ、マッピングされたIPを返す。失敗時はnil（呼び出し側は
+// そのfamilyを候補から単純に省く）。
+func queryStunMappedIP(sessID, network string) net.IP {
+	stunClient := stun.NewClient("stun.l.google.com:19302")
+	stunClient.Network = network
+	natType, mappedAddr, err := stunClient.DetectNATType(
+		"stun.l.google.com:19302",
+		"stun.cloudflare.com:3478",
+	)
+	if err != nil {
+		log.Printf("session %s: STUN query (%s) failed (continuing without it): %v", sessID, network, err)
+		return nil
+	}
+
+	natTypeName := "Unknown"
+	switch natType {
+	case stun.NATTypeFullCone:
+		natTypeName = "Full Cone (or Port Restricted)"
+	case stun.NATTypeSymmetric:
+		natTypeName = "Symmetric"
+	}
+	log.Printf("session %s: NAT type (%s): %s, mapped IP: %s", sessID, network, natTypeName, mappedAddr.IP)
+	return mappedAddr.IP
 }
 
 // getLocalAddr は優先的なローカルIPアドレスを取得
