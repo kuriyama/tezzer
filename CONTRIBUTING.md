@@ -57,8 +57,8 @@ Use clear, imperative commit subjects. A `type: summary` prefix
 
 - `cmd/tezzerd` — server binary
 - `cmd/tezzer` — client binary
-- `internal/udp` — UDP transport: framing, encryption, sequencing, retransmit,
-  reattach/recovery
+- `internal/qtransport` — QUIC transport: streams, TCP/agent forwarding,
+  migration/reconnect
 - `internal/session` — PTY session management and output buffering
 - `internal/proto`, `internal/netx`, `internal/stun` — control protocol, framing,
   STUN

@@ -37,6 +37,7 @@ tezzer transports terminal I/O over UDP with an authenticated, encrypted
 channel and falls back to a Unix-domain-socket / TCP control channel. Reports
 that are particularly relevant include, but are not limited to:
 
-- Weaknesses in the packet authentication or encryption (see `internal/udp`).
+- Weaknesses in the packet authentication or encryption (see `internal/qtransport`
+  and [docs/security-model.md](docs/security-model.md)).
 - Issues allowing session hijacking, replay, or unauthorized reattach.
 - Denial of service reachable by a remote peer.

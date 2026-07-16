@@ -7,6 +7,7 @@
 # <img src="assets/logo.png" alt="" width="28" align="top"> tezzer
 
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![ci](https://github.com/kuriyama/tezzer/actions/workflows/ci.yml/badge.svg)](https://github.com/kuriyama/tezzer/actions/workflows/ci.yml)
 
 > 日本語のコンセプト概要は [README.ja.md](README.ja.md) にあります。
 

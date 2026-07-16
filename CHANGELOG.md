@@ -8,8 +8,10 @@ once it reaches a 1.0 release.
 
 ## [Unreleased]
 
-Initial public release is in preparation. tezzer is pre-1.0 and its wire
-protocol and command-line interface may change without notice until 1.0.
+## [0.0.1] - 2026-07-16
+
+Initial public release. tezzer is pre-1.0 and its wire protocol and
+command-line interface may change without notice until 1.0.
 
 ### Added
 
