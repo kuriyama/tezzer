@@ -51,6 +51,17 @@ session requires the same SSH access you already have. Details in the
 
 ## Installation
 
+### macOS (Homebrew)
+
+```bash
+brew tap kuriyama/tezzer
+brew install tezzer
+```
+
+Installs `tezzer`, `tezzerd`, and `tezzer-ssh`. See
+[kuriyama/homebrew-tezzer](https://github.com/kuriyama/homebrew-tezzer) for the
+formula.
+
 ### From source
 
 ```bash

@@ -47,3 +47,6 @@ debug_*.go
 test-result-*.txt
 test-output-*.txt
 test_result.txt
+
+# 別リポジトリ（homebrew tap）。tezzer 配下に置いているが git 管理は独立。
+/homebrew-tezzer/
