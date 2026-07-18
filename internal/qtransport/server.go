@@ -235,15 +235,24 @@ func (s *quicServer) handleConn(conn *quic.Conn) {
 
 	// 再同期: クライアントが最後に受けた offset の次から、セッション層（OutputRingBuffer）に
 	// 残っている分を先行送信してからライブ出力に入る。重複は client 側が offset で弾く。
+	// セッション層はバッチ（raw バイト上限つき）で返すため、空が返るまで繰り返し引く
+	// （cold 層全量を一括で解凍・保持しない。メモリスパイク防止）。
 	if onResync != nil {
-		if chunks, err := onResync(cid, m.LastOffset+1); err == nil {
+		next := m.LastOffset + 1
+	resync:
+		for {
+			chunks, err := onResync(cid, next)
+			if err != nil || len(chunks) == 0 {
+				break
+			}
 			for _, ch := range chunks {
 				// writeOutput 経由にすることで、再同期の Write がブロックした場合も
 				// stallWatchdog から観測できる（outMu 越しに SendOutput = PTY reader
 				// まで詰まらせるのは同じため）。
 				if _, werr := sc.writeOutput(ch.Offset, ch.Data); werr != nil {
-					break
+					break resync
 				}
+				next = ch.Offset + 1
 			}
 		}
 	}
@@ -367,13 +376,21 @@ const slowWriteThreshold = 100 * time.Millisecond
 // stall 検知の水位（テストから短縮できるよう var）。
 // warning 水位を超えてブロックしている Write を見つけたら、同セッションの
 // 他クライアントへステータス通知する（詰まっている本人には届かない・見えないため、
-// 「固まった画面を見ている側」に犯人を知らせる）。critical 水位（write 打ち切り・
-// 遅延クライアント切断）は本対応（Suggestion.md の backpressure 項）で追加する。
+// 「固まった画面を見ている側」に犯人を知らせる）。
+// critical 水位を超えたら、その クライアントの QUIC 接続を切断して PTY reader を
+// 解放する。切られたクライアントは既存の reconnect + offset 再同期で復旧するため、
+// リングバッファ保持分のデータは失われない（スリープ中のノート PC が典型で、
+// 復帰時にどのみち reconnect する。MaxIdleTimeout=60s より十分手前で切る）。
 var (
-	stallWarnThreshold = 2 * time.Second
-	stallWarnRepeat    = 30 * time.Second // stall 継続中の再通知間隔
-	stallCheckInterval = 1 * time.Second
+	stallWarnThreshold     = 2 * time.Second
+	stallWarnRepeat        = 30 * time.Second // stall 継続中の再通知間隔
+	stallCriticalThreshold = 30 * time.Second // 超過で当該クライアントを切断
+	stallCheckInterval     = 1 * time.Second
 )
+
+// connCodeStallDisconnect は critical stall による切断の CONNECTION_CLOSE コード
+// （デバッグ用途。プロトコル上の意味は持たせない）。
+const connCodeStallDisconnect quic.ApplicationErrorCode = 2
 
 // writeOutput は出力フレームを 1 つ書き、所要時間を返す。書き込み開始時刻を
 // writeStartNano に記録し、ブロック中の Write を stallWatchdog が外から観測できる
@@ -424,9 +441,11 @@ func (s *quicServer) SendOutput(offset uint64, data []byte, clients []transport.
 // 同セッションの他クライアントへステータス通知する。SendOutput は PTY reader から
 // 同期的に呼ばれるため、1 クライアントの stall はセッション全体の出力停止として
 // 他クライアントのユーザーに見えている（固まった画面の理由をその場で知らせる）。
+// critical 水位を超えたら当該クライアントを切断し、セッション全体を解放する。
 func (s *quicServer) stallWatchdog() {
 	// 水位はここで一度だけ読む（テストが Start 前に差し替え、終了後に復元するため）。
 	warnThreshold, warnRepeat := stallWarnThreshold, stallWarnRepeat
+	criticalThreshold := stallCriticalThreshold
 	ticker := time.NewTicker(stallCheckInterval)
 	defer ticker.Stop()
 	for {
@@ -449,6 +468,20 @@ func (s *quicServer) stallWatchdog() {
 			}
 			stalled := now.Sub(time.Unix(0, start))
 			if stalled < warnThreshold {
+				continue
+			}
+			// critical 水位: 詰まったクライアントを切断して PTY reader を解放する。
+			// CONNECTION_CLOSE でブロック中の writeOutput は即エラー復帰し、
+			// クライアント側は既存の reconnect + offset 再同期で復旧する
+			// （リングバッファ保持分のデータ損失なし）。接続が実際に落ちて
+			// handleConn が後始末するまで数 tick 見え続けるが、CloseWithError の
+			// 再呼び出しは no-op なので問題ない。
+			if stalled >= criticalThreshold {
+				log.Printf("qtransport: client %d (session %s) output stalled %v (critical); disconnecting",
+					sc.id.Num, sc.id.Session, stalled.Truncate(time.Millisecond))
+				if sc.conn != nil {
+					_ = sc.conn.CloseWithError(connCodeStallDisconnect, "output stalled: disconnecting slow client")
+				}
 				continue
 			}
 			if sc.stallWarned.CompareAndSwap(false, true) {
@@ -623,4 +656,9 @@ func (s *quicServer) Close() error {
 	return err
 }
 
-var _ transport.ServerTransport = (*quicServer)(nil)
+var (
+	_ transport.ServerTransport  = (*quicServer)(nil)
+	_ transport.ForwardingPolicy = (*quicServer)(nil)
+	_ transport.SocketHandover   = (*quicServer)(nil)
+	_ transport.Addresser        = (*quicServer)(nil)
+)

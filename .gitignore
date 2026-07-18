@@ -31,6 +31,9 @@ go.work
 .DS_Store
 Thumbs.db
 
+# 一時ファイル
+*.tmp
+
 # Session logs
 .session.log
 .session-result.log

@@ -41,12 +41,17 @@ func deriveIdentity(k []byte, label string) (ed25519.PublicKey, ed25519.PrivateK
 }
 
 // selfSignedCert は pub/priv を載せた自己署名証明書（PKI なし）を作る。
+// 有効期限は意図的に長期（100 年）にしてある: 実体の認証は pinVerify の鍵 pinning で、
+// 有効期限は現状どちら側も検証しない（client は InsecureSkipVerify + pinVerify、
+// server は RequireAnyClientCert）。証明書は transport 生成時に一度だけ作られるため、
+// 短い期限にすると「誰も見ていないから動く」時限の罠になる（将来検証を厳格化した
+// 瞬間に長寿命セッションが壊れる）。
 func selfSignedCert(pub ed25519.PublicKey, priv ed25519.PrivateKey) (tls.Certificate, error) {
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject:      pkix.Name{CommonName: "tezzer"},
 		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(24 * time.Hour),
+		NotAfter:     time.Now().AddDate(100, 0, 0),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 	}

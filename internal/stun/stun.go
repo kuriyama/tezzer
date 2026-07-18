@@ -34,15 +34,6 @@ var (
 	ErrNoXorMapped     = errors.New("no XOR-MAPPED-ADDRESS in response")
 )
 
-// NATType はNATの種類を表します
-type NATType int
-
-const (
-	NATTypeUnknown NATType = iota
-	NATTypeFullCone
-	NATTypeSymmetric
-)
-
 // Client はSTUNクライアントです。
 type Client struct {
 	ServerAddr string
@@ -107,32 +98,93 @@ func (c *Client) GetMappedAddr() (*net.UDPAddr, error) {
 	return parseBindingResponse(buf[:n], txID)
 }
 
-// DetectNATType は複数のSTUNサーバーを使ってNATタイプを判別します。
-// 異なるSTUNサーバーから同じ公開ポートが返されればCone NAT、
-// 異なるポートが返されればSymmetric NATです。
-func (c *Client) DetectNATType(serverA, serverB string) (NATType, *net.UDPAddr, error) {
-	// サーバーAで公開アドレスを取得
-	origServer := c.ServerAddr
-	c.ServerAddr = serverA
-	addrA, err := c.GetMappedAddr()
+// ProbeResult は同一ソケットから 2 つの STUN サーバーへ問い合わせた NAT 診断結果。
+type ProbeResult struct {
+	LocalPort int          // 問い合わせに使ったローカルポート
+	MappedA   *net.UDPAddr // サーバー A から見た公開アドレス
+	MappedB   *net.UDPAddr // サーバー B から見た公開アドレス（マッピング比較用）
+}
+
+// EndpointIndependent は NAT マッピングが宛先非依存（EIM = cone 系）かを返す。
+// false は宛先ごとにマッピングが変わる EDM（symmetric NAT）で、STUN で得た
+// アドレスを第三者への広告に使えない。
+// cone 系のさらなる細分（filtering 挙動）は RFC 5780 対応サーバーが必要なため扱わない。
+func (r ProbeResult) EndpointIndependent() bool {
+	return r.MappedA.IP.Equal(r.MappedB.IP) && r.MappedA.Port == r.MappedB.Port
+}
+
+// PortPreserving は NAT がローカルポートを公開側でも保存しているかを返す。
+// tezzer の STUN 候補広告は「公開 IP + QUIC listen ポート」という port 保存前提の
+// 合成値なので、これが false だと広告候補は実際のマッピングと一致しない。
+func (r ProbeResult) PortPreserving() bool {
+	return r.MappedA.Port == r.LocalPort
+}
+
+// Probe は 1 つの UDP ソケットから serverA / serverB へ順に Binding Request を送り、
+// それぞれの XOR-MAPPED-ADDRESS を返す。同一ソケットからの比較なので、マッピングの
+// 宛先依存性（EIM/EDM = cone/symmetric）の判定として意味を持つ。
+// ソケットを分けるとローカルポートが毎回変わり、この比較は成立しない
+// （旧 DetectNATType はこの誤りでほぼ常に symmetric と誤判定していた）。
+// network は "udp4" / "udp6"。診断はソケット単位ではなく NAT 装置の性質を見るものなので、
+// 使い捨てソケットで測って一般化してよい。
+func Probe(network, serverA, serverB string, timeout time.Duration) (ProbeResult, error) {
+	conn, err := net.ListenUDP(network, nil)
 	if err != nil {
-		c.ServerAddr = origServer
-		return NATTypeUnknown, nil, fmt.Errorf("failed to query server A: %w", err)
+		return ProbeResult{}, fmt.Errorf("failed to bind probe socket: %w", err)
+	}
+	defer conn.Close()
+
+	a, err := queryMappedFrom(conn, network, serverA, timeout)
+	if err != nil {
+		return ProbeResult{}, fmt.Errorf("failed to query %s: %w", serverA, err)
+	}
+	b, err := queryMappedFrom(conn, network, serverB, timeout)
+	if err != nil {
+		return ProbeResult{}, fmt.Errorf("failed to query %s: %w", serverB, err)
+	}
+	local := conn.LocalAddr().(*net.UDPAddr)
+	return ProbeResult{LocalPort: local.Port, MappedA: a, MappedB: b}, nil
+}
+
+// queryMappedFrom は unconnected ソケット conn から server へ Binding Request を送り、
+// トランザクション ID の一致する応答の XOR-MAPPED-ADDRESS を返す。
+func queryMappedFrom(conn *net.UDPConn, network, server string, timeout time.Duration) (*net.UDPAddr, error) {
+	raddr, err := net.ResolveUDPAddr(network, server)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve STUN server: %w", err)
 	}
 
-	// サーバーBで公開アドレスを取得
-	c.ServerAddr = serverB
-	addrB, err := c.GetMappedAddr()
-	c.ServerAddr = origServer
-	if err != nil {
-		return NATTypeUnknown, addrA, fmt.Errorf("failed to query server B: %w", err)
+	txID := make([]byte, 12)
+	if _, err := rand.Read(txID); err != nil {
+		return nil, fmt.Errorf("failed to generate transaction ID: %w", err)
 	}
+	req := makeBindingRequest(txID)
 
-	// ポートが同じならCone NAT、異なればSymmetric NAT
-	if addrA.Port == addrB.Port {
-		return NATTypeFullCone, addrA, nil
+	deadline := time.Now().Add(timeout)
+	if err := conn.SetWriteDeadline(deadline); err != nil {
+		return nil, err
 	}
-	return NATTypeSymmetric, addrA, nil
+	if _, err := conn.WriteToUDP(req, raddr); err != nil {
+		return nil, fmt.Errorf("failed to send STUN request: %w", err)
+	}
+	if err := conn.SetReadDeadline(deadline); err != nil {
+		return nil, err
+	}
+	buf := make([]byte, 1500)
+	for {
+		n, _, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				return nil, ErrTimeout
+			}
+			return nil, fmt.Errorf("failed to read STUN response: %w", err)
+		}
+		addr, err := parseBindingResponse(buf[:n], txID)
+		if err != nil {
+			continue // 別トランザクションの遅延応答・無関係パケットは読み飛ばす
+		}
+		return addr, nil
+	}
 }
 
 // makeBindingRequest はSTUN Binding Requestメッセージを作成します。

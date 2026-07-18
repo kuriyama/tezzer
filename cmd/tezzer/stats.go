@@ -60,7 +60,16 @@ func (c *Client) writeStatsFile() {
 	hasMeta := c.serverMeta != nil
 	c.metaMu.RUnlock()
 	if !hasMeta {
-		_ = c.fetchServerMeta()
+		// 応答は handleServer が非同期に受信して serverMeta に格納するため、
+		// 少しだけ待って取り込む（間に合わなければ Server 欄なしで出力する）。
+		if err := c.requestServerMeta(); err == nil {
+			for i := 0; i < 10 && !hasMeta; i++ {
+				time.Sleep(100 * time.Millisecond)
+				c.metaMu.RLock()
+				hasMeta = c.serverMeta != nil
+				c.metaMu.RUnlock()
+			}
+		}
 	}
 
 	stats := clientStatsJSON{

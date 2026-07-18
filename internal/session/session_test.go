@@ -321,18 +321,18 @@ func TestSessionUDPEnabled(t *testing.T) {
 	defer sess.Close()
 
 	// UDPが有効化されていることを確認
-	if !sess.IsUDPEnabled() {
+	if !sess.IsQUICEnabled() {
 		t.Error("UDP should be enabled by default")
 	}
 
 	// UDPポートが取得できることを確認
-	udpPort := sess.GetUDPPort()
+	udpPort := sess.GetQUICPort()
 	if udpPort == 0 {
 		t.Error("UDP port should be non-zero")
 	}
 
 	// UDP鍵が取得できることを確認
-	udpKey := sess.GetUDPKey()
+	udpKey := sess.GetQUICKey()
 	if len(udpKey) != 32 {
 		t.Errorf("expected 32-byte UDP key, got %d bytes", len(udpKey))
 	}

@@ -112,11 +112,8 @@ type SessionCreatedMsg struct {
 	SessionID  string `msgpack:"session_id"`
 	UDPEnabled bool   `msgpack:"udp_enabled,omitempty"` // UDPが有効かどうか
 	UDPPort    int    `msgpack:"udp_port,omitempty"`    // UDPポート番号（サーバー側）
-	UDPKey     []byte `msgpack:"udp_key,omitempty"`     // 共有鍵（32バイト、AES-256用）
-	// UDPSessionID: 共有UDPモード時に使用するセッションID（8バイト）
-	// 非共有モードまたは空の場合はSessionIDからハッシュを生成して使用
-	UDPSessionID []byte `msgpack:"udp_session_id,omitempty"`
-	PTYClosed    bool   `msgpack:"pty_closed,omitempty"` // PTYが既に終了しているか
+	UDPKey     []byte `msgpack:"udp_key,omitempty"`     // 共有鍵（32バイト、mTLS pinning 用）
+	PTYClosed  bool   `msgpack:"pty_closed,omitempty"`  // PTYが既に終了しているか
 	// InitialOutput: PTYが即座に終了した場合のバッファ出力（envコマンド等の非インタラクティブコマンド用）
 	InitialOutput []byte `msgpack:"initial_output,omitempty"`
 	// UDP接続アドレス情報
@@ -124,6 +121,10 @@ type SessionCreatedMsg struct {
 	// IPv4/IPv6。片方の family が利用不可なら省かれる。例: ["203.0.113.1:54321", "[2001:db8::1]:54321"]）
 	STUNAddrs []string `msgpack:"stun_addrs,omitempty"`
 	LocalAddr string   `msgpack:"local_addr,omitempty"` // サーバーのローカルアドレス（LAN内接続用、例: "192.168.1.10"）
+	// STUNServer はサーバが STUN 問い合わせに使ったサーバー（tezzerd --stun-server の値）。
+	// クライアント側の STUN 問い合わせも同じサーバーを使う（自前 STUN サーバー運用者の
+	// 意図をクライアント側にも通す）。旧サーバからは空 = クライアント既定にフォールバック。
+	STUNServer string `msgpack:"stun_server,omitempty"`
 }
 
 type ErrorMsg struct {

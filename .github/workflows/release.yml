@@ -11,6 +11,8 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
@@ -30,3 +32,59 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file /tmp/release-notes.md
+      # Homebrew tap の formula を自動 bump する。formula は (version, sha256 ×2) で
+      # 完全に決まるため、sed ではなく全文を再生成する（goreleaser の brews と同じ方針。
+      # tap 側の手編集は上書きされる前提）。
+      - name: Bump Homebrew formula
+        if: env.TAP_TOKEN != ''
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          arm_sha=$(awk '/tezzer_darwin_arm64\.tar\.gz/{print $1}' dist/SHA256SUMS)
+          intel_sha=$(awk '/tezzer_darwin_amd64\.tar\.gz/{print $1}' dist/SHA256SUMS)
+          if [ -z "$arm_sha" ] || [ -z "$intel_sha" ]; then
+            echo "darwin checksums not found in dist/SHA256SUMS" >&2
+            exit 1
+          fi
+          git clone --depth 1 \
+            "https://x-access-token:${TAP_TOKEN}@github.com/${GITHUB_REPOSITORY_OWNER}/homebrew-tezzer.git" /tmp/tap
+          mkdir -p /tmp/tap/Formula
+          cat > /tmp/tap/Formula/tezzer.rb <<FORMULA
+          class Tezzer < Formula
+            desc "Lightweight, SSH-like terminal transport with persistent sessions and automatic reconnection"
+            homepage "https://github.com/${GITHUB_REPOSITORY}"
+            version "${ver}"
+            license "Apache-2.0"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/${GITHUB_REPOSITORY}/releases/download/v${ver}/tezzer_darwin_arm64.tar.gz"
+                sha256 "${arm_sha}"
+              end
+              on_intel do
+                url "https://github.com/${GITHUB_REPOSITORY}/releases/download/v${ver}/tezzer_darwin_amd64.tar.gz"
+                sha256 "${intel_sha}"
+              end
+            end
+
+            def install
+              bin.install "tezzer"
+              bin.install "tezzerd"
+              bin.install "tezzer-ssh"
+            end
+
+            test do
+              system "#{bin}/tezzer", "-h"
+            end
+          end
+          FORMULA
+          cd /tmp/tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "formula unchanged; nothing to push"
+          else
+            git commit -m "tezzer ${ver}"
+            git push
+          fi

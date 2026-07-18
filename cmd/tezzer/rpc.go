@@ -7,6 +7,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"net"
 
 	"github.com/kuriyama/tezzer/internal/netx"
@@ -39,4 +40,52 @@ func roundTrip[T any](conn net.Conn, req any) (*T, error) {
 		return nil, fmt.Errorf("expected %T, got %T", (*T)(nil), msg)
 	}
 	return resp, nil
+}
+
+// dialAndHandshake はサーバーに接続し HELLO/WELCOME ハンドシェイクを行う
+func dialAndHandshake(addr string, cols, rows int) (net.Conn, error) {
+	conn, err := net.Dial("unix", addr)
+	if err != nil {
+		return nil, err
+	}
+
+	helloData, err := proto.Encode(proto.HelloMsg{
+		Type:       "HELLO",
+		V:          1,
+		ClientName: "tezzer",
+		Cols:       cols,
+		Rows:       rows,
+	})
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to encode hello: %w", err)
+	}
+	if err := netx.WriteFrame(conn, helloData); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to write hello: %w", err)
+	}
+
+	frameData, err := netx.ReadFrame(conn)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to read welcome: %w", err)
+	}
+	msg, err := proto.Decode(frameData)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to decode welcome: %w", err)
+	}
+	welcome, ok := msg.(*proto.WelcomeMsg)
+	if !ok {
+		conn.Close()
+		return nil, fmt.Errorf("expected WELCOME, got %T", msg)
+	}
+	log.Printf("connected to %s", welcome.ServerName)
+
+	return conn, nil
+}
+
+// connectToServer は管理コマンド用のサーバー接続（端末サイズは不問）
+func connectToServer(addr string) (net.Conn, error) {
+	return dialAndHandshake(addr, 80, 24)
 }

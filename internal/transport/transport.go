@@ -9,7 +9,10 @@
 //     再同期は OnResyncNeeded（offset ベース）で配線する。
 package transport
 
-import "context"
+import (
+	"context"
+	"net"
+)
 
 // ConnectionState は接続状態（transport 非依存の粒度）。
 type ConnectionState int
@@ -120,6 +123,10 @@ type ServerTransport interface {
 	// session 層は OutputRingBuffer から該当オフセット以降のチャンクを返し、
 	// transport がそれを当該クライアントへ再送する。これにより OutputRingBuffer は
 	// session 所有のまま、SSN/フォールバックという udp 固有語を表に出さずに再同期できる。
+	// コールバックは fromOffset 以降の「先頭の一部だけ」を返してよい（バッチ返却。
+	// cold 層全量の一括解凍によるメモリスパイクを避けるため）。transport は空スライスが
+	// 返るまで「最後に受け取った offset+1」を fromOffset にして繰り返し呼ぶこと。
+	// 返るチャンクは offset 昇順・fromOffset 以上であること（呼び出しループの前進保証）。
 	OnResyncNeeded(fn func(client ClientID, fromOffset uint64) ([]OutputChunk, error))
 
 	ActiveClients() []ClientID
@@ -199,4 +206,54 @@ type AgentForwarder interface {
 	// provider が unset（-A クライアント未接続）の場合はエラーを返す。
 	// ctx は open ハンドシェイクにのみ効く。
 	OpenAgentStream(ctx context.Context, sessionID string) (ForwardConn, error)
+}
+
+// ---- オプション機能の named interface ----
+// ServerTransport / ClientTransport 本体の契約には含めず、対応実装（quic）だけが満たす。
+// 呼び出し側は型アサーションで検出する（TCPForwarder / AgentForwarder と同じパターン）。
+// 無名 interface のアサーションが呼び出し側に散らばると契約の全体像が見えなくなるため、
+// ここに集約して名前を付ける。
+
+// ForwardingPolicy は転送機能の許可/禁止を設定できる ServerTransport のオプション機能
+// （サーバ起動フラグ --no-tcp-forwarding / --no-agent-forwarding の適用先）。
+type ForwardingPolicy interface {
+	// SetTCPForwarding は TCP ポートフォワード（-L）の許可/禁止を設定する（既定: 許可）。
+	SetTCPForwarding(enabled bool)
+	// SetAgentForwarding は SSH agent forwarding（-A）の許可/禁止を設定する（既定: 許可）。
+	SetAgentForwarding(enabled bool)
+}
+
+// SocketHandover は無停止再起動（self re-exec）に必要な fd 継承・明示切断に対応する
+// ServerTransport のオプション機能。
+type SocketHandover interface {
+	// DupUDPSocketFd は待ち受け UDP ソケットを複製した fd（CLOEXEC なし = exec を
+	// 跨いで継承される）を返す。
+	DupUDPSocketFd() (int, error)
+	// DisconnectAllClients は全クライアントを CONNECTION_CLOSE で即時切断する
+	// （クライアントの idle timeout 待ちを回避し、即 reconnect を誘発する）。
+	DisconnectAllClients(reason string)
+}
+
+// Addresser は実際の待ち受けアドレスを公開する ServerTransport のオプション機能
+// （:0 bind 時のポート確定、bootstrap でクライアントへ伝える用）。
+type Addresser interface {
+	Addr() net.Addr
+}
+
+// ResyncSeeder は「既に他経路（UDS）で受信・描画済みの出力オフセット」を Start 前に
+// 設定できる ClientTransport のオプション機能。Hello の LastOffset に反映され、
+// attach 時のバックログ二重転送を防ぐ。
+type ResyncSeeder interface {
+	// SeedResyncOffset は Start() 前に一度だけ呼ぶこと。
+	SeedResyncOffset(offset uint64)
+}
+
+// AgentForwardClient は SSH agent forwarding（-A）の ClientTransport 側オプション機能。
+type AgentForwardClient interface {
+	// AgentForwardingSupported はサーバが -A 対応を広告しているかを返す
+	// （serverMeta 受信後に確定。未受信の間は false）。
+	AgentForwardingSupported() bool
+	// SetAgentSockPath は中継元のローカル agent ソケットパスを設定する
+	// （Start() 前に一度だけ。空文字なら -A 無効）。
+	SetAgentSockPath(path string)
 }

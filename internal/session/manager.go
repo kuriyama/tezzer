@@ -32,8 +32,8 @@ type Manager struct {
 	// fixedPort 未指定時は nil（各セッションが per-session で transport を持つ）。
 	sharedTransport transport.ServerTransport
 	sharedCancel    context.CancelFunc
-	udpPort         int
-	udpKey          []byte
+	sharedPort      int
+	sharedKey       []byte
 
 	// TCP ポートフォワードの禁止フラグ（零値 = 許可。tezzerd --no-tcp-forwarding で true）
 	tcpFwdDisabled atomic.Bool
@@ -72,19 +72,17 @@ func (m *Manager) AgentForwardingEnabled() bool {
 
 // applyTransportPolicy は生成した transport にサーバポリシー（転送許可）を適用する。
 func (m *Manager) applyTransportPolicy(st transport.ServerTransport) {
-	if f, ok := st.(interface{ SetTCPForwarding(bool) }); ok {
-		f.SetTCPForwarding(m.tcpForwardingEnabled())
-	}
-	if f, ok := st.(interface{ SetAgentForwarding(bool) }); ok {
-		f.SetAgentForwarding(m.AgentForwardingEnabled())
+	if p, ok := st.(transport.ForwardingPolicy); ok {
+		p.SetTCPForwarding(m.tcpForwardingEnabled())
+		p.SetAgentForwarding(m.AgentForwardingEnabled())
 	}
 }
 
-// InitSharedUDP は固定ポート運用時に共有 QUIC transport を1つ起動する。
+// InitSharedTransport は固定ポート運用時に共有 QUIC transport を1つ起動する。
 // fixedPort <= 0 の場合は何もしない（各セッションが per-session で transport を持つ）。
 // 共有時は 1 ソケットを全セッションで多重化し、固定ポートを port-forward した運用で
 // 複数セッションを相乗りできる。
-func (m *Manager) InitSharedUDP(fixedPort int, ipv4Only bool) error {
+func (m *Manager) InitSharedTransport(fixedPort int, ipv4Only bool) error {
 	if fixedPort <= 0 {
 		return nil
 	}
@@ -96,7 +94,12 @@ func (m *Manager) InitSharedUDP(fixedPort int, ipv4Only bool) error {
 	if err != nil {
 		return fmt.Errorf("failed to create shared QUIC transport: %w", err)
 	}
-	addr, ok := st.(interface{ Addr() net.Addr }).Addr().(*net.UDPAddr)
+	a, ok := st.(transport.Addresser)
+	if !ok {
+		_ = st.Close()
+		return fmt.Errorf("transport does not expose listen address")
+	}
+	addr, ok := a.Addr().(*net.UDPAddr)
 	if !ok {
 		_ = st.Close()
 		return fmt.Errorf("failed to get shared QUIC listen address")
@@ -105,7 +108,7 @@ func (m *Manager) InitSharedUDP(fixedPort int, ipv4Only bool) error {
 }
 
 // adoptSharedTransport は共有 QUIC トランスポートの配線・起動を行う
-// （InitSharedUDP と無停止再起動の復元経路で共通）。失敗時は st を閉じる。
+// （InitSharedTransport と無停止再起動の復元経路で共通）。失敗時は st を閉じる。
 func (m *Manager) adoptSharedTransport(st transport.ServerTransport, port int, key []byte) error {
 	st.OnResyncNeeded(m.sharedResync)
 	st.OnClientConnect(m.sharedOnConnect)
@@ -121,21 +124,21 @@ func (m *Manager) adoptSharedTransport(st transport.ServerTransport, port int, k
 
 	m.sharedTransport = st
 	m.sharedCancel = cancel
-	m.udpPort = port
-	m.udpKey = key
+	m.sharedPort = port
+	m.sharedKey = key
 
 	go m.routeSharedInput()
 	go m.routeSharedResize()
-	log.Printf("shared QUIC transport enabled on port %d", m.udpPort)
+	log.Printf("shared QUIC transport enabled on port %d", m.sharedPort)
 	return nil
 }
 
-// IsSharedUDPEnabled は共有 transport モードかを返す。
-func (m *Manager) IsSharedUDPEnabled() bool { return m.sharedTransport != nil }
+// IsSharedTransportEnabled は共有 transport モードかを返す。
+func (m *Manager) IsSharedTransportEnabled() bool { return m.sharedTransport != nil }
 
-// GetSharedUDPPort / GetSharedUDPKey は bootstrap で client へ伝える用。
-func (m *Manager) GetSharedUDPPort() int   { return m.udpPort }
-func (m *Manager) GetSharedUDPKey() []byte { return m.udpKey }
+// GetSharedPort / GetSharedKey は bootstrap で client へ伝える用。
+func (m *Manager) GetSharedPort() int   { return m.sharedPort }
+func (m *Manager) GetSharedKey() []byte { return m.sharedKey }
 
 // sessionByID は SessionID から該当セッションを引く。
 func (m *Manager) sessionByID(sessionID string) *Session {

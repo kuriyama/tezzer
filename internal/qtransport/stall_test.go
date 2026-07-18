@@ -131,3 +131,85 @@ func TestQUICTransport_StallWarnsOtherClients(t *testing.T) {
 			healthyStat.StallEpisodes, healthyStat.CurrentStallMs)
 	}
 }
+
+// critical 水位超えで watchdog が詰まったクライアントを切断し、ブロックしていた
+// SendOutput（= PTY reader）が解放されてクライアント登録も解除されることを検証する。
+func TestQUICTransport_StallCriticalDisconnects(t *testing.T) {
+	oldWarn, oldRepeat, oldCrit, oldTick := stallWarnThreshold, stallWarnRepeat, stallCriticalThreshold, stallCheckInterval
+	stallWarnThreshold, stallWarnRepeat, stallCriticalThreshold, stallCheckInterval =
+		100*time.Millisecond, time.Second, 500*time.Millisecond, 50*time.Millisecond
+	t.Cleanup(func() {
+		stallWarnThreshold, stallWarnRepeat, stallCriticalThreshold, stallCheckInterval = oldWarn, oldRepeat, oldCrit, oldTick
+	})
+
+	k := make([]byte, 32)
+	rand.Read(k)
+
+	srv, err := NewServer(k, "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := srv.Start(ctx); err != nil {
+		t.Fatalf("server Start: %v", err)
+	}
+	addr := srv.(interface{ Addr() net.Addr }).Addr().String()
+
+	// 詰まるクライアント: Hello だけ送って以後何も読まない raw QUIC 接続。
+	tlsConf, err := ClientTLS(k)
+	if err != nil {
+		t.Fatalf("ClientTLS: %v", err)
+	}
+	stalledConn, err := quic.DialAddr(ctx, addr, tlsConf, quicConfig())
+	if err != nil {
+		t.Fatalf("DialAddr (stalled): %v", err)
+	}
+	defer stalledConn.CloseWithError(0, "test done")
+	ctrl, err := stalledConn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("OpenStreamSync: %v", err)
+	}
+	if err := writeFrame(ctrl, &ctrlMsg{Type: ctrlHello, ClientID: 9, SessionID: "s1"}); err != nil {
+		t.Fatalf("hello: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for len(srv.ActiveClients()) < 1 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(srv.ActiveClients()) < 1 {
+		t.Fatal("stalled client did not register")
+	}
+
+	// PTY reader 相当の送信ループ: 受信ウィンドウを吸い切ると Write がブロックする。
+	go func() {
+		payload := make([]byte, 64*1024)
+		targets := []transport.ClientID{{Session: "s1", Num: 9}}
+		for i := uint64(1); ctx.Err() == nil; i++ {
+			_ = srv.SendOutput(i, payload, targets)
+			time.Sleep(time.Millisecond) // 切断後の空回りを抑える
+		}
+	}()
+
+	// critical 水位超えでサーバから CONNECTION_CLOSE されること。
+	select {
+	case <-stalledConn.Context().Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("stalled client was not disconnected")
+	}
+	if cause := context.Cause(stalledConn.Context()); cause == nil || !strings.Contains(cause.Error(), "stalled") {
+		t.Errorf("close reason does not mention stall: %v", cause)
+	}
+
+	// handleConn の後始末でクライアント登録が解除されること。
+	deadline = time.Now().Add(5 * time.Second)
+	for len(srv.ActiveClients()) > 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := srv.ActiveClients(); len(got) > 0 {
+		t.Fatalf("stalled client still registered after disconnect: %v", got)
+	}
+}

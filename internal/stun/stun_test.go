@@ -131,11 +131,56 @@ func TestClientNetworkOverride(t *testing.T) {
 	}
 }
 
+// TestProbe_EndpointIndependent は同一ソケット 2 サーバー比較の正常系。
+// ループバック（NAT なし）では両サーバーから同じ mapped address が返り、
+// EIM 判定・port 保存判定がともに true になる。
+func TestProbe_EndpointIndependent(t *testing.T) {
+	serverA := startLoopbackStunServer(t)
+	serverB := startLoopbackStunServer(t)
+
+	res, err := Probe("udp4", serverA, serverB, 2*time.Second)
+	if err != nil {
+		t.Fatalf("Probe failed: %v", err)
+	}
+	if !res.EndpointIndependent() {
+		t.Errorf("expected endpoint-independent mapping on loopback: A=%v B=%v", res.MappedA, res.MappedB)
+	}
+	if !res.PortPreserving() {
+		t.Errorf("expected port-preserving on loopback: local=%d mapped=%d", res.LocalPort, res.MappedA.Port)
+	}
+	if res.MappedA.Port != res.LocalPort {
+		t.Errorf("mapped port %d != local port %d", res.MappedA.Port, res.LocalPort)
+	}
+}
+
+// TestProbe_DestinationDependent は symmetric NAT 相当（サーバーごとに見える
+// mapped port が異なる）を、port をずらして応答する偽サーバーで模擬し、
+// EIM 判定が false になることを確認する。
+func TestProbe_DestinationDependent(t *testing.T) {
+	serverA := startLoopbackStunServer(t)
+	serverB := startLoopbackStunServerWithPortOffset(t, 1)
+
+	res, err := Probe("udp4", serverA, serverB, 2*time.Second)
+	if err != nil {
+		t.Fatalf("Probe failed: %v", err)
+	}
+	if res.EndpointIndependent() {
+		t.Errorf("expected destination-dependent mapping: A=%v B=%v", res.MappedA, res.MappedB)
+	}
+}
+
 // startLoopbackStunServer はテスト用の最小STUNサーバーをループバックに起動する。
 // 受け取ったBinding RequestのTransaction IDと送信元アドレスをそのまま使い、
 // XOR-MAPPED-ADDRESSにその送信元を詰めたBinding Success Responseを返すだけで、
 // 認証やNAT越しの実挙動など本来のSTUNサーバーの複雑さは扱わない。
 func startLoopbackStunServer(t *testing.T) string {
+	return startLoopbackStunServerWithPortOffset(t, 0)
+}
+
+// startLoopbackStunServerWithPortOffset は XOR-MAPPED-ADDRESS の port に offset を
+// 加えて応答する偽STUNサーバーを起動する。offset != 0 は「このサーバーから見える
+// mapped port が他と違う」= symmetric NAT 相当の模擬に使う。
+func startLoopbackStunServerWithPortOffset(t *testing.T, portOffset int) string {
 	t.Helper()
 
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
@@ -155,7 +200,8 @@ func startLoopbackStunServer(t *testing.T) string {
 				continue
 			}
 			txID := append([]byte(nil), buf[8:20]...)
-			_, _ = conn.WriteToUDP(makeBindingSuccessResponse(txID, src), src)
+			mapped := &net.UDPAddr{IP: src.IP, Port: src.Port + portOffset}
+			_, _ = conn.WriteToUDP(makeBindingSuccessResponse(txID, mapped), src)
 		}
 	}()
 

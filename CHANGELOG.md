@@ -8,6 +8,64 @@ once it reaches a 1.0 release.
 
 ## [Unreleased]
 
+## [0.0.2] - 2026-07-18
+
+### Added
+
+- `tezzerd --check-nat`: one-shot NAT diagnosis and exit. Probes two STUN
+  servers from a single socket per address family and reports your public
+  address, the NAT mapping behavior (endpoint-independent "cone" vs
+  destination-dependent "symmetric"), port preservation, and an actionable
+  verdict (whether STUN-derived direct QUIC will work, or whether to set up
+  `--udp-port` with router port forwarding). The comparison server defaults to
+  Cloudflare and can be overridden with `--stun-server2`.
+- The server now tells clients which STUN server it uses
+  (`SESSION_CREATED.stun_server`), so client-side STUN queries follow
+  `tezzerd --stun-server` instead of always querying Google. Old
+  clients/servers interoperate (the field is optional).
+
+### Changed
+
+- A client that stops reading output for 30 seconds is now disconnected, so a
+  single stalled client (e.g. a laptop asleep mid-burst) can no longer freeze
+  the session's output for everyone else. The disconnected client reconnects
+  and resynchronizes automatically with no data loss. This completes the
+  backpressure work started with the stall warnings in 0.0.1.
+- Reconnect attempts now back off exponentially (1s doubling to a 60s cap)
+  after repeated failures, instead of redialing (and re-querying STUN) in a
+  tight loop while the server is unreachable. Typing, sleep/wake, and a
+  successful reconnect reset the backoff, so an active user is never delayed.
+- Resynchronization after long sleeps streams the retained backlog in bounded
+  batches instead of decompressing all of it into memory at once.
+- The server caches STUN lookup results (5 minutes on success, 30 seconds on
+  failure), removing repeated blocking queries — and repeated 5-second
+  timeouts in STUN-blocked environments — from session create/attach.
+- Client status and log messages now say "QUIC" instead of the legacy "UDP"
+  wording (including the `-list` / `-info` client detail labels).
+
+### Fixed
+
+- `tezzerd --stun-server` was ignored: STUN queries always went to hardcoded
+  Google/Cloudflare servers regardless of the flag.
+- Removed the NAT-type detection that misreported almost any NAT as
+  "symmetric" (it compared mapped ports across different local sockets, which
+  is meaningless). Correct same-socket probing now backs `--check-nat`.
+- The client now exits cleanly with a clear message when the server reports it
+  cannot continue the session (e.g. QUIC establishment timeout, with a hint to
+  check UDP reachability), instead of sitting attached to a dead session.
+- Fixed rare frame corruption races on the Unix socket when responses and
+  streamed output were written (or read) concurrently.
+- Fixed a UDP socket leak: transports retired by reconnect/migration were kept
+  open until the client exited (one leaked socket per recovery).
+- Fixed a 1-in-65536 client ID collision with the reserved value 0 that could
+  cause session output to be sent twice (over both the SSH path and QUIC).
+
+### Removed
+
+- The client-side `tezzer -udp-port` flag. It was accepted but had no effect;
+  scripts passing it must drop it (**breaking**). The server-side
+  `tezzerd --udp-port` is unchanged.
+
 ## [0.0.1] - 2026-07-16
 
 Initial public release. tezzer is pre-1.0 and its wire protocol and

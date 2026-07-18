@@ -1,7 +1,6 @@
 package session
 
 // handover.go: tezzerd の無停止再起動（self re-exec 方式）の状態シリアライズ・復元。
-// 設計は Suggestion.md「tezzerd の無停止再起動」参照。
 //
 // 旧プロセスは WriteHandover で全セッションのロックを取ったまま（= world stop）状態を
 // 書き出し、PTY master と QUIC UDP ソケットの fd を dup（CLOEXEC なし）して execve で
@@ -24,6 +23,7 @@ import (
 	"time"
 
 	"github.com/kuriyama/tezzer/internal/qtransport"
+	"github.com/kuriyama/tezzer/internal/transport"
 	"github.com/vmihailenco/msgpack/v5"
 )
 
@@ -62,16 +62,15 @@ type handoverSession struct {
 	PtyFd        int      `msgpack:"ptyfd"`
 	AgentForward bool     `msgpack:"agent"`
 
-	UDPClientIDsOut []uint16 `msgpack:"ucids"`
-	LastDetachedNS  int64    `msgpack:"detached"`
-	LastUDPAddr     string   `msgpack:"lastaddr"`
-	LastOutputNS    int64    `msgpack:"lastout"` // 旧フォーマットには無い（復元時 0 = 未設定）
-	LastInputNS     int64    `msgpack:"lastin"`  // 同上
+	QUICClientIDsOut []uint16 `msgpack:"ucids"`
+	LastDetachedNS   int64    `msgpack:"detached"`
+	LastOutputNS     int64    `msgpack:"lastout"` // 旧フォーマットには無い（復元時 0 = 未設定）
+	LastInputNS      int64    `msgpack:"lastin"`  // 同上
 
 	// per-session transport（共有モードのセッションでは QuicFd = -1）
-	UDPPort int    `msgpack:"port"`
-	UDPKey  []byte `msgpack:"key"`
-	QuicFd  int    `msgpack:"quicfd"`
+	Port   int    `msgpack:"port"`
+	Key    []byte `msgpack:"key"`
+	QuicFd int    `msgpack:"quicfd"`
 
 	Hot         []handoverChunk       `msgpack:"hot"`
 	ColdPending []handoverChunk       `msgpack:"coldp"`
@@ -151,7 +150,7 @@ func (m *Manager) WriteHandover(w io.Writer) (abort func(), err error) {
 		SharedQuicFd: -1,
 	}
 	if m.sharedTransport != nil {
-		d, ok := m.sharedTransport.(interface{ DupUDPSocketFd() (int, error) })
+		d, ok := m.sharedTransport.(transport.SocketHandover)
 		if !ok {
 			return fail(fmt.Errorf("shared transport does not support fd handover"))
 		}
@@ -161,8 +160,8 @@ func (m *Manager) WriteHandover(w io.Writer) (abort func(), err error) {
 		}
 		dupFds = append(dupFds, fd)
 		st.SharedQuicFd = fd
-		st.SharedKey = m.udpKey
-		st.SharedPort = m.udpPort
+		st.SharedKey = m.sharedKey
+		st.SharedPort = m.sharedPort
 	}
 
 	for _, s := range m.sessions {
@@ -178,22 +177,21 @@ func (m *Manager) WriteHandover(w io.Writer) (abort func(), err error) {
 		dupFds = append(dupFds, ptyFd)
 
 		hs := handoverSession{
-			ID:              s.ID,
-			Name:            s.Name,
-			Cmd:             s.Cmd,
-			Args:            s.Args,
-			Rows:            s.Rows,
-			Cols:            s.Cols,
-			CreatedAtNS:     s.CreatedAt.UnixNano(),
-			Seq:             s.seq,
-			ChildPID:        s.proc.Pid,
-			PtyFd:           ptyFd,
-			AgentForward:    s.agentListener != nil,
-			UDPClientIDsOut: s.udpClientIDsOut,
-			LastUDPAddr:     s.lastUDPAddr,
-			QuicFd:          -1,
-			Hot:             chunksToHandover(s.outputChunks),
-			ColdPending:     chunksToHandover(s.coldPending),
+			ID:               s.ID,
+			Name:             s.Name,
+			Cmd:              s.Cmd,
+			Args:             s.Args,
+			Rows:             s.Rows,
+			Cols:             s.Cols,
+			CreatedAtNS:      s.CreatedAt.UnixNano(),
+			Seq:              s.seq,
+			ChildPID:         s.proc.Pid,
+			PtyFd:            ptyFd,
+			AgentForward:     s.agentListener != nil,
+			QUICClientIDsOut: s.quicClientIDsOut,
+			QuicFd:           -1,
+			Hot:              chunksToHandover(s.outputChunks),
+			ColdPending:      chunksToHandover(s.coldPending),
 		}
 		if !s.lastDetachedAt.IsZero() {
 			hs.LastDetachedNS = s.lastDetachedAt.UnixNano()
@@ -215,7 +213,7 @@ func (m *Manager) WriteHandover(w io.Writer) (abort func(), err error) {
 			})
 		}
 		if s.st != nil && !s.usesSharedTransport {
-			d, ok := s.st.(interface{ DupUDPSocketFd() (int, error) })
+			d, ok := s.st.(transport.SocketHandover)
 			if !ok {
 				return fail(fmt.Errorf("session %s: transport does not support fd handover", s.ID))
 			}
@@ -225,8 +223,8 @@ func (m *Manager) WriteHandover(w io.Writer) (abort func(), err error) {
 			}
 			dupFds = append(dupFds, fd)
 			hs.QuicFd = fd
-			hs.UDPPort = s.udpPort
-			hs.UDPKey = s.udpKey
+			hs.Port = s.quicPort
+			hs.Key = s.quicKey
 		}
 		st.Sessions = append(st.Sessions, hs)
 	}
@@ -239,8 +237,8 @@ func (m *Manager) WriteHandover(w io.Writer) (abort func(), err error) {
 	// クライアントは idle timeout（60秒）まで接続死に気づけないため、即時 reconnect を
 	// 誘発する。exec 失敗時（abort 経路）でもクライアントは旧プロセスへ再接続するだけで
 	// 実害はない。
-	disconnect := func(t interface{}) {
-		if d, ok := t.(interface{ DisconnectAllClients(string) }); ok {
+	disconnect := func(t transport.ServerTransport) {
+		if d, ok := t.(transport.SocketHandover); ok {
 			d.DisconnectAllClients("tezzerd restarting")
 		}
 	}
@@ -340,8 +338,7 @@ func (m *Manager) restoreSession(hs *handoverSession) error {
 		coldPending:       coldPending,
 		coldPendingBytes:  coldPendingBytes,
 		clients:           make(map[string]*Client),
-		udpClientIDsOut:   hs.UDPClientIDsOut,
-		lastUDPAddr:       hs.LastUDPAddr,
+		quicClientIDsOut:  hs.QUICClientIDsOut,
 		manager:           m,
 		done:              make(chan struct{}),
 		quicReadyCh:       make(chan struct{}),
@@ -385,12 +382,12 @@ func (m *Manager) restoreSession(hs *handoverSession) error {
 	}
 
 	// transport: 共有モードなら manager のものを参照、per-session なら fd から復元。
-	if m.IsSharedUDPEnabled() {
+	if m.IsSharedTransportEnabled() {
 		s.st = m.sharedTransport
 		s.usesSharedTransport = true
-		s.udpEnabled = true
-		s.udpPort = m.GetSharedUDPPort()
-		s.udpKey = m.GetSharedUDPKey()
+		s.quicEnabled = true
+		s.quicPort = m.GetSharedPort()
+		s.quicKey = m.GetSharedKey()
 	} else if hs.QuicFd >= 0 {
 		pc, err := packetConnFromFd(hs.QuicFd, "quic-udp-"+hs.ID)
 		if err != nil {
@@ -398,14 +395,14 @@ func (m *Manager) restoreSession(hs *handoverSession) error {
 			failCleanup()
 			return fmt.Errorf("restore udp socket: %w", err)
 		}
-		st, err := qtransport.NewServerFromPacketConn(hs.UDPKey, pc)
+		st, err := qtransport.NewServerFromPacketConn(hs.Key, pc)
 		if err != nil {
 			_ = pc.Close()
 			_ = s.ptyMaster.Close()
 			failCleanup()
 			return fmt.Errorf("restore transport: %w", err)
 		}
-		if err := s.adoptPerSessionTransport(st, hs.UDPPort, hs.UDPKey); err != nil {
+		if err := s.adoptPerSessionTransport(st, hs.Port, hs.Key); err != nil {
 			_ = s.ptyMaster.Close()
 			failCleanup()
 			return fmt.Errorf("adopt transport: %w", err)

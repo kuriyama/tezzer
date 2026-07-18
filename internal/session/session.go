@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"github.com/kuriyama/tezzer/internal/proto"
@@ -43,6 +42,11 @@ const (
 	// 出力が止まったとき、圧縮待ち（coldPending）を圧縮に回すまでの猶予
 	//（Manager の cleanup ticker で判定）。
 	coldPendingFlushAge = 2 * time.Minute
+	// 再同期（outputFromOffset）1 バッチの raw バイト上限の目安。transport は空が
+	// 返るまで繰り返し引く契約なので全量は最終的に届くが、cold 層（raw 換算で
+	// 数百 MB になりうる）を一括で解凍・保持するメモリスパイクを避ける。
+	// cold セグメント（raw 約 1MB）単位で判定するため、実バッチは上限を多少超えうる。
+	maxResyncBatchRawBytes = 4 * 1024 * 1024
 )
 
 // デバッグ出力のパッケージレベル制御（atomic操作用、0=OFF, 1=ON）
@@ -101,14 +105,13 @@ type Session struct {
 	st                  transport.ServerTransport
 	stCancel            context.CancelFunc
 	usesSharedTransport bool // true なら st は manager 所有の共有 transport（Close/ループは manager 管理）
-	udpEnabled          bool
-	udpPort             int
-	udpKey              []byte
-	udpSessionID        []byte   // bootstrap 互換のため保持（QUIC では暗号化 Nonce 用途は無い）
+	quicEnabled         bool
+	quicPort            int
+	quicKey             []byte
 	ipv4Only            bool     // IPv4のみ使用する場合true
-	udpClientIDsOut     []uint16 // UDP出力送信対象のClientIDリスト（InitiateUDPHandshake 用）
+	quicClientIDsOut    []uint16 // QUIC 出力ファンアウト対象の clientID リスト（RegisterQUICClient で登録）
 
-	// Manager参照（共有UDPモード時のClientIDルーティング用）
+	// Manager参照（共有 transport モード時のClientIDルーティング用）
 	manager *Manager
 
 	// SSH agent forwarding（-A）。作成時にのみ確定し、以後不変（agent.go）。
@@ -134,7 +137,6 @@ type Session struct {
 
 	// デタッチ追跡
 	lastDetachedAt time.Time // 最後にクライアントが0になった時刻
-	lastUDPAddr    string    // 最後に受信した有効なUDP送信元IP
 
 	// 活動追跡（freshness）: セッション単位の最終 PTY 出力/入力時刻。
 	// クライアントが誰も attach していなくても更新される点が ClientInfo.LastSeen
@@ -156,14 +158,13 @@ type OutputChunk struct {
 
 // Client represents a connected client
 type Client struct {
-	ID          string
-	Session     *Session
-	OutCh       chan []byte
-	Done        chan struct{} // writer goroutineで切断検出に使用
-	UDPEnabled  bool          // UDP経由で通信する場合true
-	UDPClientID uint16        // UDP用のクライアント識別子（0の場合はUDP未使用）
-	Protocol    string        // "UDS", "TCP", "UDP"
-	RemoteAddr  string        // リモートアドレス（TCP/UDPの場合）
+	ID           string
+	Session      *Session
+	OutCh        chan []byte
+	Done         chan struct{} // writer goroutineで切断検出に使用
+	QUICClientID uint16        // QUIC 用のクライアント識別子（0 = QUIC 未使用）
+	Protocol     string        // "UDS", "TCP", "UDP"
+	RemoteAddr   string        // リモートアドレス（TCP/UDPの場合）
 }
 
 // lookupLoginShell は /etc/passwd からユーザーのログインシェルを返す。
@@ -289,9 +290,9 @@ func NewSession(id, cmd string, args []string, env map[string]string, cwd string
 	s.quicReady.Store(true)
 
 	// per-session の QUIC トランスポートを起動。
-	if err := s.startUDPManager(fixedUDPPort); err != nil {
-		log.Printf("session %s: failed to start QUIC transport (continuing without UDP): %v", s.ID, err)
-		s.udpEnabled = false
+	if err := s.startQUICTransport(fixedUDPPort); err != nil {
+		log.Printf("session %s: failed to start QUIC transport (continuing without QUIC): %v", s.ID, err)
+		s.quicEnabled = false
 	}
 
 	if s.agentListener != nil {
@@ -321,19 +322,19 @@ func (s *Session) StartProcess() error {
 	return nil
 }
 
-// startUDPManager は per-session の QUIC トランスポートを起動する。
+// startQUICTransport は per-session の QUIC トランスポートを起動する。
 // （関数名は bootstrap 互換のため据え置き。中身は qtransport。）
-func (s *Session) startUDPManager(fixedPort int) error {
+func (s *Session) startQUICTransport(fixedPort int) error {
 	// 共有モード（固定ポート運用）: manager 所有の共有 transport を参照する。
 	// 入力/リサイズのルーティングと OnResyncNeeded は manager 側が担当するため、
 	// ここでは I/O ループを起動しない。
-	if s.manager != nil && s.manager.IsSharedUDPEnabled() {
+	if s.manager != nil && s.manager.IsSharedTransportEnabled() {
 		s.st = s.manager.sharedTransport
 		s.usesSharedTransport = true
-		s.udpEnabled = true
-		s.udpPort = s.manager.GetSharedUDPPort()
-		s.udpKey = s.manager.GetSharedUDPKey()
-		log.Printf("session %s: using shared QUIC transport on port %d", s.ID, s.udpPort)
+		s.quicEnabled = true
+		s.quicPort = s.manager.GetSharedPort()
+		s.quicKey = s.manager.GetSharedKey()
+		log.Printf("session %s: using shared QUIC transport on port %d", s.ID, s.quicPort)
 		return nil
 	}
 
@@ -358,7 +359,12 @@ func (s *Session) startUDPManager(fixedPort int) error {
 		return fmt.Errorf("failed to create QUIC transport: %w", err)
 	}
 
-	addr, ok := st.(interface{ Addr() net.Addr }).Addr().(*net.UDPAddr)
+	a, ok := st.(transport.Addresser)
+	if !ok {
+		_ = st.Close()
+		return fmt.Errorf("transport does not expose listen address")
+	}
+	addr, ok := a.Addr().(*net.UDPAddr)
 	if !ok {
 		_ = st.Close()
 		return fmt.Errorf("failed to get QUIC listen address")
@@ -368,7 +374,7 @@ func (s *Session) startUDPManager(fixedPort int) error {
 }
 
 // adoptPerSessionTransport は per-session QUIC トランスポートの配線・起動を行う
-// （startUDPManager と無停止再起動の復元経路で共通）。失敗時は st を閉じる。
+// （startQUICTransport と無停止再起動の復元経路で共通）。失敗時は st を閉じる。
 func (s *Session) adoptPerSessionTransport(st transport.ServerTransport, port int, key []byte) error {
 	// 再同期: クライアント接続時に OutputRingBuffer から欠損分を埋める（Start 前に配線）。
 	st.OnResyncNeeded(s.outputFromOffset)
@@ -392,11 +398,11 @@ func (s *Session) adoptPerSessionTransport(st transport.ServerTransport, port in
 
 	s.st = st
 	s.stCancel = cancel
-	s.udpEnabled = true
-	s.udpPort = port
-	s.udpKey = key
+	s.quicEnabled = true
+	s.quicPort = port
+	s.quicKey = key
 
-	log.Printf("session %s: QUIC transport enabled on port %d", s.ID, s.udpPort)
+	log.Printf("session %s: QUIC transport enabled on port %d", s.ID, s.quicPort)
 
 	// QUIC クライアント接続時に Gate 2 を通知（BeginQuicPendingMode と連携）
 	st.OnClientConnect(func(_ transport.ClientID) {
@@ -404,14 +410,17 @@ func (s *Session) adoptPerSessionTransport(st transport.ServerTransport, port in
 	})
 
 	// 入力/リサイズ処理ゴルーチンを起動
-	go s.handleUDPInput()
-	go s.handleUDPResize()
+	go s.handleTransportInput()
+	go s.handleTransportResize()
 
 	return nil
 }
 
-// outputFromOffset は OutputRingBuffer から offset(=Seq) >= fromOffset のチャンクを返す
+// outputFromOffset は OutputRingBuffer から offset(=Seq) >= fromOffset のチャンクを、
+// 先頭から maxResyncBatchRawBytes を目安としたバッチで返す
 // （transport.OnResyncNeeded の実装。再接続/長スリープ後の取りこぼし回復）。
+// transport は空が返るまで「最後の offset+1」で繰り返し呼ぶ契約なので、ここで全量を
+// 一括で返す必要はない（cold 層全量の一括解凍によるメモリスパイクを避ける）。
 // 再接続クライアントが要求した位置より古いチャンクが evict 済みで再同期の穴を埋められない
 // 場合は、QUIC 経路で再描画を促すステータスを通知する（旧 UDP の OUTPUT_DROPPED 相当）。
 func (s *Session) outputFromOffset(client transport.ClientID, fromOffset uint64) ([]transport.OutputChunk, error) {
@@ -441,9 +450,24 @@ func (s *Session) outputFromOffset(client transport.ClientID, fromOffset uint64)
 	st := s.st
 	s.mu.RUnlock()
 
-	// cold 層の解凍はロック外で行う（遅くてよいパス。PTY reader を止めない）。
+	// fromOffset>1 = 既に出力を受けていた再接続クライアント。要求位置より古い側が evict
+	// されている（oldestSeq > fromOffset）なら欠損が埋まらないので再描画を促す。
+	// バッチ分割後の後続呼び出し（fromOffset は送信済み位置+1 まで進む）ではこの条件は
+	// 成立しないため、通知は再同期 1 回につき最初の呼び出しでのみ出る。
+	if st != nil && fromOffset > 1 && hasAny && oldestSeq > fromOffset {
+		_ = st.SendStatus(client, "Output was dropped (use Ctrl-^ r to refresh)")
+	}
+
+	// cold 層の解凍はロック外・バッチ上限まで（遅くてよいパス。PTY reader を止めず、
+	// 全セグメント分の raw を同時にメモリへ載せない）。判定はセグメント境界で行うため
+	// バッチは常にセグメント単位で完結し、次バッチの fromOffset が次セグメントの
+	// 先頭（または raw 層）を指す。
 	var out []transport.OutputChunk
+	total := 0
 	for i := range segs {
+		if total >= maxResyncBatchRawBytes {
+			return out, nil // 続きは次バッチ（transport が offset+1 で再度呼ぶ）
+		}
 		chunks, err := segs[i].chunksFrom(fromOffset)
 		if err != nil {
 			// 壊れたセグメントはスキップ。欠損は下の gap 検出 → 再描画通知で救われる
@@ -453,14 +477,15 @@ func (s *Session) outputFromOffset(client transport.ClientID, fromOffset uint64)
 		}
 		for _, ch := range chunks {
 			out = append(out, transport.OutputChunk{Offset: ch.Seq, Data: ch.Data})
+			total += len(ch.Data)
 		}
 	}
-	out = append(out, rawChunks...)
-
-	// fromOffset>1 = 既に出力を受けていた再接続クライアント。要求位置より古い側が evict
-	// されている（oldestSeq > fromOffset）なら欠損が埋まらないので再描画を促す。
-	if st != nil && fromOffset > 1 && hasAny && oldestSeq > fromOffset {
-		_ = st.SendStatus(client, "Output was dropped (use Ctrl-^ r to refresh)")
+	for _, ch := range rawChunks {
+		if total >= maxResyncBatchRawBytes {
+			break // 続きは次バッチ
+		}
+		out = append(out, ch)
+		total += len(ch.Data)
 	}
 	return out, nil
 }
@@ -479,8 +504,8 @@ func (s *Session) oldestRetainedSeqLocked() (uint64, bool) {
 	return 0, false
 }
 
-// handleUDPInput は QUIC 経由の入力を PTY に転送する。
-func (s *Session) handleUDPInput() {
+// handleTransportInput は QUIC 経由の入力を PTY に転送する。
+func (s *Session) handleTransportInput() {
 	if s.st == nil {
 		return
 	}
@@ -504,8 +529,8 @@ func (s *Session) handleUDPInput() {
 	}
 }
 
-// handleUDPResize は QUIC 経由のリサイズ要求を処理する。
-func (s *Session) handleUDPResize() {
+// handleTransportResize は QUIC 経由のリサイズ要求を処理する。
+func (s *Session) handleTransportResize() {
 	if s.st == nil {
 		return
 	}
@@ -811,7 +836,7 @@ func (s *Session) handlePTYOutput(data []byte) {
 	}
 
 	// リングバッファに保存（再接続用）
-	// dataのコピーを作成（UDP送信後に元データが再利用される可能性があるため）
+	// dataのコピーを作成（送信後に元データ（読み取りバッファ）が再利用されるため）
 	dataCopy := make([]byte, len(data))
 	copy(dataCopy, data)
 	newChunk := OutputChunk{
@@ -827,16 +852,16 @@ func (s *Session) handlePTYOutput(data []byte) {
 	needColdFlush := s.evictOutputChunksLocked(time.Now())
 
 	// クライアントリストをコピー（ロック外で送信するため）
-	// 共有UDPモードでは udpClientIDsOut を使用
+	// QUIC のファンアウト先は quicClientIDsOut を使用
 	clients := make([]*Client, 0, len(s.clients))
 	for _, c := range s.clients {
 		clients = append(clients, c)
 	}
-	// このセッションの UDP クライアントへファンアウトする。識別子は (SessionID, Num) の
+	// このセッションの QUIC クライアントへファンアウトする。識別子は (SessionID, Num) の
 	// 複合 ClientID。共有 transport では別セッションの同じ Num と衝突しないよう Session で
-	// 区別する。Num は InitiateUDPHandshake が登録した udpClientIDsOut（このセッション固有）。
-	udpClients := make([]transport.ClientID, len(s.udpClientIDsOut))
-	for i, num := range s.udpClientIDsOut {
+	// 区別する。Num は RegisterQUICClient が登録した quicClientIDsOut（このセッション固有）。
+	udpClients := make([]transport.ClientID, len(s.quicClientIDsOut))
+	for i, num := range s.quicClientIDsOut {
 		udpClients[i] = transport.ClientID{Session: s.ID, Num: num}
 	}
 	s.mu.Unlock()
@@ -874,7 +899,7 @@ func (s *Session) handlePTYOutput(data []byte) {
 			}
 		}
 		for _, client := range clients {
-			if client.UDPClientID != 0 && activeQUIC[client.UDPClientID] {
+			if client.QUICClientID != 0 && activeQUIC[client.QUICClientID] {
 				continue
 			}
 			udsClients = append(udsClients, client)
@@ -945,8 +970,8 @@ func (s *Session) sendOutputDroppedNotification(clientID string, droppedSeq uint
 }
 
 // AttachClient attaches a client to this session
-// udpClientID: UDP用のクライアント識別子（0の場合はUDP未使用）
-func (s *Session) AttachClient(fromSeq uint64, protocol, remoteAddr string, udpClientID uint16) *Client {
+// quicClientID: QUIC 用のクライアント識別子（0 = QUIC 未使用）
+func (s *Session) AttachClient(fromSeq uint64, protocol, remoteAddr string, quicClientID uint16) *Client {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -954,13 +979,13 @@ func (s *Session) AttachClient(fromSeq uint64, protocol, remoteAddr string, udpC
 	clientID := fmt.Sprintf("client-%d", s.clientIDSeed)
 
 	client := &Client{
-		ID:          clientID,
-		Session:     s,
-		OutCh:       make(chan []byte, 1000),
-		Done:        make(chan struct{}),
-		UDPClientID: udpClientID,
-		Protocol:    protocol,
-		RemoteAddr:  remoteAddr,
+		ID:           clientID,
+		Session:      s,
+		OutCh:        make(chan []byte, 1000),
+		Done:         make(chan struct{}),
+		QUICClientID: quicClientID,
+		Protocol:     protocol,
+		RemoteAddr:   remoteAddr,
 	}
 
 	s.clients[clientID] = client
@@ -1009,7 +1034,7 @@ func (s *Session) sendBufferedOutput(client *Client, fromSeq uint64) {
 }
 
 // RequestRedraw は PTY サイズを一時変更して screen/tmux の再描画を促す。
-// sendBufferedOutput 後、または UDP resyncing 完了後に呼ぶ。
+// sendBufferedOutput 後、または QUIC resync 完了後に呼ぶ。
 // cols を 1 減らしてすぐ戻すことで SIGWINCH を 2 回送り、tmux/screen に再描画させる。
 // screen 向けに `screen -X redisplay` を追加実行していたが、GNU Screen 4.9 系では
 // SIGWINCH だけで毎回フル再描画されることを実測で確認したため撤去した（2026-07）。
@@ -1096,6 +1121,15 @@ func (s *Session) Resize(rows, cols int) error {
 	return nil
 }
 
+// Size は現在の PTY サイズを返す。Rows/Cols フィールドは Resize() が s.mu 下で
+// 書き換えるため、パッケージ外からロックなしで直接読むとレースになる（-info/-list の
+// 表示用にはこちらを使う）。
+func (s *Session) Size() (rows, cols int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.Rows, s.Cols
+}
+
 // Clients returns a map of currently attached clients
 func (s *Session) Clients() map[string]*Client {
 	s.mu.RLock()
@@ -1136,8 +1170,7 @@ type ClientInfo struct {
 	ID           string
 	Protocol     string
 	RemoteAddr   string
-	UDPClientID  uint16
-	UDPAddresses []string
+	QUICClientID uint16
 }
 
 // GetClientInfos returns information about all connected clients
@@ -1156,31 +1189,31 @@ func (s *Session) GetClientInfos() []ClientInfo {
 
 	result := make([]ClientInfo, 0, len(clientsCopy))
 
-	// TCP/UDSクライアントに紐づくUDP ClientIDを記録
-	seenUDPClientNums := make(map[uint16]bool)
+	// TCP/UDS クライアントに紐づく QUIC ClientID を記録
+	seenQUICClientNums := make(map[uint16]bool)
 
 	for _, c := range clientsCopy {
-		if c.UDPClientID != 0 {
-			seenUDPClientNums[c.UDPClientID] = true
+		if c.QUICClientID != 0 {
+			seenQUICClientNums[c.QUICClientID] = true
 		}
 		result = append(result, ClientInfo{
-			ID:          c.ID,
-			Protocol:    c.Protocol,
-			RemoteAddr:  c.RemoteAddr,
-			UDPClientID: c.UDPClientID,
+			ID:           c.ID,
+			Protocol:     c.Protocol,
+			RemoteAddr:   c.RemoteAddr,
+			QUICClientID: c.QUICClientID,
 		})
 	}
 
 	// QUICのみのアクティブなクライアントを追加（UDS接続が切れてQUICだけ残っているケース）
 	if st != nil {
 		for _, cid := range st.ActiveClients() {
-			if cid.Session != sessID || seenUDPClientNums[cid.Num] {
+			if cid.Session != sessID || seenQUICClientNums[cid.Num] {
 				continue
 			}
 			result = append(result, ClientInfo{
-				ID:          fmt.Sprintf("quic-%d", cid.Num),
-				Protocol:    "QUIC",
-				UDPClientID: cid.Num,
+				ID:           fmt.Sprintf("quic-%d", cid.Num),
+				Protocol:     "QUIC",
+				QUICClientID: cid.Num,
 			})
 		}
 	}
@@ -1188,11 +1221,11 @@ func (s *Session) GetClientInfos() []ClientInfo {
 	return result
 }
 
-// IsUDPEnabled returns whether UDP is enabled for this session
-func (s *Session) IsUDPEnabled() bool {
+// IsQUICEnabled returns whether the QUIC transport is enabled for this session
+func (s *Session) IsQUICEnabled() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.udpEnabled
+	return s.quicEnabled
 }
 
 // IsPTYClosed returns whether the PTY has been closed
@@ -1228,13 +1261,6 @@ func (s *Session) GetLastInputAt() time.Time {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.lastInputAt
-}
-
-// GetLastUDPAddr returns the last known UDP source IP from any client
-func (s *Session) GetLastUDPAddr() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.lastUDPAddr
 }
 
 // GetBufferedOutput returns all buffered output as a single byte slice
@@ -1347,54 +1373,37 @@ func (s *Session) GetClientSendBufferStats() []ClientSendBufferStats {
 	return out
 }
 
-// GetUDPPort returns the UDP port number
-func (s *Session) GetUDPPort() int {
+// GetQUICPort returns the QUIC listen (UDP) port number
+func (s *Session) GetQUICPort() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.udpPort
+	return s.quicPort
 }
 
-// GetUDPKey returns the shared UDP key
-func (s *Session) GetUDPKey() []byte {
+// GetQUICKey returns the shared key for QUIC mTLS pinning
+func (s *Session) GetQUICKey() []byte {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.udpKey
+	return s.quicKey
 }
 
-// GetUDPSessionID returns the UDP session ID for encryption nonce
-// 共有UDPモード時は共有SessionIDを返し、非共有時はnilを返す
-func (s *Session) GetUDPSessionID() []byte {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.udpSessionID
-}
-
-// GetSessionIDBytes returns the session ID as a byte array for UDP
-func (s *Session) GetSessionIDBytes() [8]byte {
-	// セッションIDをハッシュ化して8バイトに固定
-	h := sha256.Sum256([]byte(s.ID))
-	var result [8]byte
-	copy(result[:], h[:8])
-	return result
-}
-
-// RegisterUDPClient はクライアントを出力ファンアウト対象として登録する。
+// RegisterQUICClient はクライアントを出力ファンアウト対象として登録する。
 // QUIC ではクライアントが Hello で clientID/SessionID を申告し、manager が SessionID で
 // 直接ルーティングするため、事前のハンドシェイク準備や hole punch は不要。ここでは
-// 出力配信先リスト（udpClientIDsOut）へ clientID を加えるだけ。
-func (s *Session) RegisterUDPClient(clientID uint16) error {
+// 出力配信先リスト（quicClientIDsOut）へ clientID を加えるだけ。
+func (s *Session) RegisterQUICClient(clientID uint16) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.st == nil {
 		return fmt.Errorf("transport not enabled")
 	}
-	for _, id := range s.udpClientIDsOut {
+	for _, id := range s.quicClientIDsOut {
 		if id == clientID {
 			return nil
 		}
 	}
-	wasEmpty := len(s.udpClientIDsOut) == 0
-	s.udpClientIDsOut = append(s.udpClientIDsOut, clientID)
+	wasEmpty := len(s.quicClientIDsOut) == 0
+	s.quicClientIDsOut = append(s.quicClientIDsOut, clientID)
 	// Gate 1: UDPClientInfoMsg 受信済みフラグを立てる。
 	// Gate 2（QUIC onConnect）が既に揃っていれば QUIC 準備完了。
 	if wasEmpty {
@@ -1449,24 +1458,8 @@ func (s *Session) Done() <-chan struct{} {
 	return s.done
 }
 
-// RemoveUDPClientID はUDP出力対象リストからClientIDを削除する（共有UDPモード用）
-func (s *Session) RemoveUDPClientID(clientID uint16) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	for i, id := range s.udpClientIDsOut {
-		if id == clientID {
-			// スライスから削除（順序を保持しない）
-			s.udpClientIDsOut[i] = s.udpClientIDsOut[len(s.udpClientIDsOut)-1]
-			s.udpClientIDsOut = s.udpClientIDsOut[:len(s.udpClientIDsOut)-1]
-			log.Printf("session %s: removed UDP ClientID=%d from output list (remaining: %d)", s.ID, clientID, len(s.udpClientIDsOut))
-			break
-		}
-	}
-}
-
 // SetDebug はセッションのデバッグ出力の有効/無効を動的に切り替える
-// UDP Managerのデバッグフラグも同時に更新する（共有モードではManagerが管理）
+// （transport にはデバッグフラグ切替 API が無いためセッション側のみ）
 func (s *Session) SetDebug(enabled bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1483,7 +1476,7 @@ func (s *Session) Close() error {
 		if s.st != nil {
 			s.mu.RLock()
 			ptyClosed := s.ptyClosed
-			clients := append([]uint16(nil), s.udpClientIDsOut...)
+			clients := append([]uint16(nil), s.quicClientIDsOut...)
 			s.mu.RUnlock()
 			reason := "NO_SUCH_SESSION: session closed"
 			exitCode := -1

@@ -30,9 +30,10 @@ func TestQUICTransport_ResyncBacklog(t *testing.T) {
 		{Offset: 2, Data: []byte("bbb")},
 		{Offset: 3, Data: []byte("ccc")},
 	}
+	// バッチ契約により空が返るまで繰り返し呼ばれるため、初回の fromOffset のみ記録する。
 	var gotFrom atomic.Uint64
 	srv.OnResyncNeeded(func(_ transport.ClientID, fromOffset uint64) ([]transport.OutputChunk, error) {
-		gotFrom.Store(fromOffset)
+		gotFrom.CompareAndSwap(0, fromOffset)
 		var out []transport.OutputChunk
 		for _, ch := range backlog {
 			if ch.Offset >= fromOffset {

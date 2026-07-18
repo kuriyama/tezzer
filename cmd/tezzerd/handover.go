@@ -22,11 +22,18 @@ import (
 	"github.com/kuriyama/tezzer/internal/session"
 )
 
+// selfExecutable は re-exec すべきバイナリのパス。SIGUSR2 時点の cwd / PATH に
+// 依存すると意図しないパスへ解決されうる（相対パス起動 + chdir 後など）ため、
+// 起動直後（パッケージ初期化時）に一度だけ解決してキャッシュする。
+// パス文字列を保持する（inode ではない）ので、同じパスに新バイナリを置いてからの
+// SIGUSR2 はアップグレードとして機能する。
+var selfExecutable = resolveSelfExecutable()
+
 // performHandover は状態を書き出して自分自身を exec で置き換える。
 // 成功時はこの関数から戻らない（プロセスが置き換わる）。失敗時はロック・fd を
 // 解放して err を返し、呼び出し元は通常運転を継続できる。
 func performHandover(mgr *session.Manager) error {
-	exe := resolveSelfExecutable()
+	exe := selfExecutable
 
 	// 状態ファイルは tmpfs（XDG_RUNTIME_DIR）優先。作成後すぐ unlink して fd だけで持つ。
 	dir := os.Getenv("XDG_RUNTIME_DIR")

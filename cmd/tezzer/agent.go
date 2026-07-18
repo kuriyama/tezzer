@@ -6,6 +6,8 @@ package main
 
 import (
 	"os"
+
+	"github.com/kuriyama/tezzer/internal/transport"
 )
 
 // resolveLocalAgentSockPath はローカルの $SSH_AUTH_SOCK が使えそうかを確認し、
@@ -29,7 +31,7 @@ func resolveLocalAgentSockPath() string {
 // pollForFeatureSupport を共用する。
 func (c *Client) warnIfAgentForwardingUnsupported() {
 	c.pollForFeatureSupport(func() (bool, bool) {
-		af, ok := c.transport().(interface{ AgentForwardingSupported() bool })
+		af, ok := c.transport().(transport.AgentForwardClient)
 		return ok && af.AgentForwardingSupported(), c.transport() != nil
 	},
 		"-A: server does not support agent forwarding (old server or --no-agent-forwarding)",

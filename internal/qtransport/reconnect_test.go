@@ -9,7 +9,6 @@ import (
 	"crypto/rand"
 	"net"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,13 +25,15 @@ func TestQUICTransport_ReconnectResync(t *testing.T) {
 	}
 	defer srv.Close()
 
+	// バッチ契約（transport は空が返るまで offset+1 で繰り返し呼ぶ）に合わせ、
+	// 呼び出しごとの fromOffset を列で記録する。
 	var mu sync.Mutex
 	backlog := []transport.OutputChunk{{Offset: 1, Data: []byte("aaa")}}
-	var resyncFrom atomic.Uint64
+	var resyncCalls []uint64
 	srv.OnResyncNeeded(func(_ transport.ClientID, fromOffset uint64) ([]transport.OutputChunk, error) {
-		resyncFrom.Store(fromOffset)
 		mu.Lock()
 		defer mu.Unlock()
+		resyncCalls = append(resyncCalls, fromOffset)
 		var out []transport.OutputChunk
 		for _, ch := range backlog {
 			if ch.Offset >= fromOffset {
@@ -75,6 +76,25 @@ func TestQUICTransport_ReconnectResync(t *testing.T) {
 	// fresh connect: resync from 1 → "aaa"（lastOffset=1 へ）。
 	recv("aaa")
 
+	// 初回 resync の呼び出し列（1 → 空応答の 2 で終了）が落ち着くのを待つ。
+	waitCalls := func(n int) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			mu.Lock()
+			l := len(resyncCalls)
+			mu.Unlock()
+			if l >= n {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("timeout waiting for %d resync calls (got %d)", n, l)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	waitCalls(2)
+
 	// 断中に出力が積まれた状況を模擬（backlog に offset=2 追加）。
 	mu.Lock()
 	backlog = append(backlog, transport.OutputChunk{Offset: 2, Data: []byte("bbb")})
@@ -85,9 +105,44 @@ func TestQUICTransport_ReconnectResync(t *testing.T) {
 		t.Fatalf("reconnect: %v", err)
 	}
 
-	// reconnect の resync は fromOffset = lastOffset(1)+1 = 2 で呼ばれ "bbb" が届く。
+	// reconnect の resync は fromOffset = lastOffset(1)+1 = 2 で始まり "bbb" が届く。
 	recv("bbb")
-	if got := resyncFrom.Load(); got != 2 {
-		t.Fatalf("reconnect OnResyncNeeded fromOffset=%d want 2", got)
+	waitCalls(3)
+	mu.Lock()
+	reconnectFrom := resyncCalls[2]
+	mu.Unlock()
+	if reconnectFrom != 2 {
+		t.Fatalf("reconnect OnResyncNeeded first fromOffset=%d want 2", reconnectFrom)
+	}
+}
+
+// reconnect 連続失敗時の指数バックオフ（bump で倍々・上限で頭打ち・reset で即時復帰可）。
+func TestReconnectBackoff(t *testing.T) {
+	c := &quicClient{}
+	if c.inBackoff() {
+		t.Fatal("fresh client should not be in backoff")
+	}
+	if d := c.bumpBackoff(); d != reconnectBackoffBase {
+		t.Fatalf("first backoff = %v, want %v", d, reconnectBackoffBase)
+	}
+	if !c.inBackoff() {
+		t.Fatal("should be in backoff after failure")
+	}
+	if d := c.bumpBackoff(); d != 2*reconnectBackoffBase {
+		t.Fatalf("second backoff = %v, want %v", d, 2*reconnectBackoffBase)
+	}
+	var last time.Duration
+	for i := 0; i < 40; i++ { // 上限到達後も頭打ちのまま増えない・オーバーフローしない
+		last = c.bumpBackoff()
+	}
+	if last != reconnectBackoffMax {
+		t.Fatalf("capped backoff = %v, want %v", last, reconnectBackoffMax)
+	}
+	c.resetBackoff()
+	if c.inBackoff() {
+		t.Fatal("reset should clear backoff")
+	}
+	if d := c.bumpBackoff(); d != reconnectBackoffBase {
+		t.Fatalf("backoff after reset = %v, want %v", d, reconnectBackoffBase)
 	}
 }

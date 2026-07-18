@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -41,6 +42,7 @@ type dialResult struct {
 	conn *quic.Conn
 	tr   *quic.Transport
 	addr string
+	err  error // 失敗時のみ（conn == nil）。診断用に候補ごとの理由を運ぶ
 }
 
 // newLocalQUICTransport は新しいローカル UDP ソケット上に quic.Transport を作る。
@@ -73,13 +75,12 @@ type quicClient struct {
 	clientID     uint16
 	sessionID    string
 
-	tr            *quic.Transport
-	oldTransports []*quic.Transport // migration で退役した transport（Close でまとめて閉じる）
-	conn          *quic.Conn
-	ctrl          *quic.Stream     // control bidi（Hello/Resize 送信）
-	in            *quic.SendStream // 入力 uni
-	inConn        *quic.Conn       // in が属する conn（datagram 送信用。in と同時に差し替える）
-	inOffset      uint64           // in へ送った累計バイト数（datagram の offset。再接続でリセット）
+	tr       *quic.Transport
+	conn     *quic.Conn
+	ctrl     *quic.Stream     // control bidi（Hello/Resize 送信）
+	in       *quic.SendStream // 入力 uni
+	inConn   *quic.Conn       // in が属する conn（datagram 送信用。in と同時に差し替える）
+	inOffset uint64           // in へ送った累計バイト数（datagram の offset。再接続でリセット）
 	// inConn が DATAGRAM 対応か（接続確立時に一度だけ ConnectionState() を読んで
 	// キャッシュする。トランスポートパラメータは接続ごとに不変なので打鍵ごとに
 	// 問い合わせる必要がなく、また ConnectionState() は quic-go v0.60 内部の
@@ -94,7 +95,14 @@ type quicClient struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	recovering     atomic.Bool // recover() の多重起動防止
+	recovering atomic.Bool // recover() の多重起動防止
+	// reconnect 連続失敗時の指数バックオフ。放置クライアント（-N トンネル等）が
+	// サーバ消失後に dial（最大 10s）+ 候補リフレッシュの STUN 問い合わせを
+	// 際限なく叩き続けるのを抑える。
+	backoffMu    sync.Mutex
+	backoffFails int       // 連続失敗回数
+	backoffUntil time.Time // この時刻まで次の復帰試行を控える
+
 	state          atomic.Int32
 	lastOffset     atomic.Uint64 // 最後に配信した出力 offset（再同期 Hello・重複排除用）
 	lastRecoveryMs atomic.Uint64 // 直近の復帰所要時間（ms）
@@ -130,26 +138,30 @@ func NewClient(k []byte, serverAddr string, clientID uint16, sessionID string) (
 	return c, nil
 }
 
+// Start は接続を確立する。SetRoamingCandidates が Start 前に呼ばれていれば
+// 全候補へ並行 Dial し、最初に確立したものを採用する（reconnect と同じ dialParallel。
+// 以前は呼び出し側 cmd/tezzer が候補ごとに transport を丸ごと作って競争させる
+// 二重実装を持っていたが、transport 内部に一本化した）。
+// 候補未設定なら serverAddr へ単独 Dial する。
 func (c *quicClient) Start(ctx context.Context) error {
 	tlsConf, err := ClientTLS(c.k)
 	if err != nil {
 		return err
 	}
-	// 自前 UDP ソケット + Transport（後で migration するため）。
-	tr, err := newLocalQUICTransport()
-	if err != nil {
-		return err
-	}
-	c.tr = tr
 
-	raddr, err := net.ResolveUDPAddr("udp", c.serverAddr)
-	if err != nil {
-		return err
+	c.candidatesMu.Lock()
+	candidates := c.candidates
+	c.candidatesMu.Unlock()
+	if len(candidates) == 0 {
+		candidates = []string{c.serverAddr}
 	}
-	conn, err := c.tr.Dial(ctx, raddr, tlsConf, quicConfig())
-	if err != nil {
-		return err
+
+	winner, failures := dialParallel(ctx, candidates, tlsConf)
+	if winner == nil {
+		return fmt.Errorf("all %d candidate(s) failed: %s", len(candidates), strings.Join(failures, "; "))
 	}
+	c.tr = winner.tr
+	conn := winner.conn
 	c.conn = conn
 
 	// control bidi を開いて Hello を送る。
@@ -173,7 +185,7 @@ func (c *quicClient) Start(ctx context.Context) error {
 	c.inDatagramsOK = conn.ConnectionState().SupportsDatagrams.Remote
 
 	c.ctx, c.cancel = context.WithCancel(context.Background())
-	c.setState(transport.StateConnected, "connected")
+	c.setState(transport.StateConnected, "connected via "+winner.addr)
 	go c.pumpOutput(conn)
 	go c.readCtrl(ctrl)
 	go c.acceptServerStreams(conn)
@@ -194,6 +206,12 @@ func (c *quicClient) watchdog() {
 	// jumped 誤検知の残存分への保険（上記の見積もりがずれていても被害を頭打ちにする）。
 	// connDead() は対象外: 真に接続が死んだ場合はクールダウンなしで毎 tick リトライしてよい。
 	const jumpRecoveryCooldown = 15 * time.Second
+	// tick に対する超過がこの値を超えたらログする。sleepThreshold 未満のジャンプは
+	// migration 不要だが、VM 一時停止（WSL2 のアイドル制御等）による体感数秒の
+	// スタックの証拠になるため、黙って捨てずに記録して事後調査と突き合わせる。
+	// wall と monotonic を並記する: wall のみ大きい = 時計ジャンプ（サスペンド・
+	// VM 時刻再同期）、両方大きい = プロセス/VM がその間実行されていない。
+	const tickGapLogThreshold = 500 * time.Millisecond
 	last := time.Now()
 	var lastJumpRecovery time.Time
 	t := time.NewTicker(tick)
@@ -207,7 +225,20 @@ func (c *quicClient) watchdog() {
 			// 止まるため now.Sub(last)（monotonic）ではジャンプを検出できない。Round(0) で
 			// monotonic を剥がし、wall 時計の差（サスペンド時間を含む）で判定する。
 			jumped := now.Round(0).Sub(last.Round(0)) > sleepThreshold
-			last = time.Now()
+			// tick gap の計測は ticker の値 now ではなく配送時点の実時刻で行う。
+			// runtime は遅延した tick に「予定時刻」（Now() から遅延分を引いた値）を
+			// 載せるため、monotonic が進むタイプの停止（SIGSTOP・VM pause 等）は
+			// now からは見えない（SIGSTOP 2s の実験で delta ~1s のままを確認）。
+			// suspend 検出（jumped）が now で機能するのは、サスペンドでは monotonic
+			// 自体が止まり遅延補正がかからず wall ジャンプが値に残るため。
+			nowReal := time.Now()
+			wallDelta := nowReal.Round(0).Sub(last.Round(0))
+			monoDelta := nowReal.Sub(last)
+			last = nowReal
+			if wallDelta-tick > tickGapLogThreshold || monoDelta-tick > tickGapLogThreshold {
+				c.logf("watchdog: tick gap wall=%v mono=%v",
+					wallDelta.Truncate(time.Millisecond), monoDelta.Truncate(time.Millisecond))
+			}
 			// recover は非同期で起動する。同期で呼ぶと高遅延環境では recover が数秒〜十数秒
 			// ブロックし、その間 tick できず last が古くなって「ジャンプ」を誤検出 → 自己増殖
 			// ループになる（実機で Recoveries=92 を観測）。多重起動は recovering フラグが防ぐ。
@@ -220,6 +251,9 @@ func (c *quicClient) watchdog() {
 					continue
 				}
 				lastJumpRecovery = time.Now()
+				// スリープ復帰はネットワーク環境が変わった可能性が高いので、
+				// バックオフをリセットして即試行する。
+				c.resetBackoff()
 				go c.recover("sleep wake detected")
 			case c.connDead():
 				// サスペンドを伴わない経路断・接続死も拾う。
@@ -237,6 +271,45 @@ func (c *quicClient) connDead() bool {
 	return conn != nil && conn.Context().Err() != nil
 }
 
+// reconnect 連続失敗時のバックオフ。初回失敗後 reconnectBackoffBase、以後倍々で
+// reconnectBackoffMax まで伸びる（実効間隔にはさらに試行自体の所要時間 =
+// dialParallel の最大 10s が加算される）。
+const (
+	reconnectBackoffBase = 1 * time.Second
+	reconnectBackoffMax  = 60 * time.Second
+)
+
+// inBackoff は次の復帰試行を控えるべき間 true を返す。
+func (c *quicClient) inBackoff() bool {
+	c.backoffMu.Lock()
+	defer c.backoffMu.Unlock()
+	return time.Now().Before(c.backoffUntil)
+}
+
+// bumpBackoff は reconnect の連続失敗を記録し、次試行までの待ちを倍々で伸ばす。
+func (c *quicClient) bumpBackoff() time.Duration {
+	c.backoffMu.Lock()
+	defer c.backoffMu.Unlock()
+	d := reconnectBackoffBase << uint(c.backoffFails)
+	if d <= 0 || d > reconnectBackoffMax {
+		d = reconnectBackoffMax
+	}
+	if c.backoffFails < 30 { // シフトのオーバーフロー防止（上限到達後は増やす意味がない）
+		c.backoffFails++
+	}
+	c.backoffUntil = time.Now().Add(d)
+	return d
+}
+
+// resetBackoff は連続失敗の記録をクリアし、次の復帰試行を即時可能にする。
+// 成功時と、環境変化が濃厚な外部イベント（スリープ復帰・ユーザー打鍵）で呼ぶ。
+func (c *quicClient) resetBackoff() {
+	c.backoffMu.Lock()
+	c.backoffFails = 0
+	c.backoffUntil = time.Time{}
+	c.backoffMu.Unlock()
+}
+
 // recover は経路復帰を試みる。まず能動 migration（接続生存時）、失敗したら
 // full reconnect（接続死＝idle timeout 超の長スリープ時）にフォールバックする。
 func (c *quicClient) recover(reason string) {
@@ -246,15 +319,28 @@ func (c *quicClient) recover(reason string) {
 	}
 	defer c.recovering.Store(false)
 
+	// 連続失敗中はバックオフ（次試行時刻まで何もしない）。watchdog は毎 tick 呼ぶが
+	// ここで弾く。スリープ復帰・打鍵起点の復帰は resetBackoff 済みで来るため、
+	// ユーザーが現に使おうとしている場面で待たされることはない。
+	if c.inBackoff() {
+		return
+	}
+
 	// 接続が生きていれば軽い能動 migration を試す（同一 NW のスリープ/NAT rebind）。
 	// 既に死んでいる場合は migrate（AddPath/Probe）が無駄に Probe タイムアウトまで
 	// 待つので、直接 reconnect する。
 	if !c.connDead() {
 		if err := c.migrate(reason); err == nil {
+			c.resetBackoff()
 			return
 		}
 	}
-	_ = c.reconnect(reason)
+	if err := c.reconnect(reason); err != nil {
+		delay := c.bumpBackoff()
+		c.logf("reconnect failed (%v); next retry in %v", err, delay)
+	} else {
+		c.resetBackoff()
+	}
 }
 
 // reconnect は接続が死んだ後（長スリープ > idle timeout）に新しい QUIC 接続を張り直す。
@@ -279,7 +365,7 @@ func (c *quicClient) reconnect(reason string) error {
 		candidates = []string{c.serverAddr}
 	}
 
-	winner := dialParallel(c.ctx, candidates, tlsConf)
+	winner, failures := dialParallel(c.ctx, candidates, tlsConf)
 
 	// 全候補失敗時: 候補リフレッシュ関数が登録されていれば再探索して再試行する。
 	// スリープ復帰後にネットワーク環境が変わった場合（リモート↔LAN）に対応。
@@ -292,7 +378,7 @@ func (c *quicClient) reconnect(reason string) error {
 			freshCandidates := refresher()
 			if len(freshCandidates) > 0 && !candidatesEqual(freshCandidates, candidates) {
 				c.setState(transport.StateRecovering, "reconnecting: refreshed candidates")
-				winner = dialParallel(c.ctx, freshCandidates, tlsConf)
+				winner, failures = dialParallel(c.ctx, freshCandidates, tlsConf)
 				if winner != nil {
 					// 次回 reconnect からは新しい候補を使う
 					c.candidatesMu.Lock()
@@ -304,7 +390,7 @@ func (c *quicClient) reconnect(reason string) error {
 	}
 
 	if winner == nil {
-		return fmt.Errorf("reconnect: all %d candidate(s) failed", len(candidates))
+		return fmt.Errorf("reconnect: all %d candidate(s) failed: %s", len(candidates), strings.Join(failures, "; "))
 	}
 
 	// winner への接続でストリームを構築する。
@@ -334,7 +420,7 @@ func (c *quicClient) reconnect(reason string) error {
 	if c.conn != nil {
 		_ = c.conn.CloseWithError(0, "reconnect")
 	}
-	c.oldTransports = append(c.oldTransports, c.tr)
+	c.retireTransport(c.tr)
 	c.conn = winner.conn
 	c.tr = winner.tr
 	c.ctrlMu.Lock()
@@ -387,12 +473,30 @@ func (c *quicClient) migrate(reason string) error {
 		return err
 	}
 
-	// 旧 transport は即閉じると競合しうるため保持し、Close でまとめて閉じる。
-	c.oldTransports = append(c.oldTransports, c.tr)
+	// 旧 transport は即閉じると競合しうるため、猶予をおいて閉じる。
+	c.retireTransport(c.tr)
 	c.tr = tr
 	c.recordRecovery(start)
 	c.setState(transport.StateConnected, "roaming: migrated")
 	return nil
+}
+
+// transportRetireGrace は退役した transport（旧 UDP ソケット）を閉じるまでの猶予。
+// Switch/reconnect 直後に即閉じすると quic-go 内部のパス処理（旧経路への
+// CONNECTION_CLOSE 送出・再送等）と競合しうるため少し待つ。
+const transportRetireGrace = 30 * time.Second
+
+// retireTransport は退役した transport を猶予をおいて（または Close 時に即）閉じる。
+// 従来は Close() までまとめて保持していたが、復帰のたびに UDP ソケット fd が溜まり
+// リークしていた（WSL2 の watchdog 誤検知事案では 90h で recovery 1659 回 = fd 1659 個）。
+func (c *quicClient) retireTransport(tr *quic.Transport) {
+	go func() {
+		select {
+		case <-time.After(transportRetireGrace):
+		case <-c.ctx.Done():
+		}
+		_ = closeTransport(tr)
+	}()
 }
 
 // recordRecovery は復帰所要時間と回数を記録する。
@@ -443,7 +547,11 @@ func (c *quicClient) SendInput(data []byte) error {
 	if err != nil {
 		// 接続死（スリープ復帰直後など）を打鍵で踏んだら即復帰を起動する
 		// （watchdog の次 tick を待たず体感を改善）。多重起動は migrateMu で直列化。
-		go c.recover("input send failed")
+		// ユーザー操作起点なのでバックオフもリセットして待たせない。
+		go func() {
+			c.resetBackoff()
+			c.recover("input send failed")
+		}()
 		return err
 	}
 	// 小さい入力（打鍵）は DATAGRAM でも投機送信し、ロス時のストリーム再送待ち
@@ -506,6 +614,18 @@ func (c *quicClient) OnLogMessage(fn func(string)) {
 	c.onLogMessage = fn
 	c.cbMu.Unlock()
 }
+
+// logf はクライアント側で生成した診断メッセージを OnLogMessage 経由で上位
+// （クライアントログファイル・stats の通知リスト）へ送る。コールバック未登録
+// （Start 直後〜登録前）の間は捨てる。
+func (c *quicClient) logf(format string, args ...any) {
+	c.cbMu.Lock()
+	onLog := c.onLogMessage
+	c.cbMu.Unlock()
+	if onLog != nil {
+		onLog(fmt.Sprintf(format, args...))
+	}
+}
 func (c *quicClient) OnServerMeta(fn func(buildID, buildTime string, instanceID []byte)) {
 	c.cbMu.Lock()
 	c.onServerMeta = fn
@@ -528,9 +648,12 @@ func (c *quicClient) SetCandidatesRefresher(fn func() []string) {
 	c.candidatesRefresherMu.Unlock()
 }
 
-// dialParallel は candidates に並行 Dial し、最初に確立した接続を返す。
-// 全候補失敗時は nil を返す。ctx にタイムアウトを含めること。
-func dialParallel(ctx context.Context, candidates []string, tlsConf *tls.Config) *dialResult {
+// dialParallel は candidates に並行 Dial し、最初に確立した接続と、失敗した候補の
+// 理由（"addr: err" 形式。診断用）を返す。全候補失敗時は winner が nil。
+// ctx にタイムアウトがなくても内部で 10s を上限にする。
+// 勝者確定後にキャンセルされた残候補の失敗も failures に混ざるが、呼び出し側が
+// failures を使うのは winner == nil のときだけなので実害はない。
+func dialParallel(ctx context.Context, candidates []string, tlsConf *tls.Config) (*dialResult, []string) {
 	ch := make(chan dialResult, len(candidates))
 	dialCtx, dialCancel := context.WithTimeout(ctx, 10*time.Second)
 
@@ -542,16 +665,19 @@ func dialParallel(ctx context.Context, candidates []string, tlsConf *tls.Config)
 			defer wg.Done()
 			tr, err := newLocalQUICTransport()
 			if err != nil {
+				ch <- dialResult{addr: addr, err: err}
 				return
 			}
 			raddr, err := net.ResolveUDPAddr("udp", addr)
 			if err != nil {
 				_ = closeTransport(tr)
+				ch <- dialResult{addr: addr, err: err}
 				return
 			}
 			conn, err := tr.Dial(dialCtx, raddr, tlsConf, quicConfig())
 			if err != nil {
 				_ = closeTransport(tr)
+				ch <- dialResult{addr: addr, err: err}
 				return
 			}
 			ch <- dialResult{conn: conn, tr: tr, addr: addr}
@@ -564,7 +690,12 @@ func dialParallel(ctx context.Context, candidates []string, tlsConf *tls.Config)
 	}()
 
 	var winner *dialResult
+	var failures []string
 	for r := range ch {
+		if r.err != nil {
+			failures = append(failures, r.addr+": "+r.err.Error())
+			continue
+		}
 		if winner == nil {
 			rCopy := r
 			winner = &rCopy
@@ -574,7 +705,7 @@ func dialParallel(ctx context.Context, candidates []string, tlsConf *tls.Config)
 			_ = closeTransport(r.tr)
 		}
 	}
-	return winner
+	return winner, failures
 }
 
 // candidatesEqual は2つの候補リストが同じかを返す（順序も含む）。
@@ -662,11 +793,14 @@ func (c *quicClient) Close() error {
 	if c.tr != nil {
 		_ = closeTransport(c.tr)
 	}
-	for _, tr := range c.oldTransports {
-		_ = closeTransport(tr)
-	}
+	// 退役済み transport は retireTransport の goroutine が ctx.Done（上の cancel）を
+	// 見て閉じる。
 	c.migrateMu.Unlock()
 	return nil
 }
 
-var _ transport.ClientTransport = (*quicClient)(nil)
+var (
+	_ transport.ClientTransport    = (*quicClient)(nil)
+	_ transport.ResyncSeeder       = (*quicClient)(nil)
+	_ transport.AgentForwardClient = (*quicClient)(nil)
+)

@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -38,7 +39,14 @@ func main() {
 	noTCPForwarding := flag.Bool("no-tcp-forwarding", false, "disable TCP port forwarding (-L) for all sessions")
 	noAgentForwarding := flag.Bool("no-agent-forwarding", false, "disable SSH agent forwarding (-A) for all sessions")
 	maxSessions := flag.Int("max-sessions", 0, "maximum number of active sessions (0 = unlimited)")
+	checkNAT := flag.Bool("check-nat", false, "run a one-shot NAT diagnosis (mapping behavior, port preservation) and exit")
+	stunServer2 := flag.String("stun-server2", "stun.cloudflare.com:3478", "second STUN server for -check-nat (mapping comparison needs two servers)")
 	flag.Parse()
+
+	// -check-nat はデーモンを起動せず診断だけして終了する。
+	if *checkNAT {
+		os.Exit(runCheckNAT(*stunServer, *stunServer2, *ipv4Only))
+	}
 
 	// デバッグフラグの初期値（環境変数から）
 	debugInit := os.Getenv("TEZZER_DEBUG") != ""
@@ -63,7 +71,7 @@ func main() {
 
 	// 無停止再起動（self re-exec）からの復元: 旧プロセスが継承させた状態 fd があれば、
 	// セッション（PTY・リングバッファ・QUIC ソケット）をここで引き継ぐ。
-	// 共有 transport も状態に含まれるため、復元された場合は InitSharedUDP をスキップする。
+	// 共有 transport も状態に含まれるため、復元された場合は InitSharedTransport をスキップする。
 	if fdStr := os.Getenv(session.HandoverEnvVar); fdStr != "" {
 		os.Unsetenv(session.HandoverEnvVar) // 以後生成する子プロセスへ漏らさない
 		if fd, err := strconv.Atoi(fdStr); err != nil {
@@ -83,8 +91,8 @@ func main() {
 	// 固定 UDP ポート指定時は共有 QUIC transport を1つ起動し、全セッションを1ポートに相乗りさせる
 	// （固定ポートを port-forward した運用向け）。未指定なら各セッションが per-session で QUIC を起動。
 	// 無停止再起動で共有 transport を引き継いだ場合は不要（ソケットごと復元済み）。
-	if *udpPort > 0 && !mgr.IsSharedUDPEnabled() {
-		if err := mgr.InitSharedUDP(*udpPort, *ipv4Only); err != nil {
+	if *udpPort > 0 && !mgr.IsSharedTransportEnabled() {
+		if err := mgr.InitSharedTransport(*udpPort, *ipv4Only); err != nil {
 			log.Fatalf("failed to initialize shared QUIC transport: %v", err)
 		}
 	}
@@ -149,7 +157,7 @@ func main() {
 				atomic.StoreInt32(&debugEnabled, newVal)
 				enabled := newVal == 1
 				session.SetDebugEnabled(enabled)
-				// 全セッションのデバッグフラグも更新（UDP Managerを含む）
+				// 全セッションのデバッグフラグも更新
 				mgr.SetDebugForAllSessions(enabled)
 				status := "OFF"
 				if enabled {
@@ -162,7 +170,7 @@ func main() {
 				signal.Stop(sigCh) // これ以上シグナルを受け取らない
 				listener.Close()
 				os.Remove(*listenUnix)
-				mgr.Close() // 共有UDP Managerを含むリソースをクリーンアップ
+				mgr.Close() // 共有 transport を含むリソースをクリーンアップ
 				close(shutdownCh)
 				return // goroutineを終了
 			}
@@ -195,7 +203,23 @@ func main() {
 	}
 }
 
-func handleConnection(conn net.Conn, mgr *session.Manager, stunServer string, ipv4Only bool, fixedUDPPort int) {
+// udsConn は UDS 接続への書き込みを直列化するラッパ。attach 後は writer goroutine
+// （OutCh 配信）と読み取りループ内の直接応答（PONG / SERVER_META / SESSION_KILLED /
+// QUIC timeout エラー）が同一 conn へ並行して書くため、無ロックの netx.WriteFrame
+// （長さヘッダとペイロードを別 Write する）ではフレームが混線しうる。
+type udsConn struct {
+	net.Conn
+	writeMu sync.Mutex
+}
+
+func (c *udsConn) WriteFrame(payload []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return netx.WriteFrame(c.Conn, payload)
+}
+
+func handleConnection(rawConn net.Conn, mgr *session.Manager, stunServer string, ipv4Only bool, fixedUDPPort int) {
+	conn := &udsConn{Conn: rawConn}
 	defer conn.Close()
 
 	log.Printf("new connection from %s", conn.RemoteAddr())
@@ -204,7 +228,7 @@ func handleConnection(conn net.Conn, mgr *session.Manager, stunServer string, ip
 	protocol := "UDS"
 	remoteAddr := conn.RemoteAddr().String()
 
-	peerUID, err := netx.GetPeerUID(conn)
+	peerUID, err := netx.GetPeerUID(rawConn)
 	if err != nil {
 		log.Printf("failed to get peer UID: %v", err)
 		sendError(conn, proto.ErrUnauthorized, "Unix socket authentication failed")
@@ -252,7 +276,7 @@ func handleConnection(conn net.Conn, mgr *session.Manager, stunServer string, ip
 		return
 	}
 
-	if err := netx.WriteFrame(conn, welcomeData); err != nil {
+	if err := conn.WriteFrame(welcomeData); err != nil {
 		log.Printf("write welcome error: %v", err)
 		return
 	}
@@ -296,7 +320,7 @@ func handleConnection(conn net.Conn, mgr *session.Manager, stunServer string, ip
 			log.Printf("marshal sessions list error: %v", err)
 			return
 		}
-		if err := netx.WriteFrame(conn, listData); err != nil {
+		if err := conn.WriteFrame(listData); err != nil {
 			log.Printf("write sessions list error: %v", err)
 		}
 		return
@@ -318,7 +342,7 @@ func handleConnection(conn net.Conn, mgr *session.Manager, stunServer string, ip
 			log.Printf("marshal session info error: %v", err)
 			return
 		}
-		if err := netx.WriteFrame(conn, infoData); err != nil {
+		if err := conn.WriteFrame(infoData); err != nil {
 			log.Printf("write session info error: %v", err)
 		}
 		return
@@ -358,19 +382,15 @@ func handleConnection(conn net.Conn, mgr *session.Manager, stunServer string, ip
 
 		stunAddrs, localAddr := resolveUDPAddrs(sess, stunServer, ipv4Only)
 
-		udpSessionID := sess.GetUDPSessionID()
-		if debugEnabled != 0 {
-			log.Printf("session %s: sending UDPSessionID=%x (len=%d)", sess.ID, udpSessionID, len(udpSessionID))
-		}
 		createdMsg := proto.SessionCreatedMsg{
-			Type:         "SESSION_CREATED",
-			SessionID:    sess.ID,
-			UDPEnabled:   sess.IsUDPEnabled(),
-			UDPPort:      sess.GetUDPPort(),
-			UDPKey:       sess.GetUDPKey(),
-			UDPSessionID: udpSessionID,
-			STUNAddrs:    stunAddrs,
-			LocalAddr:    localAddr,
+			Type:       "SESSION_CREATED",
+			SessionID:  sess.ID,
+			UDPEnabled: sess.IsQUICEnabled(),
+			UDPPort:    sess.GetQUICPort(),
+			UDPKey:     sess.GetQUICKey(),
+			STUNAddrs:  stunAddrs,
+			LocalAddr:  localAddr,
+			STUNServer: stunServer,
 		}
 
 		createdData, err := msgpack.Marshal(createdMsg)
@@ -378,7 +398,7 @@ func handleConnection(conn net.Conn, mgr *session.Manager, stunServer string, ip
 			log.Printf("marshal session created error: %v", err)
 			return
 		}
-		if err := netx.WriteFrame(conn, createdData); err != nil {
+		if err := conn.WriteFrame(createdData); err != nil {
 			log.Printf("write session created error: %v", err)
 			return
 		}
@@ -425,26 +445,22 @@ func handleConnection(conn net.Conn, mgr *session.Manager, stunServer string, ip
 			}
 		}
 
-		// Attach client (UDP情報はAttachSessionMsgから取得)
+		// Attach client (QUIC clientID は AttachSessionMsg から取得)
 		client = sess.AttachClient(m.FromSeq, protocol, remoteAddr, m.ClientID)
 
 		// Send SESSION_CREATED (attach成功の通知として)
 		stunAddrs, localAddr := resolveUDPAddrs(sess, stunServer, ipv4Only)
 
-		attachUDPSessionID := sess.GetUDPSessionID()
-		if debugEnabled != 0 {
-			log.Printf("session %s: sending UDPSessionID=%x (len=%d) on attach", sess.ID, attachUDPSessionID, len(attachUDPSessionID))
-		}
 		attachedMsg := proto.SessionCreatedMsg{
-			Type:         "SESSION_CREATED",
-			SessionID:    sess.ID,
-			UDPEnabled:   sess.IsUDPEnabled(),
-			UDPPort:      sess.GetUDPPort(),
-			UDPKey:       sess.GetUDPKey(),
-			UDPSessionID: attachUDPSessionID, // 共有UDPモード時のみ設定される
-			STUNAddrs:    stunAddrs,
-			LocalAddr:    localAddr,
-			PTYClosed:    sess.IsPTYClosed(),
+			Type:       "SESSION_CREATED",
+			SessionID:  sess.ID,
+			UDPEnabled: sess.IsQUICEnabled(),
+			UDPPort:    sess.GetQUICPort(),
+			UDPKey:     sess.GetQUICKey(),
+			STUNAddrs:  stunAddrs,
+			LocalAddr:  localAddr,
+			STUNServer: stunServer,
+			PTYClosed:  sess.IsPTYClosed(),
 		}
 
 		attachedData, err := msgpack.Marshal(attachedMsg)
@@ -452,7 +468,7 @@ func handleConnection(conn net.Conn, mgr *session.Manager, stunServer string, ip
 			log.Printf("marshal session attached error: %v", err)
 			return
 		}
-		if err := netx.WriteFrame(conn, attachedData); err != nil {
+		if err := conn.WriteFrame(attachedData); err != nil {
 			log.Printf("write session attached error: %v", err)
 			return
 		}
@@ -476,7 +492,7 @@ func handleConnection(conn net.Conn, mgr *session.Manager, stunServer string, ip
 				if !ok {
 					return
 				}
-				if err := netx.WriteFrame(conn, frameData); err != nil {
+				if err := conn.WriteFrame(frameData); err != nil {
 					log.Printf("write frame error: %v", err)
 					return
 				}
@@ -497,7 +513,7 @@ func handleConnection(conn net.Conn, mgr *session.Manager, stunServer string, ip
 
 	// Unix Socketまたはアドレス取得失敗の場合
 	if clientDisplay == "" {
-		if peerUID, err := netx.GetPeerUID(conn); err == nil {
+		if peerUID, err := netx.GetPeerUID(rawConn); err == nil {
 			clientDisplay = fmt.Sprintf("unix-socket(UID:%d)", peerUID)
 		} else {
 			clientDisplay = "unix-socket"
@@ -538,8 +554,8 @@ func handleConnection(conn net.Conn, mgr *session.Manager, stunServer string, ip
 
 		case *proto.UDPClientInfoMsg:
 			// クライアント ClientID を受信 → 出力ファンアウト対象として登録。
-			if err := sess.RegisterUDPClient(m.ClientID); err != nil {
-				log.Printf("session %s: failed to register UDP client: %v", m.SessionID, err)
+			if err := sess.RegisterQUICClient(m.ClientID); err != nil {
+				log.Printf("session %s: failed to register QUIC client: %v", m.SessionID, err)
 			}
 
 		case *proto.PingMsg:
@@ -552,7 +568,7 @@ func handleConnection(conn net.Conn, mgr *session.Manager, stunServer string, ip
 				log.Printf("marshal pong error: %v", err)
 				continue
 			}
-			if err := netx.WriteFrame(conn, pongData); err != nil {
+			if err := conn.WriteFrame(pongData); err != nil {
 				log.Printf("write pong error: %v", err)
 				break
 			}
@@ -572,7 +588,7 @@ func handleConnection(conn net.Conn, mgr *session.Manager, stunServer string, ip
 				log.Printf("marshal server meta error: %v", err)
 				continue
 			}
-			if err := netx.WriteFrame(conn, metaData); err != nil {
+			if err := conn.WriteFrame(metaData); err != nil {
 				log.Printf("write server meta error: %v", err)
 				break
 			}
@@ -599,14 +615,14 @@ func handleConnection(conn net.Conn, mgr *session.Manager, stunServer string, ip
 	log.Printf("client %s: session %s detached", clientDisplay, sess.ID)
 }
 
-func sendError(conn net.Conn, code, message string) {
+func sendError(conn *udsConn, code, message string) {
 	errMsg := proto.ErrorMsg{
 		Type:    "ERROR",
 		Code:    code,
 		Message: message,
 	}
 	errData, _ := msgpack.Marshal(errMsg)
-	netx.WriteFrame(conn, errData)
+	conn.WriteFrame(errData)
 }
 
 // sessionProtoInfo は Session から proto.SessionInfo を組み立てる（LIST_SESSIONS・
@@ -636,20 +652,23 @@ func sessionProtoInfo(s *session.Session) proto.SessionInfo {
 		lastInputAt = t.Unix()
 	}
 
+	// Rows/Cols は Resize がロック下で書き換えるため、直接読まずアクセサ経由で取る
+	// （ID/Name/Cmd/CreatedAt は作成後不変なのでそのまま読んでよい）。
+	rows, cols := s.Size()
+
 	return proto.SessionInfo{
 		SessionID:          s.ID,
 		Name:               s.Name,
 		Cmd:                s.Cmd,
-		Rows:               s.Rows,
-		Cols:               s.Cols,
+		Rows:               rows,
+		Cols:               cols,
 		CreatedAt:          s.CreatedAt.Unix(),
 		ClientCount:        s.GetClientCount(),
 		Clients:            protoClientInfos,
-		UDPEnabled:         s.IsUDPEnabled(),
-		UDPPort:            s.GetUDPPort(),
+		UDPEnabled:         s.IsQUICEnabled(),
+		UDPPort:            s.GetQUICPort(),
 		PTYClosed:          s.IsPTYClosed(),
 		LastDetachedAt:     lastDetachedAt,
-		LastUDPAddr:        s.GetLastUDPAddr(),
 		LastOutputAt:       lastOutputAt,
 		LastInputAt:        lastInputAt,
 		OutputChunks:       outputStats.ChunkCount,
@@ -674,13 +693,13 @@ func clientInfosWithStats(clientInfos []session.ClientInfo, sendStats []session.
 	result := make([]proto.ClientInfo, len(clientInfos))
 	for i, ci := range clientInfos {
 		result[i] = proto.ClientInfo{
-			ID:           ci.ID,
-			Protocol:     ci.Protocol,
-			RemoteAddr:   ci.RemoteAddr,
-			UDPClientID:  ci.UDPClientID,
-			UDPAddresses: ci.UDPAddresses,
+			ID:         ci.ID,
+			Protocol:   ci.Protocol,
+			RemoteAddr: ci.RemoteAddr,
+			// wire フィールド名は互換のため udp_client_id のまま（値は QUIC の clientID）
+			UDPClientID: ci.QUICClientID,
 		}
-		if st, ok := sendStatsMap[ci.UDPClientID]; ok {
+		if st, ok := sendStatsMap[ci.QUICClientID]; ok {
 			result[i].SendBufferBytes = st.TotalBytes
 			if !st.LastSeen.IsZero() {
 				result[i].LastSeen = st.LastSeen.Unix()
@@ -702,7 +721,7 @@ func clientInfosWithStats(clientInfos []session.ClientInfo, sendStats []session.
 // killSessionAndRespond はセッションを削除し、成功時は SESSION_KILLED を返す
 // （失敗時は sendError）。KillSessionMsg は初回コマンドとセッションループ内の
 // 両方から届きうるため、ここに共通化する。
-func killSessionAndRespond(conn net.Conn, mgr *session.Manager, sessionID string) {
+func killSessionAndRespond(conn *udsConn, mgr *session.Manager, sessionID string) {
 	if err := mgr.DeleteSession(sessionID); err != nil {
 		sendError(conn, proto.ErrNoSuchSession, err.Error())
 		return
@@ -716,7 +735,7 @@ func killSessionAndRespond(conn net.Conn, mgr *session.Manager, sessionID string
 		log.Printf("marshal session killed error: %v", err)
 		return
 	}
-	if err := netx.WriteFrame(conn, killedData); err != nil {
+	if err := conn.WriteFrame(killedData); err != nil {
 		log.Printf("write session killed error: %v", err)
 	}
 	log.Printf("session %s killed by client request", sessionID)
@@ -725,7 +744,7 @@ func killSessionAndRespond(conn net.Conn, mgr *session.Manager, sessionID string
 // waitSessionAndRespond は WAIT_SESSION を処理する。セッションの終了（Done）まで
 // この接続の goroutine 上でブロックし、終了したら SESSION_CLOSED NOTE（exit code 付き）
 // を返す。待機中にクライアント側が切断した場合（Ctrl-C 等）はそのまま終了する。
-func waitSessionAndRespond(conn net.Conn, mgr *session.Manager, sessionID string) {
+func waitSessionAndRespond(conn *udsConn, mgr *session.Manager, sessionID string) {
 	sess, err := mgr.GetSession(sessionID)
 	if err != nil {
 		sendError(conn, proto.ErrNoSuchSession, err.Error())
@@ -762,7 +781,7 @@ func waitSessionAndRespond(conn net.Conn, mgr *session.Manager, sessionID string
 		log.Printf("marshal wait notification error: %v", err)
 		return
 	}
-	if err := netx.WriteFrame(conn, noteData); err != nil {
+	if err := conn.WriteFrame(noteData); err != nil {
 		log.Printf("write wait notification error: %v", err)
 	}
 }
@@ -770,50 +789,51 @@ func waitSessionAndRespond(conn net.Conn, mgr *session.Manager, sessionID string
 // resolveUDPAddrs はセッションのSTUNアドレス候補（IPv4/IPv6、取得できた分）と
 // ローカルアドレスを解決する。初回接続の候補を増やすため両familyを問い合わせる。
 func resolveUDPAddrs(sess *session.Session, stunServer string, ipv4Only bool) (stunAddrs []string, localAddr string) {
-	if !sess.IsUDPEnabled() {
+	if !sess.IsQUICEnabled() {
 		return
 	}
 
 	if stunServer != "" {
-		if ip := queryStunMappedIP(sess.ID, "udp4"); ip != nil {
-			stunAddrs = append(stunAddrs, net.JoinHostPort(ip.String(), strconv.Itoa(sess.GetUDPPort())))
+		if ip := queryStunMappedIP(sess.ID, "udp4", stunServer); ip != nil {
+			stunAddrs = append(stunAddrs, net.JoinHostPort(ip.String(), strconv.Itoa(sess.GetQUICPort())))
 		}
 		if !ipv4Only {
-			if ip := queryStunMappedIP(sess.ID, "udp6"); ip != nil {
-				stunAddrs = append(stunAddrs, net.JoinHostPort(ip.String(), strconv.Itoa(sess.GetUDPPort())))
+			if ip := queryStunMappedIP(sess.ID, "udp6", stunServer); ip != nil {
+				stunAddrs = append(stunAddrs, net.JoinHostPort(ip.String(), strconv.Itoa(sess.GetQUICPort())))
 			}
 		}
 	}
 
 	if localIP := getLocalAddr(); localIP != "" {
-		localAddr = fmt.Sprintf("%s:%d", localIP, sess.GetUDPPort())
+		localAddr = fmt.Sprintf("%s:%d", localIP, sess.GetQUICPort())
 	}
 	return
 }
 
-// queryStunMappedIP は指定family（"udp4"/"udp6"）でGoogle/Cloudflareの STUN
-// サーバーに問い合わせ、マッピングされたIPを返す。失敗時はnil（呼び出し側は
-// そのfamilyを候補から単純に省く）。
-func queryStunMappedIP(sessID, network string) net.IP {
-	stunClient := stun.NewClient("stun.l.google.com:19302")
+// queryStunMappedIP は指定family（"udp4"/"udp6"）で設定された STUN サーバーに
+// 問い合わせ、マッピングされたIPを返す。失敗時はnil（呼び出し側はそのfamilyを
+// 候補から単純に省く）。結果は TTL キャッシュされる（stuncache.go 参照。
+// キャッシュヒット時はログも出さない）。
+// 旧実装は NAT タイプ判別のため 2 サーバー（Google/Cloudflare ハードコード）へ
+// 問い合わせていたが、--stun-server の指定が無視されるバグがあり、判別結果も
+// ログ表示のみ（かつクエリごとに別ソケットを使うため port 比較が意味をなさず
+// 原理的に不正確）だったため、単一クエリに簡素化した。
+func queryStunMappedIP(sessID, network, stunServer string) net.IP {
+	key := network + "|" + stunServer
+	if ip, ok := stunMappedIPs.get(key); ok {
+		return ip // ip=nil は失敗のネガティブキャッシュヒット
+	}
+	stunClient := stun.NewClient(stunServer)
 	stunClient.Network = network
-	natType, mappedAddr, err := stunClient.DetectNATType(
-		"stun.l.google.com:19302",
-		"stun.cloudflare.com:3478",
-	)
+	mappedAddr, err := stunClient.GetMappedAddr()
 	if err != nil {
-		log.Printf("session %s: STUN query (%s) failed (continuing without it): %v", sessID, network, err)
+		log.Printf("session %s: STUN query (%s) failed (continuing without it, next retry in %v): %v",
+			sessID, network, stunCacheFailureTTL, err)
+		stunMappedIPs.put(key, nil)
 		return nil
 	}
-
-	natTypeName := "Unknown"
-	switch natType {
-	case stun.NATTypeFullCone:
-		natTypeName = "Full Cone (or Port Restricted)"
-	case stun.NATTypeSymmetric:
-		natTypeName = "Symmetric"
-	}
-	log.Printf("session %s: NAT type (%s): %s, mapped IP: %s", sessID, network, natTypeName, mappedAddr.IP)
+	log.Printf("session %s: STUN mapped IP (%s): %s", sessID, network, mappedAddr.IP)
+	stunMappedIPs.put(key, mappedAddr.IP)
 	return mappedAddr.IP
 }
 

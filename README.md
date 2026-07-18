@@ -109,7 +109,17 @@ tezzerd --udp-port 7020          # fixed UDP port (otherwise auto-assigned)
 tezzerd --stun-server host:port  # STUN server for NAT traversal
 tezzerd --ipv4-only              # IPv4 only
 tezzerd --max-sessions 20        # limit active sessions (0 = unlimited, default)
+tezzerd --check-nat              # one-shot NAT diagnosis and exit (see below)
 ```
+
+`tezzerd --check-nat` probes two STUN servers from a single socket and reports,
+per address family, your public address, the NAT mapping behavior
+(endpoint-independent "cone" vs destination-dependent "symmetric"), and whether
+the NAT preserves ports. Run it once on the server host to learn whether
+STUN-derived direct QUIC will work in your environment, or whether you should
+set up a fixed port (`--udp-port`) with router port forwarding instead. The
+comparison server defaults to Cloudflare and can be overridden with
+`--stun-server2`.
 
 `tezzerd` accepts client connections over a Unix domain socket. Remote clients
 reach it by forwarding that socket over SSH (see `tezzer-ssh`).
