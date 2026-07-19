@@ -19,10 +19,14 @@ import (
 
 func TestQUICTransport_StallWarnsOtherClients(t *testing.T) {
 	// 水位をテスト用に短縮（watchdog は起動時に読むので Start 前に設定する）。
-	oldWarn, oldRepeat, oldTick := stallWarnThreshold, stallWarnRepeat, stallCheckInterval
-	stallWarnThreshold, stallWarnRepeat, stallCheckInterval = 300*time.Millisecond, time.Second, 50*time.Millisecond
+	oldWarn, oldRepeat, oldTick := stallWarnThreshold.Get(), stallWarnRepeat.Get(), stallCheckInterval.Get()
+	stallWarnThreshold.Set(300 * time.Millisecond)
+	stallWarnRepeat.Set(time.Second)
+	stallCheckInterval.Set(50 * time.Millisecond)
 	t.Cleanup(func() {
-		stallWarnThreshold, stallWarnRepeat, stallCheckInterval = oldWarn, oldRepeat, oldTick
+		stallWarnThreshold.Set(oldWarn)
+		stallWarnRepeat.Set(oldRepeat)
+		stallCheckInterval.Set(oldTick)
 	})
 
 	k := make([]byte, 32)
@@ -123,8 +127,8 @@ func TestQUICTransport_StallWarnsOtherClients(t *testing.T) {
 	if stalledStat.StallEpisodes < 1 {
 		t.Errorf("StallEpisodes = %d, want >= 1", stalledStat.StallEpisodes)
 	}
-	if stalledStat.CurrentStallMs < uint64(stallWarnThreshold.Milliseconds()) {
-		t.Errorf("CurrentStallMs = %d, want >= %d", stalledStat.CurrentStallMs, stallWarnThreshold.Milliseconds())
+	if stalledStat.CurrentStallMs < uint64(stallWarnThreshold.Get().Milliseconds()) {
+		t.Errorf("CurrentStallMs = %d, want >= %d", stalledStat.CurrentStallMs, stallWarnThreshold.Get().Milliseconds())
 	}
 	if healthyStat.StallEpisodes != 0 || healthyStat.CurrentStallMs != 0 {
 		t.Errorf("healthy client has stall stats: episodes=%d current=%dms",
@@ -135,11 +139,16 @@ func TestQUICTransport_StallWarnsOtherClients(t *testing.T) {
 // critical 水位超えで watchdog が詰まったクライアントを切断し、ブロックしていた
 // SendOutput（= PTY reader）が解放されてクライアント登録も解除されることを検証する。
 func TestQUICTransport_StallCriticalDisconnects(t *testing.T) {
-	oldWarn, oldRepeat, oldCrit, oldTick := stallWarnThreshold, stallWarnRepeat, stallCriticalThreshold, stallCheckInterval
-	stallWarnThreshold, stallWarnRepeat, stallCriticalThreshold, stallCheckInterval =
-		100*time.Millisecond, time.Second, 500*time.Millisecond, 50*time.Millisecond
+	oldWarn, oldRepeat, oldCrit, oldTick := stallWarnThreshold.Get(), stallWarnRepeat.Get(), stallCriticalThreshold.Get(), stallCheckInterval.Get()
+	stallWarnThreshold.Set(100 * time.Millisecond)
+	stallWarnRepeat.Set(time.Second)
+	stallCriticalThreshold.Set(500 * time.Millisecond)
+	stallCheckInterval.Set(50 * time.Millisecond)
 	t.Cleanup(func() {
-		stallWarnThreshold, stallWarnRepeat, stallCriticalThreshold, stallCheckInterval = oldWarn, oldRepeat, oldCrit, oldTick
+		stallWarnThreshold.Set(oldWarn)
+		stallWarnRepeat.Set(oldRepeat)
+		stallCriticalThreshold.Set(oldCrit)
+		stallCheckInterval.Set(oldTick)
 	})
 
 	k := make([]byte, 32)

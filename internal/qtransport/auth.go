@@ -1,8 +1,10 @@
-// Package qtransport は QUIC ベースのトランスポート実装。
+// Package qtransport is the QUIC-based transport implementation.
 //
-// 認証は PKI を使わず、SSH 経由 UDS bootstrap で配送される共有鍵 K に紐づく
-// self-signed 証明書を mTLS で相互 pinning する（Spike A で feasibility 実証済み、
-// docs/dev/quic-transport-feasibility.md §4 参照）。
+// Authentication uses no PKI: both ends present self-signed certificates tied
+// to the shared key K (delivered over the SSH-forwarded Unix-socket
+// bootstrap) and mutually pin each other's derived public keys via mTLS
+// (feasibility shown in spike A; see docs/dev/quic-transport-feasibility.md
+// §4).
 package qtransport
 
 import (
@@ -20,7 +22,7 @@ import (
 	"golang.org/x/crypto/hkdf"
 )
 
-// ALPN は tezzer QUIC のアプリケーションプロトコル識別子。
+// ALPN is the application protocol identifier of tezzer QUIC.
 const ALPN = "github.com/kuriyama/tezzer/1"
 
 const (
@@ -117,8 +119,8 @@ func tlsConfig(isServer bool, ownK, expectPeerK []byte) (*tls.Config, error) {
 	return cfg, nil
 }
 
-// ServerTLS は共有鍵 K からサーバ側 mTLS 設定を作る。
+// ServerTLS builds the server-side mTLS configuration from the shared key K.
 func ServerTLS(k []byte) (*tls.Config, error) { return tlsConfig(true, k, k) }
 
-// ClientTLS は共有鍵 K からクライアント側 mTLS 設定を作る。
+// ClientTLS builds the client-side mTLS configuration from the shared key K.
 func ClientTLS(k []byte) (*tls.Config, error) { return tlsConfig(false, k, k) }

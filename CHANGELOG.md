@@ -8,6 +8,28 @@ once it reaches a 1.0 release.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-07-19
+
+### Added
+
+- FreeBSD builds (`freebsd/amd64`, `freebsd/arm64`) in release artifacts and
+  `make dist`. Peer-credential checks on the Unix socket use `LOCAL_PEERCRED`
+  (as on macOS). Cross-compiled; not yet CI-tested on real hardware.
+
+### Changed
+
+- The godoc surface — package comments and documentation comments on exported
+  identifiers — is now written in English. Inline implementation comments
+  remain primarily in Japanese; CONTRIBUTING.md documents the
+  comment-language policy.
+- SECURITY.md now describes the actual transport (QUIC with mutual TLS 1.3,
+  keyed from a per-session secret bootstrapped over an SSH-forwarded Unix
+  socket). The stale description of a TCP fallback channel is gone; tezzer
+  has no TCP listener.
+- README installation instructions now lead with Linux and include
+  copy-pasteable tarball commands (release asset URLs are stable across
+  versions), with macOS (Homebrew) and FreeBSD sections alongside.
+
 ## [0.0.2] - 2026-07-18
 
 ### Added

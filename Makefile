@@ -43,6 +43,8 @@ dist:
 	$(call dist_build,linux,arm64)
 	$(call dist_build,darwin,amd64)
 	$(call dist_build,darwin,arm64)
+	$(call dist_build,freebsd,amd64)
+	$(call dist_build,freebsd,arm64)
 ifneq ($(shell command -v nfpm),)
 	$(call dist_pkg,amd64)
 	$(call dist_pkg,arm64)
@@ -50,7 +52,7 @@ else
 	@echo "nfpm が見つからないため deb/rpm 生成をスキップ" \
 		"(go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.46.3)"
 endif
-	rm -rf dist/.nfpm dist/tezzer_linux_amd64 dist/tezzer_linux_arm64 dist/tezzer_darwin_amd64 dist/tezzer_darwin_arm64
+	rm -rf dist/.nfpm dist/tezzer_linux_amd64 dist/tezzer_linux_arm64 dist/tezzer_darwin_amd64 dist/tezzer_darwin_arm64 dist/tezzer_freebsd_amd64 dist/tezzer_freebsd_arm64
 	cd dist && sha256sum tezzer* > SHA256SUMS
 
 test:

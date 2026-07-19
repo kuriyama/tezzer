@@ -1,19 +1,19 @@
 package version
 
-// ビルド時にldflags経由で埋め込まれる変数
+// Variables injected at build time via ldflags.
 var (
-	// GitCommit はビルド時のgit commit hash
+	// GitCommit is the git commit hash of the build.
 	GitCommit = "unknown"
-	// BuildTime はビルド時刻
+	// BuildTime is the build timestamp.
 	BuildTime = "unknown"
 )
 
-// GetVersion はバージョン情報を返す
+// GetVersion returns the version information.
 func GetVersion() string {
 	return GitCommit
 }
 
-// GetBuildTime はビルド時刻を返す
+// GetBuildTime returns the build timestamp.
 func GetBuildTime() string {
 	return BuildTime
 }

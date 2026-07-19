@@ -47,8 +47,8 @@ type Manager struct {
 	done chan struct{}
 }
 
-// SetTCPForwarding は全セッションの TCP 転送の許可/禁止を設定する。
-// セッション作成前（起動時）に呼ぶ想定。
+// SetTCPForwarding allows or denies TCP forwarding for all sessions.
+// Intended to be called at startup, before any session is created.
 func (m *Manager) SetTCPForwarding(enabled bool) {
 	m.tcpFwdDisabled.Store(!enabled)
 }
@@ -58,14 +58,15 @@ func (m *Manager) tcpForwardingEnabled() bool {
 	return !m.tcpFwdDisabled.Load()
 }
 
-// SetAgentForwarding は全セッションの agent forwarding（-A）の許可/禁止を設定する。
-// セッション作成前（起動時）に呼ぶ想定。
+// SetAgentForwarding allows or denies SSH agent forwarding (-A) for all
+// sessions. Intended to be called at startup, before any session is created.
 func (m *Manager) SetAgentForwarding(enabled bool) {
 	m.agentFwdDisabled.Store(!enabled)
 }
 
-// AgentForwardingEnabled は agent forwarding の許可状態を返す（零値 = 許可）。
-// セッション作成時、UDS リスナーを作るかどうかの判断に使う（NewSession の二重防御）。
+// AgentForwardingEnabled reports whether agent forwarding is allowed (zero
+// value = allowed). Used at session creation to decide whether to create the
+// agent Unix socket (defense in depth in NewSession).
 func (m *Manager) AgentForwardingEnabled() bool {
 	return !m.agentFwdDisabled.Load()
 }
@@ -78,10 +79,10 @@ func (m *Manager) applyTransportPolicy(st transport.ServerTransport) {
 	}
 }
 
-// InitSharedTransport は固定ポート運用時に共有 QUIC transport を1つ起動する。
-// fixedPort <= 0 の場合は何もしない（各セッションが per-session で transport を持つ）。
-// 共有時は 1 ソケットを全セッションで多重化し、固定ポートを port-forward した運用で
-// 複数セッションを相乗りできる。
+// InitSharedTransport starts one shared QUIC transport for fixed-port
+// deployments. It does nothing when fixedPort <= 0 (each session then owns a
+// per-session transport). In shared mode one socket multiplexes every
+// session, so several sessions can ride a single port-forwarded fixed port.
 func (m *Manager) InitSharedTransport(fixedPort int, ipv4Only bool) error {
 	if fixedPort <= 0 {
 		return nil
@@ -133,10 +134,11 @@ func (m *Manager) adoptSharedTransport(st transport.ServerTransport, port int, k
 	return nil
 }
 
-// IsSharedTransportEnabled は共有 transport モードかを返す。
+// IsSharedTransportEnabled reports whether shared-transport mode is active.
 func (m *Manager) IsSharedTransportEnabled() bool { return m.sharedTransport != nil }
 
-// GetSharedPort / GetSharedKey は bootstrap で client へ伝える用。
+// GetSharedPort / GetSharedKey expose the shared transport's port and key,
+// announced to clients during bootstrap.
 func (m *Manager) GetSharedPort() int   { return m.sharedPort }
 func (m *Manager) GetSharedKey() []byte { return m.sharedKey }
 
@@ -275,19 +277,21 @@ func (m *Manager) cleanupClosedSessions() {
 	}
 }
 
-// GetServerInstanceID はサーバーインスタンスIDを返す（サーバー再起動検知用）
+// GetServerInstanceID returns the server instance ID (restart detection).
 func (m *Manager) GetServerInstanceID() [8]byte {
 	return m.serverInstanceID
 }
 
-// ErrDuplicateName は同名のアクティブなセッションが既に存在することを示す。
+// ErrDuplicateName indicates an active session with the same name already
+// exists.
 var ErrDuplicateName = errors.New("session name already in use")
 
-// ErrTooManySessions はアクティブなセッション数が上限（--max-sessions）に達していることを示す。
+// ErrTooManySessions indicates the active session count has reached the
+// --max-sessions limit.
 var ErrTooManySessions = errors.New("session limit reached")
 
-// SetMaxSessions はアクティブなセッション数の上限を設定する（0 = 無制限）。
-// サーバ起動時に一度だけ呼ぶ想定。
+// SetMaxSessions sets the limit on active sessions (0 = unlimited).
+// Intended to be called once at server startup.
 func (m *Manager) SetMaxSessions(n int) {
 	m.mu.Lock()
 	m.maxSessions = n
@@ -306,8 +310,9 @@ func (m *Manager) activeSessionCountLocked() int {
 	return n
 }
 
-// FindByName は名前が一致するアクティブな（PTY 終了済みでない）セッションを返す。
-// PTY 終了済みセッションは cleanup 待ちの残骸なので名前を保持しない扱いにする。
+// FindByName returns the active (PTY not yet ended) session with the given
+// name. Sessions whose PTY has ended are leftovers awaiting cleanup and are
+// treated as no longer holding their name.
 func (m *Manager) FindByName(name string) *Session {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -319,11 +324,10 @@ func (m *Manager) FindByName(name string) *Session {
 	return nil
 }
 
-// CreateSession creates a new session.
-// name は空なら無名セッション。非空なら アクティブなセッション間で一意 を保証する
-// （同名があれば ErrDuplicateName）。
-// agentForward は -A（SSH agent forwarding）の要求。作成時にのみ意味を持つ
-// （docs/dev/agent-forwarding.md）。
+// CreateSession creates a new session. An empty name creates an unnamed
+// session; a non-empty name is guaranteed unique among active sessions
+// (ErrDuplicateName otherwise). agentForward requests SSH agent forwarding
+// (-A); it only has meaning at creation time (docs/dev/agent-forwarding.md).
 func (m *Manager) CreateSession(name, cmd string, args []string, env map[string]string, cwd string, rows, cols int, ipv4Only bool, fixedUDPPort int, agentForward bool) (*Session, error) {
 	// PTY/transport を起動する前の事前チェック（無駄な起動を避ける）
 	if name != "" && m.FindByName(name) != nil {
@@ -430,7 +434,7 @@ func (m *Manager) GetAllSessions() []*Session {
 	return sessions
 }
 
-// SetDebugForAllSessions は全セッションのデバッグ出力の有効/無効を動的に切り替える
+// SetDebugForAllSessions toggles debug output for every session at runtime.
 func (m *Manager) SetDebugForAllSessions(enabled bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -440,7 +444,7 @@ func (m *Manager) SetDebugForAllSessions(enabled bool) {
 	}
 }
 
-// Close はマネージャのリソースをクリーンアップする。
+// Close cleans up the manager's resources.
 func (m *Manager) Close() {
 	close(m.done)
 	if m.sharedTransport != nil {

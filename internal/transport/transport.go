@@ -1,12 +1,15 @@
-// Package transport は端末セッションのトランスポート抽象。
+// Package transport defines the transport abstraction for terminal sessions.
 //
-// 目的: 「入力を送り、出力を受け、複数クライアントへファンアウトし、接続の生死を観測する」
-// という transport 非依存の契約だけを定義し、アプリ層（cmd/tezzer・internal/session）から
-// 具体実装（QUIC = internal/qtransport）を差し替え可能にする。
+// It captures only the transport-independent contract — "send input, receive
+// output, fan out to multiple clients, observe connection liveness" — so that
+// the application layers (cmd/tezzer, internal/session) stay decoupled from
+// the concrete implementation (QUIC, internal/qtransport).
 //
-//   - 再送 / 順序制御 / migration / 再接続 / hole punch 等の機構は実装の内側に隠す。
-//   - OutputRingBuffer は「再接続後の再同期ソース」という transport 非依存の役割として残し、
-//     再同期は OnResyncNeeded（offset ベース）で配線する。
+//   - Retransmission, ordering, migration, reconnection, hole punching, and
+//     similar mechanisms are hidden inside the implementation.
+//   - The output ring buffer keeps its transport-independent role as the
+//     resynchronization source after reconnects; resync is wired through
+//     OnResyncNeeded (offset-based).
 package transport
 
 import (
@@ -14,13 +17,14 @@ import (
 	"net"
 )
 
-// ConnectionState は接続状態（transport 非依存の粒度）。
+// ConnectionState is the connection state at a transport-independent
+// granularity.
 type ConnectionState int
 
 const (
 	StateConnecting ConnectionState = iota
 	StateConnected
-	StateRecovering // ローミング/一時断からの復帰中
+	StateRecovering // recovering from roaming or a transient disconnect
 	StateClosed
 )
 
@@ -39,49 +43,52 @@ func (s ConnectionState) String() string {
 	}
 }
 
-// Stats は Ctrl-^ s 表示等に使う transport 非依存のスナップショット。
-// 実装固有の詳細（udp の RecvBuffer 充填率、quic の輻輳窓など）は含めない。
+// Stats is a transport-independent snapshot used for the Ctrl-^ s display and
+// similar. Implementation-specific details (congestion window, receive-buffer
+// fill, ...) are intentionally excluded.
 type Stats struct {
-	RTT            float64 // 直近 RTT（ms、QUIC SmoothedRTT）
-	LossRate       float64 // 推定損失率（0..1、PacketsLost/PacketsSent、接続開始からの累積）
-	LastRecoveryMs float64 // 直近の復帰（migration/再接続）に要した時間（ms）。skip-stale 廃止の納得材料。
-	RecoveryCount  uint64  // ローミング/再接続の累計回数
+	RTT            float64 // recent RTT (ms; QUIC SmoothedRTT)
+	LossRate       float64 // estimated loss rate (0..1, PacketsLost/PacketsSent, cumulative since connect)
+	LastRecoveryMs float64 // duration of the most recent recovery (migration/reconnect), in ms
+	RecoveryCount  uint64  // cumulative number of roaming/reconnect recoveries
 	BytesSent      uint64
 	BytesReceived  uint64
 }
 
-// ClientID は共有 transport 上でクライアント接続を一意に識別する。
-// Session を含めることで、別セッションのクライアントが同じ Num（クライアント自己採番の
-// uint16）を選んでも衝突せず、入力ルーティング/出力ファンアウトが混線しない。
+// ClientID uniquely identifies a client connection on a shared transport.
+// Including Session means clients of different sessions cannot collide even
+// when they pick the same Num (a client-chosen uint16), so input routing and
+// output fan-out never cross wires.
 type ClientID struct {
-	Session string // 所属セッション ID（per-session モードでは単一）
-	Num     uint16 // クライアント自己採番の識別子（認可情報ではない・routing 用）
+	Session string // owning session ID (a single value in per-session mode)
+	Num     uint16 // client-chosen identifier; used for routing, carries no authorization
 }
 
-// Resize は端末サイズ変更。
+// Resize is a terminal size change.
 type Resize struct {
 	Client ClientID
 	Rows   int
 	Cols   int
 }
 
-// Input はクライアントからの入力（サーバ側で受信）。
+// Input is client input as received on the server side.
 type Input struct {
 	Client ClientID
 	Data   []byte
 }
 
-// ClientTransport は端末クライアント側の抽象。
+// ClientTransport is the client-side abstraction of a terminal transport.
 type ClientTransport interface {
-	// Start は接続を確立する（quic: Dial）。確立 or 失敗まで。
+	// Start establishes the connection (quic: dial). It returns once the
+	// connection is established or has failed.
 	Start(ctx context.Context) error
 	Close() error
 
 	SendInput(data []byte) error
-	SendResize(cols, rows int) error // 既存実装に合わせ (cols, rows) 順
-	// Output はサーバ出力（順序保証）。Offset はセッション論理オフセットで、
-	// 呼び出し側が UDS 経路（OutputMsg.Seq、同じ番号空間）とのクロスパス
-	// 重複排除に使う。
+	SendResize(cols, rows int) error // (cols, rows) order matches the existing implementations
+	// Output delivers server output (ordered). Offset is the session's
+	// logical offset; callers use it for cross-path deduplication against
+	// the Unix-socket path (OutputMsg.Seq, the same numbering space).
 	Output() <-chan OutputChunk
 
 	State() ConnectionState
@@ -89,28 +96,32 @@ type ClientTransport interface {
 	OnStatusMessage(fn func(msg string))
 	OnLogMessage(fn func(msg string))
 	OnServerMeta(fn func(buildID, buildTime string, instanceID []byte))
-	// OnSessionNotFound はセッション消失通知のコールバックを登録する。
-	// exitCode はセッションプロセスの終了コード（-1 = 不明。kill 等では付かない）。
+	// OnSessionNotFound registers a callback for session-gone notifications.
+	// exitCode is the exit status of the session process (-1 = unknown; not
+	// set for kills and similar).
 	OnSessionNotFound(fn func(msg string, exitCode int))
 
 	Stats() Stats
-	// SetRoamingCandidates は STUN 等で得た到達可能アドレス候補を渡す
-	// （udp: フォールバックアドレス、quic: migration 先のヒント）。
+	// SetRoamingCandidates provides reachable address candidates obtained via
+	// STUN and similar (fallback addresses; migration hints).
 	SetRoamingCandidates(addrs []string)
-	// SetCandidatesRefresher は全候補 Dial 失敗時に呼ぶ候補再生成関数を登録する。
-	// STUN 再取得などを行い新しい候補リストを返す。nil を渡すと無効化。
+	// SetCandidatesRefresher registers a function called when dialing every
+	// candidate has failed. It should regenerate the candidate list (e.g. by
+	// re-querying STUN). Passing nil disables it.
 	SetCandidatesRefresher(fn func() []string)
 }
 
-// ServerTransport は端末サーバ側の抽象（1 PTY → 複数クライアントのファンアウトを含む）。
+// ServerTransport is the server-side abstraction (including the fan-out from
+// one PTY to multiple clients).
 type ServerTransport interface {
 	Start(ctx context.Context) error
 	Close() error
 
-	// SendOutput は指定クライアント群へ出力をファンアウトする。
-	// offset はセッション論理オフセット（Session.seq 相当、単調増加・リセットしない）。
-	// transport はこれを運び、再接続後の再同期位置の基準にする。
-	// 実装は offset を自分の seq 空間へ対応づける（udp: per-client SSN、quic: stream offset）。
+	// SendOutput fans out one output chunk to the given clients.
+	// offset is the session's logical offset (Session.seq; monotonically
+	// increasing, never reset). The transport carries it and it anchors
+	// resynchronization after reconnects. Implementations map it onto their
+	// own sequencing space (quic: stream offset).
 	SendOutput(offset uint64, data []byte, clients []ClientID) error
 	Input() <-chan Input
 	Resize() <-chan Resize
@@ -118,67 +129,76 @@ type ServerTransport interface {
 	OnClientConnect(fn func(client ClientID))
 	OnClientDisconnect(fn func(client ClientID))
 
-	// OnResyncNeeded は、あるクライアントが fromOffset 以降の出力を要求したとき
-	// （再接続・長スリープ復帰でローカルに無い分を埋める必要が出たとき）に呼ばれる。
-	// session 層は OutputRingBuffer から該当オフセット以降のチャンクを返し、
-	// transport がそれを当該クライアントへ再送する。これにより OutputRingBuffer は
-	// session 所有のまま、SSN/フォールバックという udp 固有語を表に出さずに再同期できる。
-	// コールバックは fromOffset 以降の「先頭の一部だけ」を返してよい（バッチ返却。
-	// cold 層全量の一括解凍によるメモリスパイクを避けるため）。transport は空スライスが
-	// 返るまで「最後に受け取った offset+1」を fromOffset にして繰り返し呼ぶこと。
-	// 返るチャンクは offset 昇順・fromOffset 以上であること（呼び出しループの前進保証）。
+	// OnResyncNeeded is called when a client requests output from fromOffset
+	// onwards (after a reconnect or a long sleep, to fill in what it is
+	// missing locally). The session layer returns the retained chunks from
+	// that offset and the transport re-sends them to the client. This keeps
+	// the output ring buffer owned by the session layer.
+	// The callback may return only a leading batch of the requested range
+	// (bounded batches avoid decompressing the whole cold retention tier into
+	// memory at once). The transport must call it repeatedly, with fromOffset
+	// set to the last received offset + 1, until an empty slice is returned.
+	// Returned chunks must be in ascending offset order and >= fromOffset
+	// (this guarantees the call loop makes progress).
 	OnResyncNeeded(fn func(client ClientID, fromOffset uint64) ([]OutputChunk, error))
 
 	ActiveClients() []ClientID
 
-	// ClientSendStats はクライアントごとの出力送信健全性を返す（backpressure 観測用）。
-	// 遅いクライアントへの出力 Write がブロックすると PTY reader 全体が詰まりうるため、
-	// SlowWrites/MaxWriteMs で「どのクライアントが詰まらせているか」を可視化する。
+	// ClientSendStats reports per-client output-send health (backpressure
+	// observability). A blocked write to a slow client can stall the whole
+	// PTY reader, so SlowWrites/MaxWriteMs identify which client is stalling
+	// the session.
 	ClientSendStats() []ClientSendStat
 
-	// SetServerMeta はクライアント接続時に通知するサーバ情報を設定する
-	// （ビルド ID/時刻・インスタンス ID）。UDS に依存せず QUIC 経路で届ける。
+	// SetServerMeta sets the server information announced to clients on
+	// connect (build ID/time, instance ID). It is delivered over the QUIC
+	// path, independent of the Unix socket.
 	SetServerMeta(buildID, buildTime string, instanceID []byte)
 
-	// SendSessionGone は指定クライアントへセッション消失を通知する（再起動/kill 検知用）。
-	// UDS が死んでいても QUIC 経路で届けられるようにする。
-	// exitCode はセッションプロセスの終了コード（-1 = 不明。プロセス終了由来の
-	// クローズでのみ 0 以上になり、クライアントの終了コードへ伝搬される）。
+	// SendSessionGone notifies the given client that the session is gone
+	// (restart/kill detection). Deliverable over the QUIC path even when the
+	// Unix socket is dead.
+	// exitCode is the session process's exit status (-1 = unknown; it is
+	// >= 0 only when the close was caused by process exit, and then
+	// propagates to the client's own exit status).
 	SendSessionGone(client ClientID, reason string, exitCode int) error
 
-	// SendStatus は指定クライアントへステータスメッセージを通知する（QUIC 経路）。
-	// 例: 再接続時に再同期で埋められない出力欠損（再描画を促す）。
+	// SendStatus sends a status message to the given client (QUIC path).
+	// Example: output gaps that resync cannot fill after a reconnect
+	// (prompting a redraw).
 	SendStatus(client ClientID, msg string) error
 
 	Stats() Stats
 }
 
-// ClientSendStat はサーバ→クライアント出力の送信健全性（backpressure 観測用）。
+// ClientSendStat is per-client output-send health (backpressure
+// observability).
 type ClientSendStat struct {
 	Client         ClientID
 	BytesSent      uint64
-	LastSendUnix   int64  // 最後に成功した送信時刻（Unix 秒、0=なし）
-	SlowWrites     uint64 // 出力 Write が閾値超だった回数（backpressure の指標）
-	MaxWriteMs     uint64 // 観測した最大 Write 所要（ms）
-	StallEpisodes  uint64 // 出力 Write が warning 水位を超えてブロックした累計エピソード数
-	CurrentStallMs uint64 // 進行中の stall の経過（ms、0 = 詰まっていない）
-	QUICRemoteAddr string // QUIC 接続の現在の対向アドレス（migration で変わりうる。空=不明）
-	// TCP ポートフォワード（-L）の per-client 統計
-	ForwardsActive         int32  // 現在アクティブな転送接続数
-	ForwardsOpened         uint64 // 累計転送接続数（dial 成功分）
-	ForwardBytesToTarget   uint64 // client → target 方向の累計バイト
-	ForwardBytesFromTarget uint64 // target → client 方向の累計バイト
+	LastSendUnix   int64  // last successful send time (Unix seconds; 0 = none)
+	SlowWrites     uint64 // count of output writes exceeding the slow-write threshold
+	MaxWriteMs     uint64 // largest observed write duration (ms)
+	StallEpisodes  uint64 // cumulative episodes of writes blocked past the warning threshold
+	CurrentStallMs uint64 // elapsed time of an in-progress stall (ms; 0 = not stalled)
+	QUICRemoteAddr string // current remote address of the QUIC connection (may change with migration; empty = unknown)
+	// Per-client TCP port-forwarding (-L) statistics.
+	ForwardsActive         int32  // currently active forwarded connections
+	ForwardsOpened         uint64 // cumulative forwarded connections (successful dials)
+	ForwardBytesToTarget   uint64 // cumulative bytes, client -> target
+	ForwardBytesFromTarget uint64 // cumulative bytes, target -> client
 }
 
-// OutputChunk は再同期で session 層が返す、論理オフセット付きの出力片。
+// OutputChunk is a piece of output with its logical offset, as returned by the
+// session layer during resynchronization.
 type OutputChunk struct {
 	Offset uint64
 	Data   []byte
 }
 
-// ForwardConn は TCP ポートフォワードの 1 本分の転送路（QUIC bidi ストリーム）。
-// CloseWrite は送信方向だけを閉じ（FIN）、TCP の半クローズに対応させる。
-// Close は両方向を閉じる。
+// ForwardConn is one forwarded connection of a TCP port forward (a QUIC
+// bidirectional stream). CloseWrite closes only the send direction (FIN),
+// mirroring TCP half-close. Close closes both directions.
 type ForwardConn interface {
 	Read(p []byte) (int, error)
 	Write(p []byte) (int, error)
@@ -186,74 +206,87 @@ type ForwardConn interface {
 	Close() error
 }
 
-// TCPForwarder は -L ポートフォワードを開ける ClientTransport のオプション機能。
-// 対応実装（quic）だけが満たす。呼び出し側は型アサーションで検出する。
+// TCPForwarder is an optional ClientTransport capability for opening -L port
+// forwards. Only supporting implementations (quic) satisfy it; callers detect
+// it with a type assertion.
 type TCPForwarder interface {
-	// ForwardingSupported はサーバが転送対応を広告しているかを返す
-	// （serverMeta 受信後に確定。未受信の間は false）。
+	// ForwardingSupported reports whether the server advertises forwarding
+	// support (known once serverMeta has been received; false until then).
 	ForwardingSupported() bool
-	// OpenForward はサーバ側から target ("host:port") へ TCP 接続する転送路を開く。
-	// ctx は open ハンドシェイク（stream open + dial 応答待ち）にのみ効く。
+	// OpenForward opens a forwarding channel that makes the server dial a
+	// TCP connection to target ("host:port"). ctx applies only to the open
+	// handshake (stream open + dial response), not to the relay afterwards.
 	OpenForward(ctx context.Context, target string) (ForwardConn, error)
 }
 
-// AgentForwarder は SSH agent forwarding（-A）の中継路を開ける ServerTransport の
-// オプション機能。対応実装（quic）だけが満たす。呼び出し側は型アサーションで検出する。
-// -L の OpenForward とは向きが逆（サーバ側から、セッションの現在の agent provider
-// クライアントへ bidi ストリームを開く）。
+// AgentForwarder is an optional ServerTransport capability for opening SSH
+// agent forwarding (-A) relay channels. Only supporting implementations
+// (quic) satisfy it; callers detect it with a type assertion.
+// The direction is the reverse of -L's OpenForward: the server opens a
+// bidirectional stream towards the session's current agent provider client.
 type AgentForwarder interface {
-	// OpenAgentStream は sessionID の現在の agent provider へ中継路を開く。
-	// provider が unset（-A クライアント未接続）の場合はエラーを返す。
-	// ctx は open ハンドシェイクにのみ効く。
+	// OpenAgentStream opens a relay channel to the session's current agent
+	// provider. It returns an error when no provider is set (no -A client
+	// attached). ctx applies only to the open handshake.
 	OpenAgentStream(ctx context.Context, sessionID string) (ForwardConn, error)
 }
 
-// ---- オプション機能の named interface ----
-// ServerTransport / ClientTransport 本体の契約には含めず、対応実装（quic）だけが満たす。
-// 呼び出し側は型アサーションで検出する（TCPForwarder / AgentForwarder と同じパターン）。
-// 無名 interface のアサーションが呼び出し側に散らばると契約の全体像が見えなくなるため、
-// ここに集約して名前を付ける。
+// ---- Named optional interfaces ----
+// These are not part of the core ServerTransport / ClientTransport contracts;
+// only supporting implementations (quic) satisfy them, and callers detect them
+// with type assertions (the same pattern as TCPForwarder / AgentForwarder).
+// They are collected and named here so the full set of optional contracts
+// stays visible in one place instead of anonymous assertions scattered across
+// call sites.
 
-// ForwardingPolicy は転送機能の許可/禁止を設定できる ServerTransport のオプション機能
-// （サーバ起動フラグ --no-tcp-forwarding / --no-agent-forwarding の適用先）。
+// ForwardingPolicy is an optional ServerTransport capability for allowing or
+// denying forwarding features (the target of the server flags
+// --no-tcp-forwarding / --no-agent-forwarding).
 type ForwardingPolicy interface {
-	// SetTCPForwarding は TCP ポートフォワード（-L）の許可/禁止を設定する（既定: 許可）。
+	// SetTCPForwarding allows or denies TCP port forwarding (-L).
+	// Default: allowed.
 	SetTCPForwarding(enabled bool)
-	// SetAgentForwarding は SSH agent forwarding（-A）の許可/禁止を設定する（既定: 許可）。
+	// SetAgentForwarding allows or denies SSH agent forwarding (-A).
+	// Default: allowed.
 	SetAgentForwarding(enabled bool)
 }
 
-// SocketHandover は無停止再起動（self re-exec）に必要な fd 継承・明示切断に対応する
-// ServerTransport のオプション機能。
+// SocketHandover is an optional ServerTransport capability required by the
+// zero-downtime restart (self re-exec): fd inheritance and explicit
+// disconnection.
 type SocketHandover interface {
-	// DupUDPSocketFd は待ち受け UDP ソケットを複製した fd（CLOEXEC なし = exec を
-	// 跨いで継承される）を返す。
+	// DupUDPSocketFd returns a duplicate fd of the listening UDP socket
+	// without CLOEXEC (so it is inherited across exec).
 	DupUDPSocketFd() (int, error)
-	// DisconnectAllClients は全クライアントを CONNECTION_CLOSE で即時切断する
-	// （クライアントの idle timeout 待ちを回避し、即 reconnect を誘発する）。
+	// DisconnectAllClients immediately disconnects every client with
+	// CONNECTION_CLOSE (avoiding the client-side idle-timeout wait and
+	// triggering an immediate reconnect).
 	DisconnectAllClients(reason string)
 }
 
-// Addresser は実際の待ち受けアドレスを公開する ServerTransport のオプション機能
-// （:0 bind 時のポート確定、bootstrap でクライアントへ伝える用）。
+// Addresser is an optional ServerTransport capability exposing the actual
+// listening address (to resolve the port after binding to :0, and to tell
+// clients during bootstrap).
 type Addresser interface {
 	Addr() net.Addr
 }
 
-// ResyncSeeder は「既に他経路（UDS）で受信・描画済みの出力オフセット」を Start 前に
-// 設定できる ClientTransport のオプション機能。Hello の LastOffset に反映され、
-// attach 時のバックログ二重転送を防ぐ。
+// ResyncSeeder is an optional ClientTransport capability for seeding, before
+// Start, the output offset already received and rendered via another path
+// (the Unix socket). It is reflected in the Hello's LastOffset and prevents
+// the backlog from being transferred twice on attach.
 type ResyncSeeder interface {
-	// SeedResyncOffset は Start() 前に一度だけ呼ぶこと。
+	// SeedResyncOffset must be called at most once, before Start().
 	SeedResyncOffset(offset uint64)
 }
 
-// AgentForwardClient は SSH agent forwarding（-A）の ClientTransport 側オプション機能。
+// AgentForwardClient is the client-side optional capability for SSH agent
+// forwarding (-A).
 type AgentForwardClient interface {
-	// AgentForwardingSupported はサーバが -A 対応を広告しているかを返す
-	// （serverMeta 受信後に確定。未受信の間は false）。
+	// AgentForwardingSupported reports whether the server advertises -A
+	// support (known once serverMeta has been received; false until then).
 	AgentForwardingSupported() bool
-	// SetAgentSockPath は中継元のローカル agent ソケットパスを設定する
-	// （Start() 前に一度だけ。空文字なら -A 無効）。
+	// SetAgentSockPath sets the local agent socket path to relay from.
+	// Call at most once, before Start(). An empty string disables -A.
 	SetAgentSockPath(path string)
 }

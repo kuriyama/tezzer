@@ -1,12 +1,15 @@
-// quicServer は transport.ServerTransport の QUIC 実装。
+// quicServer is the QUIC implementation of transport.ServerTransport.
 //
-// プロトコル（v1・最小）:
-//   - クライアントが control bidi ストリームを開き Hello{ClientID} を送る → 接続を clientID へ紐付け
-//   - 入力: クライアントが uni ストリームを開き生バイトを流す → Input() へ
-//   - 出力: サーバが clientID ごとに uni ストリームを開き生バイトを流す（SendOutput）
-//   - Resize: control ストリーム上の制御フレーム → Resize() へ
+// Protocol (v1, minimal):
+//   - The client opens the control bidi stream and sends Hello{ClientID},
+//     binding the connection to that clientID.
+//   - Input: the client opens a uni stream and sends raw bytes -> Input().
+//   - Output: the server opens a uni stream per clientID and sends raw bytes
+//     (SendOutput).
+//   - Resize: a control frame on the control stream -> Resize().
 //
-// offset ベース再同期（OnResyncNeeded）と migration 追従は後続スライスで実装する。
+// Offset-based resynchronization (OnResyncNeeded) and migration tracking are
+// layered on top of this.
 package qtransport
 
 import (
@@ -94,8 +97,9 @@ type quicServer struct {
 	agentProviders map[string]transport.ClientID
 }
 
-// NewServer は listenAddr で待ち受ける QUIC サーバトランスポートを作る。
-// UDP ソケットは自前で開く（無停止再起動時に fd を取り出して継承するため）。
+// NewServer creates a QUIC server transport listening on listenAddr.
+// It opens its own UDP socket (so the fd can be extracted and inherited
+// across a zero-downtime restart).
 func NewServer(k []byte, listenAddr string) (transport.ServerTransport, error) {
 	addr, err := net.ResolveUDPAddr("udp", listenAddr)
 	if err != nil {
@@ -113,8 +117,9 @@ func NewServer(k []byte, listenAddr string) (transport.ServerTransport, error) {
 	return st, nil
 }
 
-// NewServerFromPacketConn は既存の UDP ソケット上に QUIC サーバトランスポートを作る
-// （無停止再起動での fd 継承用。ソケットの所有権は quicServer に移り、Close で閉じられる）。
+// NewServerFromPacketConn creates a QUIC server transport on an existing UDP
+// socket (for fd inheritance across a zero-downtime restart). Ownership of
+// the socket moves to the transport; Close closes it.
 func NewServerFromPacketConn(k []byte, uconn net.PacketConn) (transport.ServerTransport, error) {
 	tlsConf, err := ServerTLS(k)
 	if err != nil {
@@ -373,7 +378,7 @@ func (s *quicServer) readInputDatagrams(sc *serverClient) {
 // フロー制御で詰まっている）の兆候として slowWrites に計上する。
 const slowWriteThreshold = 100 * time.Millisecond
 
-// stall 検知の水位（テストから短縮できるよう var）。
+// stall 検知の水位（テストから短縮できるよう差し替え可能）。
 // warning 水位を超えてブロックしている Write を見つけたら、同セッションの
 // 他クライアントへステータス通知する（詰まっている本人には届かない・見えないため、
 // 「固まった画面を見ている側」に犯人を知らせる）。
@@ -381,12 +386,29 @@ const slowWriteThreshold = 100 * time.Millisecond
 // 解放する。切られたクライアントは既存の reconnect + offset 再同期で復旧するため、
 // リングバッファ保持分のデータは失われない（スリープ中のノート PC が典型で、
 // 復帰時にどのみち reconnect する。MaxIdleTimeout=60s より十分手前で切る）。
+//
+// atomic なのはテスト間の競合対策: 前のテストのサーバが残した stallWatchdog
+// goroutine は Close で join されないため、次のテストの差し替え（書き込み）と
+// 同期関係がなく、生の var では -race に検出される（GitLab nightly で実検出）。
+// 本番では初期値のまま読み取り専用。
 var (
-	stallWarnThreshold     = 2 * time.Second
-	stallWarnRepeat        = 30 * time.Second // stall 継続中の再通知間隔
-	stallCriticalThreshold = 30 * time.Second // 超過で当該クライアントを切断
-	stallCheckInterval     = 1 * time.Second
+	stallWarnThreshold     = newAtomicDuration(2 * time.Second)
+	stallWarnRepeat        = newAtomicDuration(30 * time.Second) // stall 継続中の再通知間隔
+	stallCriticalThreshold = newAtomicDuration(30 * time.Second) // 超過で当該クライアントを切断
+	stallCheckInterval     = newAtomicDuration(1 * time.Second)
 )
+
+// atomicDuration はテストから並行安全に差し替えられる時間設定。
+type atomicDuration struct{ ns atomic.Int64 }
+
+func newAtomicDuration(d time.Duration) *atomicDuration {
+	a := &atomicDuration{}
+	a.ns.Store(int64(d))
+	return a
+}
+
+func (a *atomicDuration) Get() time.Duration  { return time.Duration(a.ns.Load()) }
+func (a *atomicDuration) Set(d time.Duration) { a.ns.Store(int64(d)) }
 
 // connCodeStallDisconnect は critical stall による切断の CONNECTION_CLOSE コード
 // （デバッグ用途。プロトコル上の意味は持たせない）。
@@ -444,9 +466,9 @@ func (s *quicServer) SendOutput(offset uint64, data []byte, clients []transport.
 // critical 水位を超えたら当該クライアントを切断し、セッション全体を解放する。
 func (s *quicServer) stallWatchdog() {
 	// 水位はここで一度だけ読む（テストが Start 前に差し替え、終了後に復元するため）。
-	warnThreshold, warnRepeat := stallWarnThreshold, stallWarnRepeat
-	criticalThreshold := stallCriticalThreshold
-	ticker := time.NewTicker(stallCheckInterval)
+	warnThreshold, warnRepeat := stallWarnThreshold.Get(), stallWarnRepeat.Get()
+	criticalThreshold := stallCriticalThreshold.Get()
+	ticker := time.NewTicker(stallCheckInterval.Get())
 	defer ticker.Stop()
 	for {
 		select {
@@ -540,7 +562,7 @@ func (s *quicServer) ClientSendStats() []transport.ClientSendStat {
 		// ノイズになるため報告しない）
 		var curStallMs uint64
 		if start := sc.writeStartNano.Load(); start != 0 {
-			if d := time.Since(time.Unix(0, start)); d >= stallWarnThreshold {
+			if d := time.Since(time.Unix(0, start)); d >= stallWarnThreshold.Get() {
 				curStallMs = uint64(d.Milliseconds())
 			}
 		}

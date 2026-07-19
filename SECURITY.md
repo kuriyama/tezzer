@@ -21,9 +21,6 @@ Instead, report them privately through GitHub's
 If you prefer email, you can instead contact the maintainer privately at
 <kuriyama@s2factory.co.jp>.
 
-> Note: private vulnerability reporting must be enabled on the repository
-> (Settings → Code security and analysis). Enable it before public release.
-
 ## What to Expect
 
 - We aim to acknowledge a report within a few days.
@@ -33,8 +30,11 @@ If you prefer email, you can instead contact the maintainer privately at
 
 ## Scope
 
-tezzer transports terminal I/O over UDP with an authenticated, encrypted
-channel and falls back to a Unix-domain-socket / TCP control channel. Reports
+tezzer transports terminal I/O over QUIC (UDP), mutually authenticated and
+encrypted with TLS 1.3; both ends derive their identities from a per-session
+secret delivered over an SSH-forwarded, UID-checked Unix domain socket, which
+also serves as the bootstrap/control channel. tezzer opens no TCP listener and
+has no authentication of its own beyond that bootstrap. Reports
 that are particularly relevant include, but are not limited to:
 
 - Weaknesses in the packet authentication or encryption (see `internal/qtransport`

@@ -1,5 +1,5 @@
-// Package stun はRFC 5389準拠のSTUNクライアント実装を提供します。
-// NAT越しの公開IP/ポートの取得に使用されます。
+// Package stun provides an RFC 5389 STUN client, used to discover the public
+// IP/port across NAT.
 package stun
 
 import (
@@ -34,15 +34,15 @@ var (
 	ErrNoXorMapped     = errors.New("no XOR-MAPPED-ADDRESS in response")
 )
 
-// Client はSTUNクライアントです。
+// Client is a STUN client.
 type Client struct {
 	ServerAddr string
 	Timeout    time.Duration
-	IPv4Only   bool   // IPv4のみ使用する場合true（Networkが空の場合のみ参照）
-	Network    string // "udp4"/"udp6" で family を明示指定。空なら IPv4Only を見て "udp"/"udp4" を選ぶ
+	IPv4Only   bool   // use IPv4 only (consulted only when Network is empty)
+	Network    string // explicit family, "udp4"/"udp6"; empty selects "udp"/"udp4" from IPv4Only
 }
 
-// NewClient は新しいSTUNクライアントを作成します。
+// NewClient creates a new STUN client.
 func NewClient(serverAddr string) *Client {
 	return &Client{
 		ServerAddr: serverAddr,
@@ -50,7 +50,8 @@ func NewClient(serverAddr string) *Client {
 	}
 }
 
-// GetMappedAddr はSTUNサーバーに問い合わせて、NAT越しの公開アドレスを取得します。
+// GetMappedAddr queries the STUN server and returns the public address as
+// seen across NAT.
 func (c *Client) GetMappedAddr() (*net.UDPAddr, error) {
 	// UDP接続を作成（Network指定があれば優先、なければIPv4Onlyの場合にudp4を使用）
 	network := "udp"
@@ -98,35 +99,40 @@ func (c *Client) GetMappedAddr() (*net.UDPAddr, error) {
 	return parseBindingResponse(buf[:n], txID)
 }
 
-// ProbeResult は同一ソケットから 2 つの STUN サーバーへ問い合わせた NAT 診断結果。
+// ProbeResult is a NAT diagnosis obtained by querying two STUN servers from
+// a single socket.
 type ProbeResult struct {
-	LocalPort int          // 問い合わせに使ったローカルポート
-	MappedA   *net.UDPAddr // サーバー A から見た公開アドレス
-	MappedB   *net.UDPAddr // サーバー B から見た公開アドレス（マッピング比較用）
+	LocalPort int          // local port the queries were sent from
+	MappedA   *net.UDPAddr // public address as seen by server A
+	MappedB   *net.UDPAddr // public address as seen by server B (mapping comparison)
 }
 
-// EndpointIndependent は NAT マッピングが宛先非依存（EIM = cone 系）かを返す。
-// false は宛先ごとにマッピングが変わる EDM（symmetric NAT）で、STUN で得た
-// アドレスを第三者への広告に使えない。
-// cone 系のさらなる細分（filtering 挙動）は RFC 5780 対応サーバーが必要なため扱わない。
+// EndpointIndependent reports whether the NAT mapping is
+// endpoint-independent (EIM, the "cone" family). false means the mapping is
+// destination-dependent (EDM, symmetric NAT) and a STUN-discovered address
+// cannot be advertised to third parties. Finer cone subtypes (filtering
+// behavior) would require an RFC 5780 server, so they are not distinguished.
 func (r ProbeResult) EndpointIndependent() bool {
 	return r.MappedA.IP.Equal(r.MappedB.IP) && r.MappedA.Port == r.MappedB.Port
 }
 
-// PortPreserving は NAT がローカルポートを公開側でも保存しているかを返す。
-// tezzer の STUN 候補広告は「公開 IP + QUIC listen ポート」という port 保存前提の
-// 合成値なので、これが false だと広告候補は実際のマッピングと一致しない。
+// PortPreserving reports whether the NAT preserves the local port on the
+// public side. tezzer's STUN candidate advertisement is the synthetic
+// "public IP + QUIC listen port", which assumes port preservation; when this
+// is false the advertised candidate will not match the actual mapping.
 func (r ProbeResult) PortPreserving() bool {
 	return r.MappedA.Port == r.LocalPort
 }
 
-// Probe は 1 つの UDP ソケットから serverA / serverB へ順に Binding Request を送り、
-// それぞれの XOR-MAPPED-ADDRESS を返す。同一ソケットからの比較なので、マッピングの
-// 宛先依存性（EIM/EDM = cone/symmetric）の判定として意味を持つ。
-// ソケットを分けるとローカルポートが毎回変わり、この比較は成立しない
-// （旧 DetectNATType はこの誤りでほぼ常に symmetric と誤判定していた）。
-// network は "udp4" / "udp6"。診断はソケット単位ではなく NAT 装置の性質を見るものなので、
-// 使い捨てソケットで測って一般化してよい。
+// Probe sends Binding Requests to serverA and then serverB from a single UDP
+// socket and returns each XOR-MAPPED-ADDRESS. Because both queries share one
+// socket, comparing the results is a meaningful test of mapping
+// destination-dependence (EIM/EDM = cone/symmetric); with separate sockets
+// the local port changes on every query and the comparison is void (the
+// removed DetectNATType made exactly that mistake and misreported almost any
+// NAT as symmetric). network is "udp4" or "udp6". The diagnosis reflects the
+// NAT device rather than any particular socket, so measuring with a
+// throwaway socket generalizes.
 func Probe(network, serverA, serverB string, timeout time.Duration) (ProbeResult, error) {
 	conn, err := net.ListenUDP(network, nil)
 	if err != nil {

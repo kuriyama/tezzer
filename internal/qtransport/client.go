@@ -124,8 +124,9 @@ type quicClient struct {
 	onLogMessage      func(string)
 }
 
-// NewClient は serverAddr へ接続する QUIC クライアントトランスポートを作る。
-// sessionID は共有 transport 上での routing 識別に使う（Hello に載せる）。
+// NewClient creates a QUIC client transport that connects to serverAddr.
+// sessionID identifies the session for routing on a shared transport
+// (carried in the Hello).
 func NewClient(k []byte, serverAddr string, clientID uint16, sessionID string) (transport.ClientTransport, error) {
 	c := &quicClient{
 		k:          k,

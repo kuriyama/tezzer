@@ -35,12 +35,13 @@ const (
 	ctrlAgentOpenErr ctrlType = 12 // クライアント → サーバ: 拒否/dial 失敗（Msg = 理由）
 )
 
-// FeatureTCPForward は ctrlServerMeta.Features のビット: TCP ポートフォワード対応。
-// サーバが --no-tcp-forwarding で起動された場合は立たない。
+// FeatureTCPForward is a ctrlServerMeta.Features bit: TCP port forwarding is
+// supported. Not set when the server was started with --no-tcp-forwarding.
 const FeatureTCPForward uint64 = 1 << 0
 
-// FeatureAgentForward は ctrlServerMeta.Features のビット: SSH agent forwarding（-A）対応。
-// サーバが --no-agent-forwarding で起動された場合は立たない。
+// FeatureAgentForward is a ctrlServerMeta.Features bit: SSH agent forwarding
+// (-A) is supported. Not set when the server was started with
+// --no-agent-forwarding.
 const FeatureAgentForward uint64 = 1 << 1
 
 const maxCtrlFrame = 1 << 20    // 1 MiB（制御メッセージなので十分すぎる上限）

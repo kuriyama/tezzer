@@ -27,11 +27,13 @@ import (
 	"github.com/vmihailenco/msgpack/v5"
 )
 
-// HandoverVersion は状態フォーマットの版数。互換性のない変更をしたら上げる。
-// 新プロセスは不一致の状態を復元しない（セッションは失われるがサーバは起動する）。
+// HandoverVersion is the version of the handover state format. Bump it on
+// incompatible changes. The new process refuses to restore a mismatching
+// state (sessions are lost but the server still starts).
 const HandoverVersion = 1
 
-// HandoverEnvVar は継承する状態ファイルの fd 番号を新プロセスへ伝える環境変数。
+// HandoverEnvVar is the environment variable carrying the fd number of the
+// inherited state file to the new process.
 const HandoverEnvVar = "TEZZER_HANDOVER_FD"
 
 type handoverChunk struct {
@@ -122,10 +124,11 @@ func chunksFromHandover(hcs []handoverChunk) ([]OutputChunk, int) {
 	return out, bytes
 }
 
-// WriteHandover は全セッションのロックを取得したまま（= 出力の追記を止めて）状態を w へ
-// 書き出す。成功時: ロックは保持されたまま返る（呼び出し元が exec する前提）。exec に
-// 失敗した場合のみ abort() を呼ぶこと（ロック解放 + dup 済み fd のクローズ）。
-// 失敗時: 内部で後始末してから err を返す（abort は nil）。
+// WriteHandover serializes the state to w while holding every session's lock
+// (i.e. with output appends stopped). On success the locks remain held — the
+// caller is expected to exec; call abort() only if the exec fails (it
+// releases the locks and closes the duplicated fds). On failure it cleans up
+// internally and returns err (abort is nil).
 func (m *Manager) WriteHandover(w io.Writer) (abort func(), err error) {
 	m.mu.Lock()
 	var locked []*Session
@@ -264,8 +267,9 @@ func packetConnFromFd(fd int, name string) (net.PacketConn, error) {
 	return net.FilePacketConn(f)
 }
 
-// RestoreHandover は旧プロセスが書き出した状態を読み込み、セッションを復元する。
-// 戻り値は復元できたセッション数。共有 transport も状態に含まれていれば復元する。
+// RestoreHandover reads the state written by the previous process and
+// restores its sessions. It returns the number of sessions restored. A shared
+// transport, if present in the state, is restored as well.
 func (m *Manager) RestoreHandover(r io.Reader) (int, error) {
 	var st handoverState
 	if err := msgpack.NewDecoder(r).Decode(&st); err != nil {

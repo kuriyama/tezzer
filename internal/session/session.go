@@ -52,7 +52,7 @@ const (
 // デバッグ出力のパッケージレベル制御（atomic操作用、0=OFF, 1=ON）
 var debugEnabled int32
 
-// SetDebugEnabled はデバッグ出力の有効/無効を設定する
+// SetDebugEnabled enables or disables debug output.
 func SetDebugEnabled(enabled bool) {
 	var val int32
 	if enabled {
@@ -61,7 +61,7 @@ func SetDebugEnabled(enabled bool) {
 	atomic.StoreInt32(&debugEnabled, val)
 }
 
-// IsDebugEnabled はデバッグ出力が有効かどうかを返す
+// IsDebugEnabled reports whether debug output is enabled.
 func IsDebugEnabled() bool {
 	return atomic.LoadInt32(&debugEnabled) == 1
 }
@@ -69,7 +69,7 @@ func IsDebugEnabled() bool {
 // Session represents a PTY session
 type Session struct {
 	ID        string
-	Name      string // セッション名（-name。空なら無名。作成時に設定、以後不変）
+	Name      string // session name (-name; empty = unnamed; set at creation, immutable)
 	Cmd       string
 	Args      []string
 	Rows      int
@@ -149,11 +149,11 @@ type Session struct {
 	debug bool // デバッグログ出力フラグ
 }
 
-// OutputChunk は一つの出力塊（PTYから読んだバイト列）
+// OutputChunk is one piece of output (bytes read from the PTY).
 type OutputChunk struct {
 	Seq       uint64
 	Data      []byte
-	Timestamp time.Time // 作成時刻
+	Timestamp time.Time // creation time
 }
 
 // Client represents a connected client
@@ -161,10 +161,10 @@ type Client struct {
 	ID           string
 	Session      *Session
 	OutCh        chan []byte
-	Done         chan struct{} // writer goroutineで切断検出に使用
-	QUICClientID uint16        // QUIC 用のクライアント識別子（0 = QUIC 未使用）
+	Done         chan struct{} // used by the writer goroutine to detect detach
+	QUICClientID uint16        // client identifier for the QUIC path (0 = QUIC unused)
 	Protocol     string        // "UDS", "TCP", "UDP"
-	RemoteAddr   string        // リモートアドレス（TCP/UDPの場合）
+	RemoteAddr   string        // remote address (TCP/UDP)
 }
 
 // lookupLoginShell は /etc/passwd からユーザーのログインシェルを返す。
@@ -199,9 +199,8 @@ var systemdEnvKeys = map[string]bool{
 	"MANAGERPID":            true,
 }
 
-// NewSession creates a new session
-// mgr: session.Manager参照
-// full-QUIC 化に伴い、トランスポートは per-session で qtransport を起動する（共有モードは当面未対応）。
+// NewSession creates a new session. Unless the manager runs a shared
+// transport, it starts a per-session QUIC transport.
 func NewSession(id, cmd string, args []string, env map[string]string, cwd string, rows, cols int, ipv4Only bool, fixedUDPPort int, agentForward bool, mgr *Manager) (*Session, error) {
 	// Create command
 	command := exec.Command(cmd, args...)
@@ -302,9 +301,9 @@ func NewSession(id, cmd string, args []string, env map[string]string, cwd string
 	return s, nil
 }
 
-// StartProcess はクライアント接続後に PTY プロセスを起動する。
-// NewSession() の後、クライアントが AttachClient() した直後に呼ぶことで、
-// tmux 等の初期化シーケンス（DA2 クエリ含む）をクライアントに確実に届けられる。
+// StartProcess starts the PTY process. Calling it after NewSession, right
+// after the client has attached (AttachClient), guarantees that the startup
+// sequences of programs like tmux (including DA2 queries) reach the client.
 func (s *Session) StartProcess() error {
 	ptyMaster, err := pty.Start(s.cmd)
 	if err != nil {
@@ -643,7 +642,8 @@ func (s *Session) reapProcess() {
 	s.mu.Unlock()
 }
 
-// ExitCode はプロセスの終了コードを返す（-1 = 未終了 or 不明）。
+// ExitCode returns the process's exit status (-1 = still running or
+// unknown).
 func (s *Session) ExitCode() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -764,9 +764,10 @@ func (s *Session) flushColdPending() {
 	s.mu.Unlock()
 }
 
-// EvictStaleOutput は保持期限切れの出力チャンクを回収する（定期 cleanup 用）。
-// evict は出力追記時にも走るが、出力が止まったセッションはそれを契機にできない
-// ため、Manager の cleanup ticker から補う。滞留した圧縮待ちもここで圧縮に回す。
+// EvictStaleOutput reclaims output chunks past their retention limit (called
+// by the periodic cleanup). Eviction also runs on append, but a session whose
+// output has stopped never triggers it, so the Manager's cleanup ticker
+// covers that case. A lingering compression queue is also flushed here.
 func (s *Session) EvictStaleOutput() {
 	s.mu.Lock()
 	now := time.Now()
@@ -969,8 +970,8 @@ func (s *Session) sendOutputDroppedNotification(clientID string, droppedSeq uint
 	}
 }
 
-// AttachClient attaches a client to this session
-// quicClientID: QUIC 用のクライアント識別子（0 = QUIC 未使用）
+// AttachClient attaches a client to this session.
+// quicClientID is the client identifier for the QUIC path (0 = QUIC unused).
 func (s *Session) AttachClient(fromSeq uint64, protocol, remoteAddr string, quicClientID uint16) *Client {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1033,11 +1034,12 @@ func (s *Session) sendBufferedOutput(client *Client, fromSeq uint64) {
 	s.RequestRedraw()
 }
 
-// RequestRedraw は PTY サイズを一時変更して screen/tmux の再描画を促す。
-// sendBufferedOutput 後、または QUIC resync 完了後に呼ぶ。
-// cols を 1 減らしてすぐ戻すことで SIGWINCH を 2 回送り、tmux/screen に再描画させる。
-// screen 向けに `screen -X redisplay` を追加実行していたが、GNU Screen 4.9 系では
-// SIGWINCH だけで毎回フル再描画されることを実測で確認したため撤去した（2026-07）。
+// RequestRedraw nudges screen/tmux to redraw by briefly changing the PTY
+// size. Called after sendBufferedOutput or after a QUIC resync completes.
+// Shrinking cols by one and restoring it sends SIGWINCH twice, which makes
+// tmux/screen repaint. A screen-specific `screen -X redisplay` used to run in
+// addition, but measurements showed GNU Screen 4.9 fully redraws on SIGWINCH
+// alone, so it was removed (2026-07).
 func (s *Session) RequestRedraw() {
 	s.mu.RLock()
 	rows, cols := s.Rows, s.Cols
@@ -1121,9 +1123,9 @@ func (s *Session) Resize(rows, cols int) error {
 	return nil
 }
 
-// Size は現在の PTY サイズを返す。Rows/Cols フィールドは Resize() が s.mu 下で
-// 書き換えるため、パッケージ外からロックなしで直接読むとレースになる（-info/-list の
-// 表示用にはこちらを使う）。
+// Size returns the current PTY size. The Rows/Cols fields are rewritten by
+// Resize() under s.mu, so reading them directly from outside the package
+// without the lock is a data race; use Size for -info/-list style display.
 func (s *Session) Size() (rows, cols int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1142,8 +1144,8 @@ func (s *Session) Clients() map[string]*Client {
 	return result
 }
 
-// GetClientCount returns the number of connected clients
-// TCPクライアント数とQUICアクティブクライアント数（自セッション分）の大きい方を返す
+// GetClientCount returns the number of connected clients: the larger of the
+// Unix-socket client count and the session's active QUIC client count.
 func (s *Session) GetClientCount() int {
 	s.mu.RLock()
 	tcpCount := len(s.clients)
@@ -1165,7 +1167,7 @@ func (s *Session) GetClientCount() int {
 	return tcpCount
 }
 
-// ClientInfo は GetClientInfos が返す、接続クライアント1件分の情報。
+// ClientInfo is the per-client information returned by GetClientInfos.
 type ClientInfo struct {
 	ID           string
 	Protocol     string
@@ -1173,8 +1175,8 @@ type ClientInfo struct {
 	QUICClientID uint16
 }
 
-// GetClientInfos returns information about all connected clients
-// TCP/UDSクライアントに加え、QUICのみのアクティブなクライアントも含める
+// GetClientInfos returns information about all connected clients, including
+// QUIC-only clients whose Unix-socket connection is gone.
 func (s *Session) GetClientInfos() []ClientInfo {
 	// ロックを保持したまま st.ActiveClients() を呼ぶとデッドロックの可能性があるため、
 	// 必要な値をコピーしてからロックを解放する。
@@ -1263,8 +1265,9 @@ func (s *Session) GetLastInputAt() time.Time {
 	return s.lastInputAt
 }
 
-// GetBufferedOutput returns all buffered output as a single byte slice
-// PTYが即座に終了した場合（envコマンド等）に、クライアントに出力を返すために使用
+// GetBufferedOutput returns all buffered output as a single byte slice.
+// Used to hand output to the client when the PTY exits immediately
+// (non-interactive commands such as env).
 func (s *Session) GetBufferedOutput() []byte {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1286,14 +1289,14 @@ func (s *Session) GetBufferedOutput() []byte {
 	return result
 }
 
-// OutputBufferStats は OutputRingBuffer の統計情報
+// OutputBufferStats holds output ring buffer statistics.
 type OutputBufferStats struct {
-	ChunkCount      int       // hot 層のチャンク数
-	TotalBytes      int       // hot 層 + 圧縮待ちの raw バイト数
-	ColdSegments    int       // cold 層のセグメント数
-	ColdBytes       int       // cold 層の圧縮後バイト数（メモリ使用量に相当）
-	ColdRawBytes    int       // cold 層の圧縮前バイト数（保持している出力量に相当）
-	OldestChunkTime time.Time // 全層で最古のチャンクのタイムスタンプ
+	ChunkCount      int       // chunk count in the hot tier
+	TotalBytes      int       // raw bytes in the hot tier + compression queue
+	ColdSegments    int       // segment count in the cold tier
+	ColdBytes       int       // compressed bytes in the cold tier (approximates memory use)
+	ColdRawBytes    int       // uncompressed bytes in the cold tier (approximates retained output)
+	OldestChunkTime time.Time // timestamp of the oldest retained chunk across tiers
 }
 
 // GetOutputBufferStats returns statistics about the OutputRingBuffer
@@ -1321,26 +1324,26 @@ func (s *Session) GetOutputBufferStats() OutputBufferStats {
 	return stats
 }
 
-// ClientSendBufferStats は per-client の送信健全性（-info 表示用）。
-// QUIC では SendBuffer/SSN を持たないため、出力送信の health（bytes/最終送信時刻と、
-// backpressure 指標の SlowWrites/MaxWriteMs）を運ぶ。
+// ClientSendBufferStats is per-client send health (for the -info display):
+// bytes/last-send time plus the backpressure indicators
+// SlowWrites/MaxWriteMs.
 type ClientSendBufferStats struct {
 	ClientID       uint16
 	TotalBytes     int
 	LastSeen       time.Time
-	SlowWrites     uint64 // 出力 Write が閾値超だった回数（遅いクライアント＝backpressure）
-	MaxWriteMs     uint64 // 観測した最大 Write 所要（ms）
-	StallEpisodes  uint64 // 出力 Write が warning 水位を超えてブロックした累計エピソード数
-	CurrentStallMs uint64 // 進行中の stall の経過（ms、0 = 詰まっていない）
-	QUICRemoteAddr string // QUIC 接続の現在の対向アドレス（migration で変わりうる。空=不明）
-	// TCP ポートフォワード（-L）の統計
+	SlowWrites     uint64 // output writes exceeding the slow-write threshold (slow client = backpressure)
+	MaxWriteMs     uint64 // largest observed write duration (ms)
+	StallEpisodes  uint64 // cumulative episodes of writes blocked past the warning threshold
+	CurrentStallMs uint64 // elapsed time of an in-progress stall (ms; 0 = not stalled)
+	QUICRemoteAddr string // current QUIC remote address (may change with migration; empty = unknown)
+	// TCP port-forwarding (-L) statistics.
 	ForwardsActive         int32
 	ForwardsOpened         uint64
 	ForwardBytesToTarget   uint64
 	ForwardBytesFromTarget uint64
 }
 
-// GetClientSendBufferStats はこのセッションのクライアントごとの送信健全性を返す。
+// GetClientSendBufferStats returns per-client send health for this session.
 func (s *Session) GetClientSendBufferStats() []ClientSendBufferStats {
 	if s.st == nil {
 		return nil
@@ -1387,10 +1390,11 @@ func (s *Session) GetQUICKey() []byte {
 	return s.quicKey
 }
 
-// RegisterQUICClient はクライアントを出力ファンアウト対象として登録する。
-// QUIC ではクライアントが Hello で clientID/SessionID を申告し、manager が SessionID で
-// 直接ルーティングするため、事前のハンドシェイク準備や hole punch は不要。ここでは
-// 出力配信先リスト（quicClientIDsOut）へ clientID を加えるだけ。
+// RegisterQUICClient registers a client as an output fan-out target. With
+// QUIC the client announces clientID/SessionID in its Hello and the manager
+// routes by SessionID directly, so no handshake preparation or hole punch is
+// needed; this only adds the clientID to the output delivery list
+// (quicClientIDsOut).
 func (s *Session) RegisterQUICClient(clientID uint16) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1415,8 +1419,9 @@ func (s *Session) RegisterQUICClient(clientID uint16) error {
 	return nil
 }
 
-// OnQUICClientConnected は QUIC transport が実際にクライアント接続を受け入れたときに呼ぶ。
-// Gate 2。Gate 1（UDPClientInfoMsg 受信）が既に揃っていれば StartProcess をトリガーする。
+// OnQUICClientConnected is called when the QUIC transport has actually
+// accepted a client connection. This is gate 2; if gate 1 (UDPClientInfoMsg
+// received) is already satisfied it triggers StartProcess.
 func (s *Session) OnQUICClientConnected() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1439,27 +1444,29 @@ func (s *Session) signalQuicReadyLocked() {
 	}
 }
 
-// BeginQuicPendingMode は UDS への PTY 出力配信を抑制する。
-// tezzerd の新規セッション作成フローで、QUIC と UDPClientInfoMsg の両方が揃うまで
-// DA クエリ等が UDS 経由で端末エミュレータに届かないようにするために呼ぶ。
+// BeginQuicPendingMode suppresses PTY output delivery to the Unix socket.
+// The new-session flow in tezzerd calls it so DA queries and similar do not
+// reach the terminal emulator via the Unix socket before both QUIC and the
+// UDPClientInfoMsg have arrived.
 func (s *Session) BeginQuicPendingMode() {
 	s.quicReady.Store(false)
 }
 
-// QuicReadyCh は QUIC + UDPClientInfoMsg 両方の条件が揃ったときに close されるチャネルを返す。
-// tezzerd がタイムアウト監視と StartProcess トリガーに使う。
+// QuicReadyCh returns a channel closed once both conditions (QUIC connected
+// and UDPClientInfoMsg received) hold. tezzerd uses it for timeout monitoring
+// and as the StartProcess trigger.
 func (s *Session) QuicReadyCh() <-chan struct{} {
 	return s.quicReadyCh
 }
 
-// Done は Session が Close() された時点で close されるチャネルを返す。
-// 終了待ち処理（QUIC Ready timeout 等）を Close() と同時に打ち切るために使う。
+// Done returns a channel closed when the session is Close()d. Used to cancel
+// waiters (the QUIC-ready timeout and similar) together with Close().
 func (s *Session) Done() <-chan struct{} {
 	return s.done
 }
 
-// SetDebug はセッションのデバッグ出力の有効/無効を動的に切り替える
-// （transport にはデバッグフラグ切替 API が無いためセッション側のみ）
+// SetDebug toggles the session's debug output at runtime (session side only;
+// the transport has no debug-flag API).
 func (s *Session) SetDebug(enabled bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1467,7 +1474,7 @@ func (s *Session) SetDebug(enabled bool) {
 	// transport にはデバッグフラグ切替 API が無いため何もしない。
 }
 
-// Close closes the session
+// Close closes the session.
 func (s *Session) Close() error {
 	s.closeOnce.Do(func() {
 		close(s.done)

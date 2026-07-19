@@ -1,4 +1,4 @@
-//go:build darwin
+//go:build darwin || freebsd
 
 package netx
 
@@ -9,7 +9,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// GetPeerUID returns the UID of the peer connected to a Unix Domain Socket on macOS
+// GetPeerUID returns the UID of the peer connected to a Unix Domain Socket
+// on macOS / FreeBSD
 func GetPeerUID(conn net.Conn) (uint32, error) {
 	unixConn, ok := conn.(*net.UnixConn)
 	if !ok {
@@ -24,7 +25,7 @@ func GetPeerUID(conn net.Conn) (uint32, error) {
 
 	fd := int(file.Fd())
 
-	// macOSではLOCAL_PEERCREDを使用
+	// macOS / FreeBSD では LOCAL_PEERCRED を使用（どちらも xucred を返す）
 	cred, err := unix.GetsockoptXucred(fd, unix.SOL_LOCAL, unix.LOCAL_PEERCRED)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get peer credentials: %w", err)

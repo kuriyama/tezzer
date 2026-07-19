@@ -25,15 +25,16 @@ type HelloMsg struct {
 
 type CreateSessionMsg struct {
 	Type string            `msgpack:"type"`
-	Name string            `msgpack:"name,omitempty"` // セッション名（-name。アクティブなセッション間で一意）
+	Name string            `msgpack:"name,omitempty"` // session name (-name); unique among active sessions
 	Cmd  string            `msgpack:"cmd"`
 	Args []string          `msgpack:"args,omitempty"`
 	Env  map[string]string `msgpack:"env,omitempty"`
 	Cwd  string            `msgpack:"cwd,omitempty"`
 	Cols int               `msgpack:"cols"`
 	Rows int               `msgpack:"rows"`
-	// AgentForward は -A（SSH agent forwarding）を要求する。作成時にのみ意味を持ち、
-	// セッションの寿命の間不変（docs/dev/agent-forwarding.md）。
+	// AgentForward requests SSH agent forwarding (-A). It only has meaning at
+	// creation time and is immutable for the session's lifetime
+	// (docs/dev/agent-forwarding.md).
 	AgentForward bool `msgpack:"agent_forward,omitempty"`
 }
 
@@ -43,7 +44,7 @@ type AttachSessionMsg struct {
 	FromSeq   uint64 `msgpack:"from_seq"`
 	Cols      int    `msgpack:"cols"`
 	Rows      int    `msgpack:"rows"`
-	ClientID  uint16 `msgpack:"client_id,omitempty"` // クライアント識別子（UDP用）
+	ClientID  uint16 `msgpack:"client_id,omitempty"` // client identifier for the QUIC path
 }
 
 type InputMsg struct {
@@ -78,25 +79,27 @@ type KillSessionMsg struct {
 	SessionID string `msgpack:"session_id"`
 }
 
-// WaitSessionMsg は WAIT_SESSION: セッションのコマンド終了を待つ（-wait）。
-// サーバは終了まで応答を保留し、終了時に NOTE (SESSION_CLOSED, exit_code 付き) を返す。
+// WaitSessionMsg is WAIT_SESSION: wait for the session's command to exit
+// (-wait). The server withholds its response until the session ends, then
+// replies with a NOTE (SESSION_CLOSED, with exit_code).
 type WaitSessionMsg struct {
 	Type      string `msgpack:"type"`
 	SessionID string `msgpack:"session_id"`
 }
 
-// UDPClientInfoMsg はクライアントの ClientID をサーバーに通知する
-// （出力ファンアウト対象への登録。共有 transport モードのルーティングに必要）。
+// UDPClientInfoMsg announces the client's ClientID to the server (registering
+// it as an output fan-out target; required for routing in shared-transport
+// mode). The wire type name keeps its legacy "UDP" prefix for compatibility.
 type UDPClientInfoMsg struct {
 	Type      string `msgpack:"type"`
 	SessionID string `msgpack:"session_id"`
-	ClientID  uint16 `msgpack:"client_id"` // クライアント識別子（UDP用）
+	ClientID  uint16 `msgpack:"client_id"` // client identifier for the QUIC path
 }
 
-// GetServerMetaMsg はサーバーのメタ情報を要求
+// GetServerMetaMsg requests the server's metadata.
 type GetServerMetaMsg struct {
 	Type      string `msgpack:"type"`
-	SessionID string `msgpack:"session_id,omitempty"` // セッション固有の情報を要求する場合に指定
+	SessionID string `msgpack:"session_id,omitempty"` // set to request session-specific information
 }
 
 // Server -> Client messages
@@ -110,20 +113,23 @@ type WelcomeMsg struct {
 type SessionCreatedMsg struct {
 	Type       string `msgpack:"type"`
 	SessionID  string `msgpack:"session_id"`
-	UDPEnabled bool   `msgpack:"udp_enabled,omitempty"` // UDPが有効かどうか
-	UDPPort    int    `msgpack:"udp_port,omitempty"`    // UDPポート番号（サーバー側）
-	UDPKey     []byte `msgpack:"udp_key,omitempty"`     // 共有鍵（32バイト、mTLS pinning 用）
-	PTYClosed  bool   `msgpack:"pty_closed,omitempty"`  // PTYが既に終了しているか
-	// InitialOutput: PTYが即座に終了した場合のバッファ出力（envコマンド等の非インタラクティブコマンド用）
+	UDPEnabled bool   `msgpack:"udp_enabled,omitempty"` // whether the QUIC (UDP) transport is enabled
+	UDPPort    int    `msgpack:"udp_port,omitempty"`    // server-side UDP port
+	UDPKey     []byte `msgpack:"udp_key,omitempty"`     // shared key (32 bytes, used for mTLS pinning)
+	PTYClosed  bool   `msgpack:"pty_closed,omitempty"`  // whether the PTY has already ended
+	// InitialOutput is the buffered output for a PTY that exited immediately
+	// (non-interactive commands such as env).
 	InitialOutput []byte `msgpack:"initial_output,omitempty"`
-	// UDP接続アドレス情報
-	// STUNAddrs: STUN経由で取得したサーバーの公開アドレス候補（family別、最大2件:
-	// IPv4/IPv6。片方の family が利用不可なら省かれる。例: ["203.0.113.1:54321", "[2001:db8::1]:54321"]）
+	// STUNAddrs are the server's public address candidates discovered via
+	// STUN, one per address family (at most 2: IPv4/IPv6; a family that is
+	// unavailable is omitted). Example:
+	// ["203.0.113.1:54321", "[2001:db8::1]:54321"].
 	STUNAddrs []string `msgpack:"stun_addrs,omitempty"`
-	LocalAddr string   `msgpack:"local_addr,omitempty"` // サーバーのローカルアドレス（LAN内接続用、例: "192.168.1.10"）
-	// STUNServer はサーバが STUN 問い合わせに使ったサーバー（tezzerd --stun-server の値）。
-	// クライアント側の STUN 問い合わせも同じサーバーを使う（自前 STUN サーバー運用者の
-	// 意図をクライアント側にも通す）。旧サーバからは空 = クライアント既定にフォールバック。
+	LocalAddr string   `msgpack:"local_addr,omitempty"` // server's local address for same-LAN connects (e.g. "192.168.1.10")
+	// STUNServer is the STUN server the server itself queried (the value of
+	// tezzerd --stun-server). The client uses the same server for its own
+	// STUN queries, so a self-hosted STUN server applies to both ends.
+	// Empty from old servers = client falls back to its default.
 	STUNServer string `msgpack:"stun_server,omitempty"`
 }
 
@@ -138,74 +144,77 @@ type PongMsg struct {
 	Nonce uint64 `msgpack:"nonce"`
 }
 
-// OutputMsg はPTY出力の生バイトストリームを運ぶ
+// OutputMsg carries the raw byte stream of PTY output.
 type OutputMsg struct {
 	Type      string `msgpack:"type"`
 	SessionID string `msgpack:"session_id"`
-	Seq       uint64 `msgpack:"seq"`  // シーケンス番号（欠番検出用）
-	Data      []byte `msgpack:"data"` // PTYから読んだ生データ
+	Seq       uint64 `msgpack:"seq"`  // sequence number (gap detection)
+	Data      []byte `msgpack:"data"` // raw bytes read from the PTY
 }
 
 type NoteMsg struct {
 	Type string `msgpack:"type"`
 	Kind string `msgpack:"kind"`
-	Msg  string `msgpack:"msg,omitempty"` // 追加メッセージ（OUTPUT_DROPPED等に使用）
-	// ExitCode はセッションプロセスの終了コード（SESSION_CLOSED でのみ設定。
-	// nil = 不明。旧サーバからの通知には付かない）。
+	Msg  string `msgpack:"msg,omitempty"` // additional message (used by OUTPUT_DROPPED and others)
+	// ExitCode is the session process's exit status. Only set on
+	// SESSION_CLOSED; nil = unknown (notifications from old servers omit it).
 	ExitCode *int `msgpack:"exit_code,omitempty"`
 }
 
-// ClientInfo はクライアント接続情報
+// ClientInfo describes one connected client.
 type ClientInfo struct {
 	ID             string   `msgpack:"id"`
 	Protocol       string   `msgpack:"protocol"`                   // "UDS", "TCP", "UDP"
-	RemoteAddr     string   `msgpack:"remote_addr,omitempty"`      // リモートアドレス（TCP/UDPの場合）
-	QUICRemoteAddr string   `msgpack:"quic_remote_addr,omitempty"` // QUIC 接続の現在の対向アドレス（migration で変わりうる）
-	UDPClientID    uint16   `msgpack:"udp_client_id,omitempty"`    // UDP クライアント識別子
-	UDPAddresses   []string `msgpack:"udp_addresses,omitempty"`    // UDP接続のアドレス一覧（IP:port）
-	// 送信統計（QUIC接続時のみ）
-	SendBufferBytes int   `msgpack:"send_buffer_bytes,omitempty"` // 送信バイト数
-	LastSeen        int64 `msgpack:"last_seen,omitempty"`         // 最後に送信/受信した時刻 (Unix秒)
-	// backpressure 観測（QUIC）: 出力 Write が遅い＝遅いクライアントが PTY を詰まらせている兆候
-	SlowOutputWrites uint64 `msgpack:"slow_output_writes,omitempty"`  // 出力 Write が閾値超だった回数
-	MaxOutputWriteMs uint64 `msgpack:"max_output_write_ms,omitempty"` // 観測した最大 Write 所要(ms)
-	// stall 観測（QUIC）: warning 水位を超えてブロックした出力 Write（進行中含む）
-	OutputStallEpisodes uint64 `msgpack:"output_stall_episodes,omitempty"` // 累計エピソード数
-	OutputStallMs       uint64 `msgpack:"output_stall_ms,omitempty"`       // 進行中の stall の経過(ms、0=なし)
-	// TCP ポートフォワード（-L）の統計
-	ForwardsActive         int    `msgpack:"forwards_active,omitempty"`           // 現在アクティブな転送接続数
-	ForwardsOpened         uint64 `msgpack:"forwards_opened,omitempty"`           // 累計転送接続数
-	ForwardBytesToTarget   uint64 `msgpack:"forward_bytes_to_target,omitempty"`   // client → target 累計バイト
-	ForwardBytesFromTarget uint64 `msgpack:"forward_bytes_from_target,omitempty"` // target → client 累計バイト
+	RemoteAddr     string   `msgpack:"remote_addr,omitempty"`      // remote address (TCP/UDP)
+	QUICRemoteAddr string   `msgpack:"quic_remote_addr,omitempty"` // current QUIC remote address (may change with migration)
+	UDPClientID    uint16   `msgpack:"udp_client_id,omitempty"`    // QUIC client identifier (legacy field name)
+	UDPAddresses   []string `msgpack:"udp_addresses,omitempty"`    // list of UDP addresses (IP:port; legacy, unset by current servers)
+	// Send statistics (QUIC connections only).
+	SendBufferBytes int   `msgpack:"send_buffer_bytes,omitempty"` // bytes sent
+	LastSeen        int64 `msgpack:"last_seen,omitempty"`         // last send/receive time (Unix seconds)
+	// Backpressure observability (QUIC): slow output writes indicate a slow
+	// client stalling the PTY reader.
+	SlowOutputWrites uint64 `msgpack:"slow_output_writes,omitempty"`  // output writes exceeding the slow-write threshold
+	MaxOutputWriteMs uint64 `msgpack:"max_output_write_ms,omitempty"` // largest observed write duration (ms)
+	// Stall observability (QUIC): output writes blocked past the warning
+	// threshold (including one in progress).
+	OutputStallEpisodes uint64 `msgpack:"output_stall_episodes,omitempty"` // cumulative episodes
+	OutputStallMs       uint64 `msgpack:"output_stall_ms,omitempty"`       // elapsed ms of an in-progress stall (0 = none)
+	// TCP port-forwarding (-L) statistics.
+	ForwardsActive         int    `msgpack:"forwards_active,omitempty"`           // currently active forwarded connections
+	ForwardsOpened         uint64 `msgpack:"forwards_opened,omitempty"`           // cumulative forwarded connections
+	ForwardBytesToTarget   uint64 `msgpack:"forward_bytes_to_target,omitempty"`   // cumulative bytes, client -> target
+	ForwardBytesFromTarget uint64 `msgpack:"forward_bytes_from_target,omitempty"` // cumulative bytes, target -> client
 }
 
 type SessionInfo struct {
 	SessionID   string       `msgpack:"session_id"`
-	Name        string       `msgpack:"name,omitempty"` // セッション名（-name で付与、未設定なら空）
+	Name        string       `msgpack:"name,omitempty"` // session name (from -name; empty if unset)
 	Cmd         string       `msgpack:"cmd"`
 	Rows        int          `msgpack:"rows"`
 	Cols        int          `msgpack:"cols"`
 	CreatedAt   int64        `msgpack:"created_at"`
 	ClientCount int          `msgpack:"client_count"`
-	Clients     []ClientInfo `msgpack:"clients,omitempty"` // 接続中のクライアント情報
+	Clients     []ClientInfo `msgpack:"clients,omitempty"` // currently connected clients
 	UDPEnabled  bool         `msgpack:"udp_enabled,omitempty"`
-	UDPPort     int          `msgpack:"udp_port,omitempty"` // セッションのUDPリスニングポート
+	UDPPort     int          `msgpack:"udp_port,omitempty"` // session's UDP listening port
 	PTYClosed   bool         `msgpack:"pty_closed,omitempty"`
-	// デタッチ追跡
-	LastDetachedAt int64  `msgpack:"last_detached_at,omitempty"` // 最後にクライアントが0になった時刻 (Unix秒)
-	LastUDPAddr    string `msgpack:"last_udp_addr,omitempty"`    // 最後に受信した有効なUDP送信元IP
-	// 活動追跡（freshness）: セッション単位の最終 PTY 出力/入力時刻 (Unix秒)。
-	// クライアント接続の有無と無関係に更新される（ClientInfo.LastSeen との違い）
+	// Detach tracking.
+	LastDetachedAt int64  `msgpack:"last_detached_at,omitempty"` // when the client count last dropped to 0 (Unix seconds)
+	LastUDPAddr    string `msgpack:"last_udp_addr,omitempty"`    // last valid UDP source IP (legacy, unset by current servers)
+	// Freshness: the session's last PTY output/input times (Unix seconds).
+	// Updated regardless of whether any client is attached (unlike
+	// ClientInfo.LastSeen).
 	LastOutputAt int64 `msgpack:"last_output_at,omitempty"`
 	LastInputAt  int64 `msgpack:"last_input_at,omitempty"`
-	// OutputRingBuffer 統計
-	OutputChunks      int   `msgpack:"output_chunks,omitempty"`       // hot 層のチャンク数
-	OutputBufferBytes int   `msgpack:"output_buffer_bytes,omitempty"` // hot 層 + 圧縮待ちの raw バイト数
-	OldestChunkTime   int64 `msgpack:"oldest_chunk_time,omitempty"`   // 全層で最古のチャンクのタイムスタンプ (Unix秒)
-	// cold 層（flate 圧縮された古い出力）の統計
-	OutputColdSegments int `msgpack:"output_cold_segments,omitempty"`  // セグメント数
-	OutputColdBytes    int `msgpack:"output_cold_bytes,omitempty"`     // 圧縮後バイト数（メモリ使用量相当）
-	OutputColdRawBytes int `msgpack:"output_cold_raw_bytes,omitempty"` // 圧縮前バイト数（保持出力量相当）
+	// Output ring buffer statistics.
+	OutputChunks      int   `msgpack:"output_chunks,omitempty"`       // chunk count in the hot tier
+	OutputBufferBytes int   `msgpack:"output_buffer_bytes,omitempty"` // raw bytes in the hot tier + compression queue
+	OldestChunkTime   int64 `msgpack:"oldest_chunk_time,omitempty"`   // timestamp of the oldest retained chunk across tiers (Unix seconds)
+	// Cold-tier (flate-compressed older output) statistics.
+	OutputColdSegments int `msgpack:"output_cold_segments,omitempty"`  // segment count
+	OutputColdBytes    int `msgpack:"output_cold_bytes,omitempty"`     // compressed bytes (approximates memory use)
+	OutputColdRawBytes int `msgpack:"output_cold_raw_bytes,omitempty"` // uncompressed bytes (approximates retained output)
 }
 
 type SessionsListMsg struct {
@@ -223,13 +232,13 @@ type SessionKilledMsg struct {
 	SessionID string `msgpack:"session_id"`
 }
 
-// ServerMetaMsg はサーバーのメタ情報を返す
+// ServerMetaMsg returns the server's metadata.
 type ServerMetaMsg struct {
 	Type string `msgpack:"type"`
-	// サーバー側全体のメタ情報
-	ServerBuildID    string `msgpack:"server_build_id,omitempty"`    // サーバーのビルドID (git hash)
-	ServerBuildTime  string `msgpack:"server_build_time,omitempty"`  // サーバーのビルド時刻
-	ServerInstanceID []byte `msgpack:"server_instance_id,omitempty"` // サーバーインスタンスID（再起動検知用、8バイト）
+	// Server-wide metadata.
+	ServerBuildID    string `msgpack:"server_build_id,omitempty"`    // server build ID (git hash)
+	ServerBuildTime  string `msgpack:"server_build_time,omitempty"`  // server build time
+	ServerInstanceID []byte `msgpack:"server_instance_id,omitempty"` // server instance ID (8 bytes; restart detection)
 }
 
 // Encode encodes a message to msgpack bytes
@@ -390,14 +399,15 @@ const (
 	ErrNoSuchSession   = "NO_SUCH_SESSION"
 	ErrInternal        = "INTERNAL"
 	ErrBusy            = "BUSY"
-	ErrUnauthorized    = "UNAUTHORIZED"      // 認証失敗
-	ErrDuplicateName   = "DUPLICATE_NAME"    // 同名のアクティブなセッションが既に存在
-	ErrTooManySessions = "TOO_MANY_SESSIONS" // アクティブなセッション数が上限（--max-sessions）に到達
+	ErrUnauthorized    = "UNAUTHORIZED"      // authentication failure
+	ErrDuplicateName   = "DUPLICATE_NAME"    // an active session with the same name already exists
+	ErrTooManySessions = "TOO_MANY_SESSIONS" // active session count reached the --max-sessions limit
 )
 
-// ValidateSessionName は -name で指定するセッション名の形式を検証する。
-// クライアント・サーバ双方で使う。表示列やスクリプトでの扱いやすさのため
-// 英数と . _ - のみ、63 文字までに制限する。
+// ValidateSessionName validates the form of a session name given via -name.
+// Used on both the client and the server. Names are restricted to
+// alphanumerics plus . _ - and at most 63 characters, to keep them friendly
+// to list columns and scripting.
 func ValidateSessionName(name string) error {
 	if name == "" {
 		return fmt.Errorf("session name cannot be empty")

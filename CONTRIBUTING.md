@@ -53,6 +53,16 @@ fails it prints a `seed=`; rerun the exact case with `TEZZER_TEST_SEED=<seed>`.
 Use clear, imperative commit subjects. A `type: summary` prefix
 (`fix:`, `test:`, `docs:`, `refactor:`, `build:`) is appreciated but not required.
 
+### Comment language
+
+Documentation and the godoc surface (package comments and doc comments on
+exported identifiers) are in English. Inline implementation comments are
+currently written primarily in Japanese — the maintainer's working language —
+and you will encounter them throughout the code. This is a deliberate
+trade-off, not an oversight: many of these comments carry detailed design
+rationale that is most reliably maintained in the language it was thought in.
+English is welcome in contributions; there is no need to write Japanese.
+
 ## Project Layout
 
 - `cmd/tezzerd` — server binary

@@ -51,6 +51,20 @@ session requires the same SSH access you already have. Details in the
 
 ## Installation
 
+### Linux
+
+Download a tarball from the latest release (asset URLs are stable across
+releases):
+
+```bash
+curl -fsSL https://github.com/kuriyama/tezzer/releases/latest/download/tezzer_linux_amd64.tar.gz | tar xz
+sudo install tezzer_linux_amd64/tezzer tezzer_linux_amd64/tezzerd tezzer_linux_amd64/tezzer-ssh /usr/local/bin/
+```
+
+Replace `amd64` with `arm64` as needed. `.deb` and `.rpm` packages are also
+attached to each [release](https://github.com/kuriyama/tezzer/releases). All
+release artifacts carry build provenance attestations.
+
 ### macOS (Homebrew)
 
 ```bash
@@ -61,6 +75,12 @@ brew install tezzer
 Installs `tezzer`, `tezzerd`, and `tezzer-ssh`. See
 [kuriyama/homebrew-tezzer](https://github.com/kuriyama/homebrew-tezzer) for the
 formula.
+
+### FreeBSD
+
+The same tarball pattern as Linux, with `tezzer_freebsd_amd64.tar.gz` /
+`tezzer_freebsd_arm64.tar.gz`. FreeBSD binaries are cross-compiled and not yet
+CI-tested on real hardware.
 
 ### From source
 
