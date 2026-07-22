@@ -8,6 +8,27 @@ once it reaches a 1.0 release.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-22
+
+### Changed
+
+- README.ja.md's "no persistence" caveat now reflects zero-downtime restart
+  (`SIGUSR2`): a planned binary-update restart preserves the session, while
+  an unexpected crash (OOM kill, SIGKILL) still loses it. The previous
+  wording predated the self-re-exec restart feature and said any server
+  restart lost the session.
+- README documents a `systemctl kill` pitfall for zero-downtime restarts:
+  the default `--kill-who=all` signals every process in the unit's cgroup,
+  silently killing the shells/PTYs tezzerd manages instead of preserving
+  them. Use `systemctl --user kill --kill-who=main -s SIGUSR2 tezzerd` (or
+  signal the main PID directly) instead.
+
+### Fixed
+
+- A client could print `[Tezzer] Session closed: ...` twice when a PTY
+  session ended, because the UDS and QUIC notification paths could each
+  announce it independently. Only the first to arrive is now shown.
+
 ## [0.1.0] - 2026-07-19
 
 ### Added

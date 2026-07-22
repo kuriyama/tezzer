@@ -202,7 +202,8 @@ func (c *Client) startQUICTransport(udsAddr string, quicInfo *QUICInfo) error {
 			c.noteSessionExitCode(exitCode)
 			// UDS 経由で先に表示済みでなければここで出す
 			// （QUIC-only クライアント、または QUIC が UDS より先に届いたケース）。
-			if !c.sessionClosedNotified.Load() {
+			// CompareAndSwap で先着した側だけが表示する。
+			if c.sessionClosedNotified.CompareAndSwap(false, true) {
 				msg := strings.TrimPrefix(reason, "SESSION_CLOSED: ")
 				fmt.Fprintf(os.Stderr, "\r\n[Tezzer] Session closed: %s\r\n", msg)
 			}

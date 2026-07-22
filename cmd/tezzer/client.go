@@ -65,7 +65,7 @@ type Client struct {
 
 	errCh                 chan error  // 異常終了通知用（バッファ1）
 	killing               atomic.Bool // Ctrl-^ q による kill 処理中（sessionGone をエラー扱いしない）
-	sessionClosedNotified atomic.Bool // UDS 経由で SESSION_CLOSED を表示済み（QUIC 側の重複表示防止）
+	sessionClosedNotified atomic.Bool // SESSION_CLOSED 表示済みフラグ（UDS/QUIC どちらが先着しても一度だけ表示）
 	// セッションプロセスの終了コード（-1 = 未受信）。SESSION_CLOSED 通知
 	//（QUIC/UDS どちらの経路でも）で設定され、ssh と同様にクライアント自身の
 	// 終了コードになる。

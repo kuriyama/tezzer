@@ -341,6 +341,24 @@ loginctl enable-linger "$USER"
 If GNU screen sessions are not found under systemd, check the actual socket
 directory with `ls -la /run/screen/S-"$USER"/` and set `SCREENDIR` accordingly.
 
+### Zero-downtime restart under systemd
+
+After dropping a new binary in place (same path), send `SIGUSR2` to trigger
+the self-exec restart (PTYs, output buffers, and connection state survive;
+see "What it is not" above). Send it to the **main process only**:
+
+```bash
+kill -USR2 $(systemctl --user show -p MainPID --value tezzerd)
+```
+
+Do not use `systemctl kill -s SIGUSR2 tezzerd`: its default `--kill-who=all`
+signals every process in the unit's cgroup, including the shells/PTYs
+tezzerd manages. Those child processes have no SIGUSR2 handler, so the
+kernel's default action (terminate) kills them — breaking the very sessions
+the restart is meant to preserve, with no error surfaced on the tezzerd side
+(input silently stops reaching the PTY). If you must go through `systemctl`,
+use `systemctl --user kill --kill-who=main -s SIGUSR2 tezzerd` instead.
+
 ## Client log files
 
 The client (including via `tezzer-ssh`) writes logs to

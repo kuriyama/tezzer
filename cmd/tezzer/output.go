@@ -160,12 +160,13 @@ func (c *Client) handleServer() {
 				c.setStatusMessage(msg)
 			} else if m.Kind == "SESSION_CLOSED" {
 				// セッション終了時の通知（UDS 経由）
-				// QUIC 側でも同通知が来うるため、先に表示済みフラグを立てて重複を防ぐ。
-				c.sessionClosedNotified.Store(true)
+				// QUIC 側でも同通知が来うるため、CompareAndSwap で先着した側だけが表示する。
 				if m.ExitCode != nil {
 					c.noteSessionExitCode(*m.ExitCode)
 				}
-				fmt.Fprintf(os.Stderr, "\r\n[Tezzer] Session closed: %s\r\n", m.Msg)
+				if c.sessionClosedNotified.CompareAndSwap(false, true) {
+					fmt.Fprintf(os.Stderr, "\r\n[Tezzer] Session closed: %s\r\n", m.Msg)
+				}
 				c.doneOnce.Do(func() { close(c.done) })
 				return
 			}
