@@ -576,6 +576,41 @@ func TestSessionExitCodeSignal(t *testing.T) {
 	}
 }
 
+// TestWriteInputLargeWithEcho は、エコーを返すアプリへの巨大入力でデッドロックしないことを
+// テストする。WriteInput が s.mu を持ったまま PTY 書き込みでブロックすると、出力側の
+// handlePTYOutput が s.mu を待ち、アプリは出力が捌けず入力を読まない、で固まっていた。
+func TestWriteInputLargeWithEcho(t *testing.T) {
+	mgr := NewManager()
+	sess, err := mgr.CreateSession("", "/bin/cat", []string{}, nil, "", 24, 80, false, 0, false)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+	defer sess.Close()
+	if err := sess.StartProcess(); err != nil {
+		t.Fatalf("failed to start process: %v", err)
+	}
+
+	line := []byte(strings.Repeat("x", 79) + "\n")
+	done := make(chan error, 1)
+	go func() {
+		for i := 0; i < 1024*1024/len(line); i++ {
+			if err := sess.WriteInput(line); err != nil {
+				done <- err
+				return
+			}
+		}
+		done <- nil
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("WriteInput: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("WriteInput of 1MB to an echoing app did not finish (deadlock)")
+	}
+}
+
 // TestActivityTimestamps は handlePTYOutput / WriteInput が freshness 用の
 // 最終出力・入力時刻を更新することをテスト（白箱）
 func TestActivityTimestamps(t *testing.T) {
@@ -656,4 +691,44 @@ func TestManagerMaxSessions(t *testing.T) {
 		t.Fatalf("create after closing should succeed: %v", err)
 	}
 	third.Close()
+}
+
+// TestCreateSessionCommandNotFound は PATH にないコマンドで作成が即エラーになることを確認する。
+// 以前は作成に成功し、QUIC 確立後の StartProcess でサーバーログにだけ失敗が出て、
+// クライアントは何も表示されないまま止まっていた（systemd の PATH に zellij がない報告）。
+func TestCreateSessionCommandNotFound(t *testing.T) {
+	mgr := NewManager()
+	sess, err := mgr.CreateSession("", "tezzer-no-such-command-xyz", nil, nil, "", 24, 80, false, 0, false)
+	if err == nil {
+		sess.Close()
+		t.Fatal("CreateSession with a missing command succeeded, want error")
+	}
+	if !strings.Contains(err.Error(), "tezzer-no-such-command-xyz") {
+		t.Errorf("error %q should name the command", err)
+	}
+}
+
+// TestTermModeRestore は PTY のアプリが有効にした端末モードが、attach 応答用の
+// 再現シーケンスとして取れることを確認する（zellij 等は起動時に 1 回だけ有効化する）。
+func TestTermModeRestore(t *testing.T) {
+	mgr := NewManager()
+	sess, err := mgr.CreateSession("", "/bin/sh", []string{"-c", `printf '\033[?1049h\033[?1000;1002;1006h\033[?2004h'; sleep 5`}, nil, "", 24, 80, false, 0, false)
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	defer sess.Close()
+	if got := sess.TermModeRestore(); got != nil {
+		t.Fatalf("before output: TermModeRestore = %q, want nil", got)
+	}
+	if err := sess.StartProcess(); err != nil {
+		t.Fatalf("StartProcess: %v", err)
+	}
+	want := "\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h"
+	deadline := time.Now().Add(3 * time.Second)
+	for string(sess.TermModeRestore()) != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("TermModeRestore = %q, want %q", sess.TermModeRestore(), want)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }

@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/kuriyama/tezzer/internal/proto"
 	"github.com/kuriyama/tezzer/internal/qtransport"
 	"github.com/kuriyama/tezzer/internal/transport"
 	"github.com/kuriyama/tezzer/internal/version"
@@ -39,6 +40,9 @@ type Manager struct {
 	tcpFwdDisabled atomic.Bool
 	// agent forwarding（-A）の禁止フラグ（零値 = 許可。tezzerd --no-agent-forwarding で true）
 	agentFwdDisabled atomic.Bool
+
+	// リモートフォワード（-R）の登録表（tezzerd 全体で 1 つ。rforward.go）
+	rfwd *rfwdRegistry
 
 	// アクティブなセッション数の上限（0 = 無制限。tezzerd --max-sessions で設定。mu 保護）
 	maxSessions int
@@ -77,6 +81,16 @@ func (m *Manager) applyTransportPolicy(st transport.ServerTransport) {
 		p.SetTCPForwarding(m.tcpForwardingEnabled())
 		p.SetAgentForwarding(m.AgentForwardingEnabled())
 	}
+	// -R は TCP 転送の一部として --no-tcp-forwarding で一緒に無効になる
+	// （ssh の AllowTcpForwarding と同じ）。登録しなければ transport は広告もしない。
+	if m.tcpForwardingEnabled() {
+		m.rfwd.wire(st)
+	}
+}
+
+// RemoteForwards returns a snapshot of the remote forward (-R) ports.
+func (m *Manager) RemoteForwards() []proto.RemoteForwardInfo {
+	return m.rfwd.snapshot()
 }
 
 // InitSharedTransport starts one shared QUIC transport for fixed-port
@@ -215,6 +229,7 @@ func (m *Manager) routeSharedResize() {
 func NewManager() *Manager {
 	m := &Manager{
 		sessions: make(map[string]*Session),
+		rfwd:     newRFwdRegistry(),
 		done:     make(chan struct{}),
 	}
 	// サーバーインスタンスIDを生成（サーバー再起動検知用）
@@ -223,7 +238,22 @@ func NewManager() *Manager {
 		binary.BigEndian.PutUint64(m.serverInstanceID[:], uint64(time.Now().UnixNano()))
 	}
 	go m.runSessionCleanup()
+	go m.runRemoteForwardTicker()
 	return m
+}
+
+// runRemoteForwardTicker は -R の bind 再試行と休眠の失効を定期的に行う。
+func (m *Manager) runRemoteForwardTicker() {
+	ticker := time.NewTicker(rfwdRetryInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.done:
+			return
+		case <-ticker.C:
+			m.rfwd.tick()
+		}
+	}
 }
 
 // runSessionCleanup は PTY 終了済みで接続クライアントがいないセッションを定期削除する
@@ -399,6 +429,7 @@ func (m *Manager) DeleteSession(id string) error {
 
 	session.Close()
 	delete(m.sessions, id)
+	m.rfwd.dropSession(id)
 
 	return nil
 }
@@ -447,6 +478,7 @@ func (m *Manager) SetDebugForAllSessions(enabled bool) {
 // Close cleans up the manager's resources.
 func (m *Manager) Close() {
 	close(m.done)
+	m.rfwd.closeAll()
 	if m.sharedTransport != nil {
 		if m.sharedCancel != nil {
 			m.sharedCancel()

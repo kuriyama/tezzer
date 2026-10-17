@@ -65,6 +65,9 @@ type serverClient struct {
 
 	// agent forwarding（-A）。Hello の AgentForward で立つ（agent.go）。
 	agentForward bool
+	// -R を登録したクライアントか（Hello の RemoteForwards。rforward.go）。
+	// 切断時に OnRemoteForward の gone を呼ぶかの判定に使う。
+	remoteForward bool
 }
 
 type quicServer struct {
@@ -95,6 +98,9 @@ type quicServer struct {
 	agentFwdDisabled atomic.Bool
 	// セッションごとの現在の agent forwarding provider（agent.go。mu で保護）
 	agentProviders map[string]transport.ClientID
+	// -R のコールバック（OnRemoteForward。rforward.go。mu で保護。nil = -R 無効）
+	rfwdHello func(transport.ClientID, string, []uint16)
+	rfwdGone  func(transport.ClientID, bool)
 }
 
 // NewServer creates a QUIC server transport listening on listenAddr.
@@ -208,6 +214,10 @@ func (s *quicServer) handleConn(conn *quic.Conn) {
 	}
 	m, err := readFrame(ctrl)
 	if err != nil || m.Type != ctrlHello {
+		if err == nil {
+			err = fmt.Errorf("unexpected first frame %v", m.Type)
+		}
+		log.Printf("qtransport: connection from %s dropped before hello: %v", conn.RemoteAddr(), err)
 		_ = conn.CloseWithError(1, "expected hello")
 		return
 	}
@@ -218,9 +228,12 @@ func (s *quicServer) handleConn(conn *quic.Conn) {
 	if err != nil {
 		return
 	}
-	sc := &serverClient{id: cid, conn: conn, out: out, ctrl: ctrl, agentForward: m.AgentForward}
+	rfwdHello := s.rfwdHelloFor(m)
+	sc := &serverClient{id: cid, conn: conn, out: out, ctrl: ctrl, agentForward: m.AgentForward, remoteForward: rfwdHello != nil}
+	connectedAt := time.Now()
 
 	s.mu.Lock()
+	_, replacing := s.clients[cid]
 	s.clients[cid] = sc
 	if m.AgentForward {
 		// 「最後の Hello が勝つ」: migration/reconnect でも同じ規約で上書きする。
@@ -230,6 +243,14 @@ func (s *quicServer) handleConn(conn *quic.Conn) {
 	onResync := s.onResync
 	buildID, buildTime, instanceID := s.metaBuildID, s.metaBuildTime, s.metaInstanceID
 	s.mu.Unlock()
+	// 接続イベントは常時ログに残す（従来は一切出ず、報告時に「QUIC が届いていたか」を
+	// サーバ側から判定できなかった）。replacing = 同一 clientID の reconnect。
+	kind := "connected"
+	if replacing {
+		kind = "reconnected"
+	}
+	log.Printf("qtransport: client %d (session %s) %s from %s (last offset %d)",
+		cid.Num, cid.Session, kind, conn.RemoteAddr(), m.LastOffset)
 	if onConnect != nil {
 		onConnect(cid)
 	}
@@ -237,6 +258,12 @@ func (s *quicServer) handleConn(conn *quic.Conn) {
 	// サーバ情報を control ストリームで通知（UDS 非依存。スリープで UDS が切れても届く）。
 	// Features（転送対応等）を運ぶため常に送る。
 	_ = s.writeCtrl(sc, &ctrlMsg{Type: ctrlServerMeta, BuildID: buildID, BuildTime: buildTime, InstanceID: instanceID, Features: s.features()})
+
+	// -R の登録（reconnect のたびに再登録される）。ServerMeta の後に呼ぶので、
+	// コールバック内からの SendStatus（登録結果の通知）は ServerMeta より後に届く。
+	if rfwdHello != nil {
+		rfwdHello(cid, m.DeviceID, m.RemoteForwards)
+	}
 
 	// 再同期: クライアントが最後に受けた offset の次から、セッション層（OutputRingBuffer）に
 	// 残っている分を先行送信してからライブ出力に入る。重複は client 側が offset で弾く。
@@ -287,7 +314,18 @@ func (s *quicServer) handleConn(conn *quic.Conn) {
 		}
 	}
 	onDisconnect := s.onDisconnect
+	rfwdGone := s.rfwdGone
 	s.mu.Unlock()
+	if stillMine && sc.remoteForward && rfwdGone != nil {
+		rfwdGone(cid, closedByClientExit(conn))
+	}
+	note := ""
+	if !stillMine {
+		note = ", superseded by reconnect"
+	}
+	log.Printf("qtransport: client %d (session %s) disconnected from %s after %v: %v%s",
+		cid.Num, cid.Session, conn.RemoteAddr(), time.Since(connectedAt).Round(time.Second),
+		context.Cause(conn.Context()), note)
 	if stillMine && onDisconnect != nil {
 		onDisconnect(cid)
 	}
@@ -301,12 +339,15 @@ func (s *quicServer) readControl(sc *serverClient, ctrl *quic.Stream) {
 			return
 		}
 		sc.lastRecvNano.Store(time.Now().UnixNano())
-		if m.Type == ctrlResize {
+		switch m.Type {
+		case ctrlResize:
 			select {
 			case s.resize <- transport.Resize{Client: sc.id, Cols: m.Cols, Rows: m.Rows}:
 			case <-s.ctx.Done():
 				return
 			}
+		case ctrlPing:
+			_ = s.writeCtrl(sc, &ctrlMsg{Type: ctrlPong})
 		}
 	}
 }
@@ -413,6 +454,12 @@ func (a *atomicDuration) Set(d time.Duration) { a.ns.Store(int64(d)) }
 // connCodeStallDisconnect は critical stall による切断の CONNECTION_CLOSE コード
 // （デバッグ用途。プロトコル上の意味は持たせない）。
 const connCodeStallDisconnect quic.ApplicationErrorCode = 2
+
+// connCodeClientExit はクライアントが意図して終了する（detach・Ctrl-C・セッション終了）
+// ときの CONNECTION_CLOSE コード。サーバはこれで「接続喪失」（スリープ・回線断・
+// reconnect に伴う旧接続の close）と区別する。-R の listener を即座に手放すか、
+// 休眠させて押さえておくかの判断に使う（rforward.go）。
+const connCodeClientExit quic.ApplicationErrorCode = 3
 
 // writeOutput は出力フレームを 1 つ書き、所要時間を返す。書き込み開始時刻を
 // writeStartNano に記録し、ブロック中の Write を stallWatchdog が外から観測できる

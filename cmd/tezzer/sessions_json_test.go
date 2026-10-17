@@ -18,7 +18,7 @@ import (
 )
 
 func TestFormatSessionsListJSON_Empty(t *testing.T) {
-	got, err := formatSessionsListJSON(nil, time.UTC)
+	got, err := formatSessionsListJSON(nil, nil, time.UTC)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +84,7 @@ func testSessionsJSONFixture() []proto.SessionInfo {
 }
 
 func TestFormatSessionsListJSON_Golden(t *testing.T) {
-	got, err := formatSessionsListJSON(testSessionsJSONFixture(), time.UTC)
+	got, err := formatSessionsListJSON(testSessionsJSONFixture(), nil, time.UTC)
 	if err != nil {
 		t.Fatal(err)
 	}

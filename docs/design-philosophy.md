@@ -53,10 +53,12 @@ fatal-error notices.
 These interventions flash a single reverse-video status line at the top of the
 terminal for a few seconds, then blank it. This does **not** save or restore
 whatever was actually on that row beforehand — tezzer keeps no screen buffer
-to restore from (see "What tezzer does not do" above). Full-screen
-applications (vim, tmux, etc.) repaint the row on their own; in a plain shell
-at the very top of a fresh terminal, the row is simply left blank until
-something else overwrites it. Because of this, an intervention's message must
+to restore from (see "What tezzer does not do" above). The row is simply left
+blank until something else overwrites it: full-screen applications repaint it
+the next time they redraw that row (a rarely-changing top bar such as Zellij's
+tab bar may stay blank for a while), and in a plain shell it stays blank until
+new output reaches it. The experimental `TEZZER_STATUS=redraw` opts into
+nudging alternate-screen apps to repaint right after the row is cleared. Because of this, an intervention's message must
 fit within a single terminal row (assume ~80 columns) — anything that wraps
 leaves stray content on a second row that nothing will ever clear.
 

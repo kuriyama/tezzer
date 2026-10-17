@@ -182,18 +182,18 @@ func (c *Client) handleForwardConn(sp forwardSpec, tconn *net.TCPConn) {
 // forwardWarn は転送関連の警告を出す。ファイルログには常時、ステータス行は
 // 連続失敗のスパム防止のため 5 秒に 1 回に間引く。
 func (c *Client) forwardWarn(msg string) {
-	if c.fileLog != nil {
-		c.fileLog.Printf("%s", msg)
-	}
 	c.fwdWarnMu.Lock()
 	throttled := time.Since(c.lastFwdWarn) < 5*time.Second
 	if !throttled {
 		c.lastFwdWarn = time.Now()
 	}
 	c.fwdWarnMu.Unlock()
-	if !throttled {
-		c.setStatusMessage(msg)
+	if throttled {
+		c.fileLog.Print(msg)
+		return
 	}
+	// ファイルログへは setStatusMessage（addLogMessage）経由で書かれる
+	c.setStatusMessage(msg)
 }
 
 // pollForFeatureSupport は QUIC 機能（-L/-A 等）の feature bit 到着（serverMeta 受信）を

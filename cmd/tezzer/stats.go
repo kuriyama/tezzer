@@ -122,25 +122,25 @@ func (c *Client) writeStatsFile() {
 
 	statsPath, err := statsFilePath(c.sessionID)
 	if err != nil {
-		c.setStatusMessage(fmt.Sprintf("Stats: %v", err))
+		c.showRequestedStatus(fmt.Sprintf("Stats: %v", err))
 		return
 	}
 	if err := os.MkdirAll(filepath.Dir(statsPath), 0700); err != nil {
-		c.setStatusMessage(fmt.Sprintf("Stats: mkdir: %v", err))
+		c.showRequestedStatus(fmt.Sprintf("Stats: mkdir: %v", err))
 		return
 	}
 
 	data, err := json.MarshalIndent(stats, "", "  ")
 	if err != nil {
-		c.setStatusMessage(fmt.Sprintf("Stats: marshal: %v", err))
+		c.showRequestedStatus(fmt.Sprintf("Stats: marshal: %v", err))
 		return
 	}
 	if err := os.WriteFile(statsPath, data, 0600); err != nil {
-		c.setStatusMessage(fmt.Sprintf("Stats: write: %v", err))
+		c.showRequestedStatus(fmt.Sprintf("Stats: write: %v", err))
 		return
 	}
 
-	c.setStatusMessage(fmt.Sprintf("Stats: %s", statsPath))
+	c.showRequestedStatus(fmt.Sprintf("Stats: %s", statsPath))
 }
 
 func showSessionStats(sessionID string, jsonOut bool) error {

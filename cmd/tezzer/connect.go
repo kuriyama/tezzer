@@ -28,7 +28,7 @@ type QUICInfo struct {
 	Port       int
 	Key        []byte
 	STUNAddrs  []string // サーバーのSTUN経由アドレス候補（NAT越え用、family別）
-	LocalAddr  string   // サーバーのローカルアドレス（LAN内接続用）
+	LocalAddrs []string // サーバーのローカルアドレス候補（LAN内接続用、family別）
 	STUNServer string   // サーバが使った STUN サーバー（クライアントも同じものを使う。空 = 既定）
 }
 
@@ -42,7 +42,7 @@ func quicInfoFromSessionCreated(m *proto.SessionCreatedMsg) *QUICInfo {
 		Port:       m.UDPPort,
 		Key:        m.UDPKey,
 		STUNAddrs:  m.STUNAddrs,
-		LocalAddr:  m.LocalAddr,
+		LocalAddrs: m.LocalAddrs,
 		STUNServer: m.STUNServer,
 	}
 }
@@ -72,18 +72,22 @@ func buildQUICCandidateAddrs(quicInfo *QUICInfo, clientSTUNAddrs []string) []str
 		}
 	}
 
-	if !isRemoteConnection && serverIsOnSameHost(quicInfo.LocalAddr) {
+	if !isRemoteConnection && serverIsOnSameHost(quicInfo.LocalAddrs) {
 		candidates = append(candidates, fmt.Sprintf("127.0.0.1:%d", quicInfo.Port))
 	}
-	if !isRemoteConnection && quicInfo.LocalAddr != "" && !strings.HasPrefix(quicInfo.LocalAddr, "127.") {
-		candidates = append(candidates, quicInfo.LocalAddr)
+	if !isRemoteConnection {
+		for _, addr := range quicInfo.LocalAddrs {
+			if addr != "" && !strings.HasPrefix(addr, "127.") {
+				candidates = append(candidates, addr)
+			}
+		}
 	}
 	for _, addr := range quicInfo.STUNAddrs {
 		if addr != "" {
 			candidates = append(candidates, addr)
 		}
 	}
-	// 候補ゼロ（完全オフライン環境などで LocalAddr も STUN も取れない）の場合、
+	// 候補ゼロ（完全オフライン環境などで LocalAddrs も STUN も取れない）の場合、
 	// 最後の頼みとして loopback を試す。ローカル利用(UDS 直結)ならこれで繋がる。
 	// サーバが実際には別ホストでも mTLS（K の pinning）検証で安全に失敗するだけ。
 	if len(candidates) == 0 && !isRemoteConnection {
@@ -129,11 +133,9 @@ func (c *Client) startQUICTransport(udsAddr string, quicInfo *QUICInfo) error {
 	candidateAddrs = buildQUICCandidateAddrs(quicInfo, clientSTUNAddrs)
 
 	// 候補アドレスを常時ログ＆通知（debug 不要で「どのアドレス/ポートを叩いたか」を診断できる）
+	// ファイルログへは setStatusMessage（addLogMessage）経由で書かれる
 	if len(candidateAddrs) > 0 {
 		c.setStatusMessage(fmt.Sprintf("QUIC candidates: %s", strings.Join(candidateAddrs, ", ")))
-		if c.fileLog != nil {
-			c.fileLog.Printf("QUIC candidates: %s", strings.Join(candidateAddrs, ", "))
-		}
 	}
 
 	// 候補アドレスを表示
@@ -157,6 +159,11 @@ func (c *Client) startQUICTransport(udsAddr string, quicInfo *QUICInfo) error {
 	if c.agentSockPath != "" {
 		if as, ok := ct.(transport.AgentForwardClient); ok {
 			as.SetAgentSockPath(c.agentSockPath)
+		}
+	}
+	if len(c.rforwards) > 0 {
+		if rf, ok := ct.(transport.RemoteForwardClient); ok {
+			rf.SetRemoteForwards(c.deviceID, remoteForwardTargets(c.rforwards))
 		}
 	}
 	// UDS 経由で既に描画済みの分は QUIC の再同期対象から外す
@@ -205,6 +212,7 @@ func (c *Client) startQUICTransport(udsAddr string, quicInfo *QUICInfo) error {
 			// CompareAndSwap で先着した側だけが表示する。
 			if c.sessionClosedNotified.CompareAndSwap(false, true) {
 				msg := strings.TrimPrefix(reason, "SESSION_CLOSED: ")
+				c.restoreTerminalModes()
 				fmt.Fprintf(os.Stderr, "\r\n[Tezzer] Session closed: %s\r\n", msg)
 			}
 			select {
@@ -241,19 +249,50 @@ func (c *Client) startQUICTransport(udsAddr string, quicInfo *QUICInfo) error {
 	if err := ct.Start(dialCtx); err != nil {
 		_ = ct.Close()
 		c.setStatusMessage("QUIC: " + err.Error())
-		if c.fileLog != nil {
-			c.fileLog.Printf("QUIC: %v", err)
-		}
 		return fmt.Errorf("failed to connect: %w", err)
 	}
 
 	c.setTransport(ct)
+	c.startCandidateRefreshLoop(quicInfo)
 	return nil
+}
+
+// logQUICSetupFailure は QUIC 確立失敗の全文を通常ログ（stderr）に出す。
+// status line は 1 行なので候補が複数あると失敗理由が切れて読めず、報告から原因を
+// 追えなかった。前回と同じ内容なら出さない（15 秒ごとの再試行でログを埋めない）。
+// 出した内容を返すので、呼び出し側は次回の last に渡す。
+func (c *Client) logQUICSetupFailure(err error, last string, port int) string {
+	msg := err.Error()
+	if msg == last {
+		return last
+	}
+	if c.statusMgr != nil { // statusMgr なし（-N）は setStatusMessage が既に log に出している
+		log.Printf("QUIC setup failed: %v", err)
+	}
+	if hint := quicSetupHint(msg, port); hint != "" {
+		log.Print(hint)
+	}
+	return msg
+}
+
+// quicSetupHint は QUIC 確立失敗が「応答なし」（タイムアウト）だった場合に、
+// 確認すべき箇所のヒントを返す。該当しなければ空文字列。
+// サーバからの応答が一切ない失敗は、ほぼ UDP の到達性の問題（NAT のポート転送漏れ、
+// tezzerd が --udp-port なしでランダムポートになっている、クライアント側の UDP 遮断）。
+func quicSetupHint(msg string, port int) string {
+	if !strings.Contains(msg, "no recent network activity") && !strings.Contains(msg, "handshake did not complete") {
+		return ""
+	}
+	return fmt.Sprintf("hint: no response from UDP port %d. Check NAT port forwarding for that port, "+
+		"that tezzerd runs with --udp-port <forwarded port> (otherwise ports are random), "+
+		"and that the client network does not block UDP", port)
 }
 
 // retryQUICTransport は QUIC 初回確立に失敗した場合に、UDS が生きている間
 // バックグラウンドで再試行する。成功したら出力ポンプを起動して昇格する。
-func (c *Client) retryQUICTransport(udsAddr string, quicInfo *QUICInfo) {
+// firstErr は初回確立の失敗（ログの重複抑制の起点）。
+func (c *Client) retryQUICTransport(udsAddr string, quicInfo *QUICInfo, firstErr error) {
+	lastErr := c.logQUICSetupFailure(firstErr, "", quicInfo.Port)
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -265,9 +304,7 @@ func (c *Client) retryQUICTransport(udsAddr string, quicInfo *QUICInfo) {
 				return // 既に確立済み（別経路で昇格した等）
 			}
 			if err := c.startQUICTransport(udsAddr, quicInfo); err != nil {
-				if c.isDebugEnabled() {
-					log.Printf("QUIC: background retry failed: %v", err)
-				}
+				lastErr = c.logQUICSetupFailure(err, lastErr, quicInfo.Port)
 				continue
 			}
 			c.setStatusMessage("[Tezzer] QUIC connection established (background retry)")
@@ -310,23 +347,26 @@ func (c *Client) getClientSTUNAddr(network, stunServer string) (*net.UDPAddr, er
 	return stunClient.GetMappedAddr()
 }
 
-// serverIsOnSameHost はサーバーの LocalAddr がクライアント自身のインターフェース IP と
-// 一致するかを返す（同一ホスト判定）。一致しない・不明な場合は false。
-func serverIsOnSameHost(serverLocalAddr string) bool {
-	if serverLocalAddr == "" {
-		return false
-	}
-	serverIP, _, err := net.SplitHostPort(serverLocalAddr)
-	if err != nil || serverIP == "" {
+// serverIsOnSameHost はサーバーの LocalAddrs のいずれかがクライアント自身の
+// インターフェース IP と一致するかを返す（同一ホスト判定）。一致しない・
+// 不明な場合は false。
+func serverIsOnSameHost(serverLocalAddrs []string) bool {
+	if len(serverLocalAddrs) == 0 {
 		return false
 	}
 	ifaces, err := net.InterfaceAddrs()
 	if err != nil {
 		return false
 	}
-	for _, a := range ifaces {
-		if ipnet, ok := a.(*net.IPNet); ok && ipnet.IP.String() == serverIP {
-			return true
+	for _, serverLocalAddr := range serverLocalAddrs {
+		serverIP, _, err := net.SplitHostPort(serverLocalAddr)
+		if err != nil || serverIP == "" {
+			continue
+		}
+		for _, a := range ifaces {
+			if ipnet, ok := a.(*net.IPNet); ok && ipnet.IP.String() == serverIP {
+				return true
+			}
 		}
 	}
 	return false

@@ -68,6 +68,9 @@ type handoverSession struct {
 	LastDetachedNS   int64    `msgpack:"detached"`
 	LastOutputNS     int64    `msgpack:"lastout"` // 旧フォーマットには無い（復元時 0 = 未設定）
 	LastInputNS      int64    `msgpack:"lastin"`  // 同上
+	// 端末モードの状態（ModeTracker.Restore の出力。復元時に新しいトラッカーへ食わせる）。
+	// 旧フォーマットには無い（復元時は全モード初期値扱い = 従来の挙動）
+	TermModes []byte `msgpack:"tmodes,omitempty"`
 
 	// per-session transport（共有モードのセッションでは QuicFd = -1）
 	Port   int    `msgpack:"port"`
@@ -193,6 +196,7 @@ func (m *Manager) WriteHandover(w io.Writer) (abort func(), err error) {
 			AgentForward:     s.agentListener != nil,
 			QUICClientIDsOut: s.quicClientIDsOut,
 			QuicFd:           -1,
+			TermModes:        s.termModes.Restore(),
 			Hot:              chunksToHandover(s.outputChunks),
 			ColdPending:      chunksToHandover(s.coldPending),
 		}
@@ -349,6 +353,7 @@ func (m *Manager) restoreSession(hs *handoverSession) error {
 		exitCode:          -1,
 		debug:             IsDebugEnabled(),
 	}
+	s.termModes.Scan(hs.TermModes)
 	if hs.LastDetachedNS != 0 {
 		s.lastDetachedAt = time.Unix(0, hs.LastDetachedNS)
 	}

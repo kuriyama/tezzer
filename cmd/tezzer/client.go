@@ -32,13 +32,14 @@ const maxLogEntries = 20
 
 // Client はクライアント状態を保持
 type Client struct {
-	conn      net.Conn
-	sessionID string
-	termFd    int
-	width     int
-	height    int
-	done      chan struct{}
-	doneOnce  sync.Once // doneチャネルを1回だけcloseするため
+	conn        net.Conn
+	sessionID   string
+	sessionName string // -name のセッション名（Ctrl-^ i 表示用。無名・不明なら空）
+	termFd      int
+	width       int
+	height      int
+	done        chan struct{}
+	doneOnce    sync.Once // doneチャネルを1回だけcloseするため
 	// QUIC トランスポート（nil の場合は UDS のみ）。startQUICTransport（メイン goroutine）が
 	// 書き、handleServer/handleStdin など別 goroutine が読むため ctMu で保護する。
 	ct   transport.ClientTransport
@@ -55,7 +56,21 @@ type Client struct {
 	// 更新は renderMu 下で行う（読み取りはどこからでも可）。
 	renderedSeq atomic.Uint64
 	renderMu    sync.Mutex // renderedSeq の判定〜stdout 書き込みの直列化（UDS/QUIC 両経路）
-	statusMgr   *termui.StatusManager
+	// outputStopped は終了時に端末モードを解除した後 true になり、以降の出力描画を止める
+	// （遅れて届いたチャンクがモードを再び有効化しないように）。renderMu 下でのみ触る。
+	outputStopped bool
+	statusMgr     *termui.StatusManager
+
+	// TEZZER_STATUS=redraw: ステータス行の消去後、alt screen 中なら resize trick で
+	// 再描画を促す（zellij のタブバー等、最上段を自前で描くアプリ向け。opt-in）。
+	// altScreen は描画ストリームから alt screen 状態を推定する（renderMu 下でのみ触る。
+	// statusRedraw 無効時は nil でスキャン自体を行わない）。screenState はその最新値の
+	// ミラーで、ステータス消去タイマー等の別 goroutine から読む。
+	statusRedraw bool
+	// TEZZER_STATUS=off: 頼まれていない通知をステータス行に出さない（ログのみ）
+	statusOff   bool
+	altScreen   *termui.AltScreenTracker
+	screenState atomic.Int32 // termui.ScreenState
 
 	lastOutputRecv atomic.Int64 // 最後に PTY 出力を受信した Unix ナノ秒（0 = 未受信）
 
@@ -101,11 +116,20 @@ type Client struct {
 	inputBatchBuf   []byte
 	inputBatchStart time.Time
 
+	// 入力送信エラーのログ抑制用（noteSendResult。handleStdin goroutine 内でのみ触る）
+	sendFailing      bool
+	sendDropped      int
+	sendDroppedBytes int
+
 	// -L ポートフォワード
 	forwards    []forwardSpec // 解析済みの -L 指定（不変）
 	fwdActive   atomic.Int32  // アクティブな転送 TCP 接続数（Ctrl-^ i 表示用）
 	fwdWarnMu   sync.Mutex
 	lastFwdWarn time.Time // ステータス行への警告の間引き用
+
+	// -R リモートフォワード（rforward.go。中継自体は qtransport 内で行う）
+	rforwards []remoteForwardSpec // 解析済みの -R 指定（不変）
+	deviceID  string              // 端末 ID（-R 指定時のみ）
 
 	// -N: 転送専用 attach（端末を触らない。PTY 出力は破棄、statusMgr は nil）
 	noPTY bool
@@ -234,19 +258,45 @@ func (c *Client) showStatus() {
 	if len(c.forwards) > 0 {
 		fwdInfo = fmt.Sprintf(" | fwd:%d/%d", c.fwdActive.Load(), len(c.forwards))
 	}
-	status := fmt.Sprintf("[Tezzer] sess:%s | %s%s%s", sessID, transportInfo, outInfo, fwdInfo)
-	c.setStatusMessage(status)
+	if len(c.rforwards) > 0 {
+		active := 0
+		if rf, ok := c.transport().(transport.RemoteForwardClient); ok {
+			active = rf.RemoteForwardActive()
+		}
+		fwdInfo += fmt.Sprintf(" | rfwd:%d/%d", active, len(c.rforwards))
+	}
+	scrInfo := ""
+	if c.statusRedraw {
+		scrInfo = fmt.Sprintf(" | scr:%s", termui.ScreenState(c.screenState.Load()))
+	}
+	status := fmt.Sprintf("[Tezzer] %ssess:%s | %s%s%s%s", nameLabel(c.sessionName), sessID, transportInfo, outInfo, fwdInfo, scrInfo)
+	c.showRequestedStatus(status)
+}
+
+// maxStatusNameLen はステータス行に出すセッション名の最大桁数。名前は最大 63 文字だが、
+// ステータス行は 1 行（目安 80 桁）に収める必要があるため長い名前は切り詰める。
+const maxStatusNameLen = 20
+
+// nameLabel は Ctrl-^ i に出す "name:<名前> " を返す（無名なら ""）。
+func nameLabel(name string) string {
+	if name == "" {
+		return ""
+	}
+	if len(name) > maxStatusNameLen {
+		name = name[:maxStatusNameLen-1] + "~"
+	}
+	return "name:" + name + " "
 }
 
 func (c *Client) showHelp() {
 	escKey := escapeKeyDisplay(c.escapeByte)
 	help := fmt.Sprintf("[Tezzer] %s+ .Detach qQuit rRedraw fForce iStatus sStats dDebug hHelp", escKey)
-	c.setStatusMessage(help)
+	c.showRequestedStatus(help)
 }
 
 // killSession はセッションを終了し、クライアントを終了する
 func (c *Client) killSession() {
-	fmt.Fprintf(os.Stderr, "\033[?25h")
+	c.restoreTerminalModes()
 
 	// kill 中フラグを先に立てる（QUIC sessionGone がエラー扱いされないように）
 	c.killing.Store(true)
@@ -310,12 +360,12 @@ func (c *Client) resetScrollRegion() {
 	// \e[2J = 画面全体をクリア、\e[H = カーソルをホームポジションへ
 	fmt.Fprintf(os.Stderr, "\033[2J\033[H")
 
-	c.setStatusMessage("Scroll region reset")
+	c.showRequestedStatus("Scroll region reset")
 }
 
 // requestServerRedraw はサーバー側 PTY に resize trick で再描画を促す。
-// QUIC resync 後（OutputRingBuffer の replay が発生したケース）に呼ぶ。
-// TCP reattach は session.RequestRedraw がサーバー側で直接処理する。
+// 呼び出し元は QUIC の Recovering → Connected 復帰時（resync 後）と Ctrl-^ f。
+// attach 時の再描画はサーバー側で session.RequestRedraw が直接行う。
 func (c *Client) requestServerRedraw() {
 	go func() {
 		time.Sleep(300 * time.Millisecond)
@@ -335,8 +385,20 @@ func (c *Client) requestServerRedraw() {
 	}()
 }
 
-// setStatusMessage はステータスメッセージをログに追加し、3秒間表示する
+// setStatusMessage はステータスメッセージをログに追加し、3秒間表示する。
+// TEZZER_STATUS=off ではログにだけ残し画面には出さない（接続状態の変化など、
+// ユーザーが頼んでいない通知の経路。頼まれた表示は showRequestedStatus）。
 func (c *Client) setStatusMessage(msg string) {
+	if c.statusOff {
+		c.addLogMessage(msg)
+		return
+	}
+	c.showRequestedStatus(msg)
+}
+
+// showRequestedStatus はユーザーが明示的に求めた表示（Ctrl-^ i/h 等のキー操作と
+// その返答）を出す。TEZZER_STATUS=off でも表示する。
+func (c *Client) showRequestedStatus(msg string) {
 	c.addLogMessage(msg)
 	if c.statusMgr == nil {
 		// -N（転送専用）ではステータス行がないので通常のログに出す
@@ -390,6 +452,9 @@ func (c *Client) getLogMessages() []logEntry {
 func (c *Client) renderOutput(chunks []transport.OutputChunk, fromQUIC bool) {
 	c.renderMu.Lock()
 	defer c.renderMu.Unlock()
+	if c.outputStopped {
+		return
+	}
 	frontier := c.renderedSeq.Load()
 	var buf []byte
 	for _, ch := range chunks {
@@ -397,6 +462,7 @@ func (c *Client) renderOutput(chunks []transport.OutputChunk, fromQUIC bool) {
 		case ch.Offset <= frontier:
 			// 描画済み（他経路が先行）
 		case ch.Offset == frontier+1 || fromQUIC || c.transport() == nil:
+			c.trackScreen(ch.Offset, frontier, ch.Data)
 			buf = append(buf, ch.Data...)
 			frontier = ch.Offset
 		default:
@@ -408,6 +474,80 @@ func (c *Client) renderOutput(chunks []transport.OutputChunk, fromQUIC bool) {
 	}
 	c.renderedSeq.Store(frontier)
 	c.writeOutput(buf)
+}
+
+// trackScreen は描画するチャンクで alt screen 状態を更新する（renderMu 下で呼ぶ）。
+// offset 1 はセッション出力の先頭なので通常画面から確定で始められる。それ以外で
+// frontier から飛んだ（途中参加・evict・UDS 欠落）場合は間の遷移を見逃しうるので
+// 不明に戻し、次の遷移シーケンスで再確定させる。
+func (c *Client) trackScreen(offset, frontier uint64, data []byte) {
+	if c.altScreen == nil {
+		return
+	}
+	before := c.altScreen.State()
+	switch {
+	case offset == 1:
+		c.altScreen = termui.NewAltScreenTracker(termui.ScreenMain)
+	case offset != frontier+1:
+		c.altScreen.Reset()
+	}
+	after := c.altScreen.Scan(data)
+	if after != before {
+		c.screenState.Store(int32(after))
+		c.fileLog.Printf("screen state: %s -> %s (offset=%d frontier=%d)", before, after, offset, frontier)
+	}
+}
+
+// maybeRedrawAfterStatus はステータス行の消去後に呼ばれ、TEZZER_STATUS=redraw かつ
+// alt screen 中なら再描画を促す。状態不明・通常画面・-peek・接続断中は何もしない
+// （接続断中の resize 送信失敗がステータス表示→消去→再描画のループにならないよう、
+// 接続中であることを条件にする）。
+func (c *Client) maybeRedrawAfterStatus() {
+	if c.shouldRedrawAfterStatus() {
+		c.requestServerRedraw()
+	}
+}
+
+func (c *Client) shouldRedrawAfterStatus() bool {
+	if !c.statusRedraw || c.readOnly {
+		return false
+	}
+	if termui.ScreenState(c.screenState.Load()) != termui.ScreenAlt {
+		return false
+	}
+	if ct := c.transport(); ct != nil && ct.State() != transport.StateConnected {
+		return false
+	}
+	return true
+}
+
+// terminalModeReset はリモートのアプリ（zellij 等）が有効にしたまま残しうる端末モードを
+// 解除するシーケンス。状態は追跡せず無条件に出す（有効でないモードの解除は無害）。
+// これがないと detach 後もローカル端末がマウス通知を送り続け、シェルにゴミが出る。
+const terminalModeReset = "\x1b[?1049l" + // alt screen を抜ける
+	"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l" + // マウス
+	"\x1b[?1004l" + // フォーカス通知
+	"\x1b[?2004l" + // bracketed paste
+	"\x1b[<u" + // kitty keyboard protocol（pop）
+	"\x1b[?1l\x1b>" + // application cursor keys / keypad
+	"\x1b[0m\x1b[?25h" // 文字属性リセット・カーソル表示
+
+// restoreTerminalModes は終了時（detach・kill・セッション終了）に端末モードを解除する。
+// 終了メッセージより前に呼ぶ（alt screen 上に出すと解除で消えるため）。2 回目以降は何もしない。
+func (c *Client) restoreTerminalModes() {
+	c.renderMu.Lock()
+	defer c.renderMu.Unlock()
+	if c.outputStopped {
+		return
+	}
+	c.outputStopped = true
+	if c.noPTY {
+		return
+	}
+	if c.statusMgr != nil {
+		c.statusMgr.Close() // 解除後に消去タイマーがローカル画面の最上段を消さないように
+	}
+	os.Stdout.Write([]byte(terminalModeReset))
 }
 
 func (c *Client) writeOutput(data []byte) {
@@ -448,7 +588,7 @@ func (c *Client) toggleDebug() {
 	if newValue {
 		status = "ON"
 	}
-	c.setStatusMessage(fmt.Sprintf("[Tezzer] Debug output: %s", status))
+	c.showRequestedStatus(fmt.Sprintf("[Tezzer] Debug output: %s", status))
 }
 
 // sendResize sends a resize message to the server

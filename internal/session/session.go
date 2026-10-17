@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"github.com/kuriyama/tezzer/internal/proto"
 	"github.com/kuriyama/tezzer/internal/qtransport"
+	"github.com/kuriyama/tezzer/internal/termui"
 	"github.com/kuriyama/tezzer/internal/transport"
 	"github.com/kuriyama/tezzer/internal/version"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -76,7 +78,11 @@ type Session struct {
 	Cols      int
 	CreatedAt time.Time
 
-	mu        sync.RWMutex
+	mu sync.RWMutex
+	// inputMu は PTY への入力書き込みを直列化する。PTY 書き込みはアプリが入力を読むまで
+	// ブロックしうるので s.mu の外で行う（s.mu を持ったままだと、出力側の handlePTYOutput が
+	// s.mu を待ち、エコーを返すアプリは出力が捌けず入力を読まない、でデッドロックする）。
+	inputMu   sync.Mutex
 	ptyMaster *os.File
 	cmd       *exec.Cmd
 	// proc はセッションの子プロセス。通常は StartProcess で cmd.Process から設定される。
@@ -145,6 +151,11 @@ type Session struct {
 	lastOutputAt time.Time // 最後に PTY が出力した時刻
 	lastInputAt  time.Time // 最後に PTY へ入力を書いた時刻
 
+	// PTY 出力から追跡する端末モード（マウス・bracketed paste・alt screen 等）。
+	// アプリは起動時に 1 回だけ有効化することが多く、attach し直したクライアントには
+	// バッファ再生だけでは届かないため、attach 応答で送り直す（TermModeRestore）。mu で保護
+	termModes termui.ModeTracker
+
 	// Debug
 	debug bool // デバッグログ出力フラグ
 }
@@ -189,6 +200,35 @@ func lookupLoginShell(username string) string {
 	return ""
 }
 
+// LoginShell returns the shell to run when the client did not specify a
+// command: the current user's login shell from /etc/passwd, else $SHELL,
+// else /bin/sh.
+func LoginShell() string {
+	if u, err := user.Current(); err == nil {
+		if shell := lookupLoginShell(u.Username); shell != "" {
+			return shell
+		}
+	}
+	// macOS 等は一般ユーザーが /etc/passwd に載らないので tezzerd 自身の $SHELL を使う
+	if shell := os.Getenv("SHELL"); shell != "" {
+		return shell
+	}
+	return "/bin/sh"
+}
+
+// UseLoginShell makes the session start its command as a login shell, like
+// ssh does: argv[0] is prefixed with "-" (e.g. "-zsh") and, unless a working
+// directory was given, it starts in the user's home directory. It must be
+// called before StartProcess.
+func (s *Session) UseLoginShell() {
+	s.cmd.Args[0] = "-" + filepath.Base(s.cmd.Path)
+	if s.cmd.Dir == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			s.cmd.Dir = home
+		}
+	}
+}
+
 // systemd サービス固有の変数（セッションに渡すべきでない）
 var systemdEnvKeys = map[string]bool{
 	"INVOCATION_ID":         true,
@@ -204,6 +244,13 @@ var systemdEnvKeys = map[string]bool{
 func NewSession(id, cmd string, args []string, env map[string]string, cwd string, rows, cols int, ipv4Only bool, fixedUDPPort int, agentForward bool, mgr *Manager) (*Session, error) {
 	// Create command
 	command := exec.Command(cmd, args...)
+	// PATH 解決の失敗（exec.Command が Err に入れる）はここで返す。実際の起動
+	// （StartProcess）は QUIC 確立後の非同期処理なので、そこで失敗してもクライアントには
+	// 伝わらず、何も表示されないまま止まって見える。tezzerd を systemd で動かすと
+	// PATH がログインシェルより狭く、~/.cargo/bin 等のコマンドが見つからないことがある。
+	if command.Err != nil {
+		return nil, command.Err
+	}
 	if cwd != "" {
 		command.Dir = cwd
 	}
@@ -454,7 +501,7 @@ func (s *Session) outputFromOffset(client transport.ClientID, fromOffset uint64)
 	// バッチ分割後の後続呼び出し（fromOffset は送信済み位置+1 まで進む）ではこの条件は
 	// 成立しないため、通知は再同期 1 回につき最初の呼び出しでのみ出る。
 	if st != nil && fromOffset > 1 && hasAny && oldestSeq > fromOffset {
-		_ = st.SendStatus(client, "Output was dropped (use Ctrl-^ r to refresh)")
+		_ = st.SendStatus(client, "Output was dropped (use Ctrl-^ f to redraw)")
 	}
 
 	// cold 層の解凍はロック外・バッチ上限まで（遅くてよいパス。PTY reader を止めず、
@@ -847,6 +894,7 @@ func (s *Session) handlePTYOutput(data []byte) {
 	}
 	s.outputChunks = append(s.outputChunks, newChunk)
 	s.outputBufferBytes += len(dataCopy)
+	s.termModes.Scan(dataCopy)
 	s.lastOutputAt = newChunk.Timestamp
 
 	// 古いチャンク・バイト数超過・チャンク数超過を evict
@@ -970,6 +1018,16 @@ func (s *Session) sendOutputDroppedNotification(clientID string, droppedSeq uint
 	}
 }
 
+// TermModeRestore returns the escape sequence that reproduces the terminal
+// modes the session's apps have set (mouse reporting, bracketed paste, the
+// alternate screen and so on), or nil when none differ from a fresh terminal.
+// A newly attached client writes it before the replayed output.
+func (s *Session) TermModeRestore() []byte {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.termModes.Restore()
+}
+
 // AttachClient attaches a client to this session.
 // quicClientID is the client identifier for the QUIC path (0 = QUIC unused).
 func (s *Session) AttachClient(fromSeq uint64, protocol, remoteAddr string, quicClientID uint16) *Client {
@@ -1035,7 +1093,8 @@ func (s *Session) sendBufferedOutput(client *Client, fromSeq uint64) {
 }
 
 // RequestRedraw nudges screen/tmux to redraw by briefly changing the PTY
-// size. Called after sendBufferedOutput or after a QUIC resync completes.
+// size. Called after sendBufferedOutput on attach; redraws after a QUIC resync
+// are requested by the client instead.
 // Shrinking cols by one and restoring it sends SIGWINCH twice, which makes
 // tmux/screen repaint. A screen-specific `screen -X redisplay` used to run in
 // addition, but measurements showed GNU Screen 4.9 fully redraws on SIGWINCH
@@ -1073,21 +1132,26 @@ func (s *Session) DetachClient(clientID string) {
 
 // WriteInput writes input to the PTY
 func (s *Session) WriteInput(data []byte) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.inputMu.Lock()
+	defer s.inputMu.Unlock()
 
-	// PTY が閉じられた後の Write は fd への use-after-close になる（Close() と競合）。
-	// ptyClosed は s.mu 下で扱われるので、ここで弾けば Close() の fd close と直列化される
-	// （Resize() と同じパターン）。
-	if s.ptyClosed || s.ptyMaster == nil {
+	s.mu.RLock()
+	pm, closed := s.ptyMaster, s.ptyClosed
+	s.mu.RUnlock()
+	if closed || pm == nil {
 		return fmt.Errorf("PTY has been closed")
 	}
 
-	_, err := s.ptyMaster.Write(data)
-	if err == nil {
-		s.lastInputAt = time.Now()
+	// 書き込みは s.mu の外（inputMu の説明参照）。Close() の fd close と並行しても、
+	// os.File は参照カウントで fd を守るので use-after-close にはならない
+	// （ptyReader の Read と同じ。Close 後の Write は os.ErrClosed を返す）。
+	if _, err := pm.Write(data); err != nil {
+		return err
 	}
-	return err
+	s.mu.Lock()
+	s.lastInputAt = time.Now()
+	s.mu.Unlock()
+	return nil
 }
 
 // Resize resizes the PTY

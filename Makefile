@@ -4,12 +4,24 @@ GIT_REVCOUNT := $(shell git rev-list --count HEAD 2>/dev/null || echo 0)
 # deb/rpm 用のパッケージバージョン。タグ運用を始めるまでは 0.0.0 ベースに、
 # 単調増加するコミット数（apt/rpm のアップグレード判定に必要）とハッシュを付ける。
 DIST_VERSION ?= 0.0.0+r$(GIT_REVCOUNT).$(GIT_COMMIT)
+# バイナリに埋め込む表示用バージョン（-version）。リリース CI は make dist DIST_VERSION=x.y.z
+# で呼ぶのでそれを使う。それ以外（開発ビルド）は最新リリースタグ + "+dev"（例: 0.1.1+dev）。
+# リリースタグは publish.sh で書き出した公開ツリー側の commit に付くため develop の祖先に
+# ならず git describe が使えない。正確な位置は併記する commit hash で示す。
+LATEST_TAG := $(shell git tag --list 'v*' --sort=-v:refname 2>/dev/null | head -1 | sed 's/^v//')
+ifneq ($(filter command line environment,$(origin DIST_VERSION)),)
+VERSION ?= $(DIST_VERSION)
+else
+VERSION ?= $(if $(LATEST_TAG),$(LATEST_TAG)+dev,dev)
+endif
+# 未 commit の変更を含むビルドは commit hash に -dirty を付ける（-version 表示用）
+GIT_DIRTY := $(shell git diff --quiet HEAD -- 2>/dev/null || echo -dirty)
 # -s -w: シンボルテーブルと DWARF デバッグ情報を除去（バイナリを約 1/3 削減）。
 # デバッグビルドが必要な場合は make build STRIP= で無効化できる。
 STRIP := -s -w
-LDFLAGS := $(STRIP) -X tezzer/internal/version.GitCommit=$(GIT_COMMIT) -X tezzer/internal/version.BuildTime=$(BUILD_TIME)
+LDFLAGS := $(STRIP) -X tezzer/internal/version.Version=$(VERSION) -X tezzer/internal/version.GitCommit=$(GIT_COMMIT)$(GIT_DIRTY) -X tezzer/internal/version.BuildTime=$(BUILD_TIME)
 
-.PHONY: build dist test test-race vet fmt fmt-check ci ci-nightly e2e e2e-docker clean install
+.PHONY: build dist test test-race vet fmt fmt-check ci ci-nightly e2e e2e-docker test-chaos deadcode dupl clean install
 
 build:
 	go build -ldflags "$(LDFLAGS)" -o bin/tezzerd ./cmd/tezzerd
@@ -76,6 +88,14 @@ e2e:
 e2e-docker:
 	./scripts/e2e-docker.sh
 
+# test-chaos は qtransport（quic-go）を実 UDP ソケット + chaosRelay（実プロキシ、
+# internal/qtransport/chaos_relay_test.go）経由で動かし、ランダムな loss/dup/delay 下で
+# 破綻しないことを実時間で検証する。quic-go は synctest 非対応（実タイマー）のため
+# 仮想時間化できない。数秒で終わるが、build tag chaos 付きで CI には入れない。
+# TEZZER_TEST_SEED で単一 seed を再現できる。
+test-chaos:
+	go test -tags chaos -count=1 -timeout 1m -v ./internal/qtransport/
+
 fmt:
 	gofmt -w .
 
@@ -89,13 +109,37 @@ fmt-check:
 	fi
 
 # ci は毎プッシュ向けの高速チェック: gofmt 差分 + vet + 短縮テスト。
-# -short で internal/stun の実 STUN ネットワークテストをスキップする（隔離環境でも緑になる）。
+# -short で sleep_spike_test.go（実スリープ）・pty_integration_test.go（実PTY起動）を
+# スキップする。internal/stun はループバックの最小STUNサーバーを使うため -short の
+# 有無に関わらず常に実行される（外部ネットワーク不要、隔離環境でも緑になる）。
 ci: fmt-check vet
 	go test -short ./...
 
-# ci-nightly は定期実行向けの重いチェック: race 付き全テスト。
+# ci-nightly は定期実行向けの重いチェック: race 付き全テスト（-short を外すので
+# sleep_spike/pty_integration も実行される）+ カオステスト。いずれも外部ネットワーク
+# 不要で、実時間依存は数秒〜十数秒程度に収まる。
 ci-nightly: fmt-check vet
-	go test -race -short ./...
+	go test -race ./...
+	go test -tags chaos -race -count=1 ./internal/qtransport/
+
+# deadcode は golang.org/x/tools/cmd/deadcode（Rapid Type Analysis で main から
+# 到達不能な関数を検出）による未使用コードの手動チェック。cmd/tezzer と cmd/tezzerd
+# は internal/qtransport 等を非対称に使う（クライアント専用/サーバー専用の関数がある）
+# ため、両方の main パッケージをまとめて渡さないと片方専用のコードが誤検出される。
+# -test でテストからのみ使う関数（atomicDuration.Set 等、テスト用の差し込み口）も
+# reachable 扱いにする。go install はせず go run のバージョン指定実行にして
+# go.mod を汚さない。ネットワーク（初回のみ）が要るため CI には組み込まず手動実行。
+deadcode:
+	go run golang.org/x/tools/cmd/deadcode@v0.36.0 -test ./cmd/tezzer/... ./cmd/tezzerd/... ./internal/...
+
+# dupl はトークン列ベースのクローン検出（github.com/mibk/dupl）による重複コードの
+# 手動チェック。*_test.go は除外する（テーブル駆動テストの定型的な繰り返しでノイズが
+# 多いため）。閾値 50 トークンは「関数まるごと似ている」レベルの塊を拾う目安（既定
+# 100 だと短めの重複を見逃す）。GOOS 別ファイル（*_linux.go/*_bsd.go 等の対）は
+# 構造上似て当然の誤検出として出るので、指摘ごとに実際に統合すべきか判断すること。
+# ネットワーク（初回のみ）が要るため CI には組み込まず手動実行。
+dupl:
+	go run github.com/mibk/dupl@v1.1.0 -t 50 $(shell find . -name "*.go" -not -name "*_test.go" -not -path "./.git/*")
 
 clean:
 	rm -rf bin/ dist/

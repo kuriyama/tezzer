@@ -38,9 +38,12 @@ func (s *quicServer) SetAgentForwarding(enabled bool) {
 
 // features はctrlServerMeta で広告する機能ビットを返す。
 func (s *quicServer) features() uint64 {
-	var f uint64
+	f := FeatureLiveness
 	if !s.fwdDisabled.Load() {
 		f |= FeatureTCPForward
+	}
+	if s.remoteForwardEnabled() {
+		f |= FeatureRemoteForward
 	}
 	if !s.agentFwdDisabled.Load() {
 		f |= FeatureAgentForward
@@ -101,7 +104,7 @@ func (c *quicClient) SetAgentSockPath(path string) {
 	c.agentSockPath = path
 }
 
-// acceptServerStreams はサーバが開く control 以外の bidi ストリーム（agent 要求）を受ける。
+// acceptServerStreams はサーバが開く control 以外の bidi ストリーム（-A・-R の中継要求）を受ける。
 // forward.go の acceptForwardStreams と対称（サーバ→クライアント方向）。
 func (c *quicClient) acceptServerStreams(conn *quic.Conn) {
 	for {
@@ -117,12 +120,24 @@ func (c *quicClient) handleServerStream(st *quic.Stream) {
 	_ = st.SetReadDeadline(time.Now().Add(forwardOpenTimeout))
 	m, err := readFrame(st)
 	_ = st.SetReadDeadline(time.Time{})
-	if err != nil || m.Type != ctrlAgentOpen {
+	if err != nil {
 		st.CancelRead(fwdCodeProtocol)
 		st.CancelWrite(fwdCodeProtocol)
 		return
 	}
+	switch m.Type {
+	case ctrlAgentOpen:
+		c.handleAgentStream(st)
+	case ctrlRFwdOpen:
+		c.handleRFwdStream(st, m)
+	default:
+		st.CancelRead(fwdCodeProtocol)
+		st.CancelWrite(fwdCodeProtocol)
+	}
+}
 
+// handleAgentStream はサーバからの agent 中継要求 1 本を処理する（先頭フレーム読み取り済み）。
+func (c *quicClient) handleAgentStream(st *quic.Stream) {
 	reject := func(reason string) {
 		_ = writeFrame(st, &ctrlMsg{Type: ctrlAgentOpenErr, Msg: reason})
 		st.CancelRead(fwdCodeProtocol)

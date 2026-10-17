@@ -27,7 +27,7 @@ func main() {
 	sessionID := flag.String("session", "", "session id to attach (empty => create)")
 	resume := flag.Bool("resume", false, "attach to the most recent session (shortcut for -session <latest>)")
 	name := flag.String("name", "", "named session: attach if a session with this name exists, otherwise create one")
-	cmd := flag.String("cmd", "/bin/bash", "command to run when creating session")
+	cmd := flag.String("cmd", "", "command to run when creating session (default: the server user's login shell; args after -- are passed to it; without -cmd, the first arg after -- is the command)")
 	list := flag.Bool("list", false, "list all sessions and exit")
 	info := flag.String("info", "", "show info for session and exit")
 	stats := flag.String("stats", "", "show stats for session and exit (use Ctrl-^ s to generate)")
@@ -39,10 +39,19 @@ func main() {
 	escapeKey := flag.String("escape-key", "^", "escape key prefix (default: Ctrl-^, use '^', '~', etc.)")
 	var localForwards stringListFlag
 	flag.Var(&localForwards, "L", "local port forward [bind:]port:host:hostport (bind: loopback only; repeatable)")
-	noPTY := flag.Bool("N", false, "no PTY I/O: attach for port forwarding only (requires -L and an existing session via -session/-resume/-name)")
+	var remoteForwards stringListFlag
+	flag.Var(&remoteForwards, "R", "remote port forward [bind:]port:host:hostport: listen on the server's localhost:port and dial host:hostport from this machine (bind: loopback only; repeatable)")
+	noPTY := flag.Bool("N", false, "no PTY I/O: attach for port forwarding only (requires -L or -R and an existing session via -session/-resume/-name)")
 	agentForward := flag.Bool("A", false, "forward local SSH agent ($SSH_AUTH_SOCK) to the session (create-time only)")
 	ipv4Only := flag.Bool("ipv4-only", false, "use IPv4 only for STUN and UDP connections")
+	showVersion := flag.Bool("version", false, "print version and build information and exit")
+	serverVersion := flag.Bool("server-version", false, "print the running tezzerd's version and build information and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version.String("tezzer"))
+		return
+	}
 
 	// 環境変数 TEZZER_SOCKET のチェック（tezzer-ssh スクリプト用）
 	envSocket := os.Getenv("TEZZER_SOCKET")
@@ -63,6 +72,14 @@ func main() {
 	connectAddr := *addrUnix
 
 	// 管理コマンドの処理
+	if *serverVersion {
+		if err := showServerVersion(connectAddr); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if *list {
 		if err := listSessions(connectAddr, *jsonOut); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -111,8 +128,8 @@ func main() {
 	// -N は既存セッションへの転送専用 attach。新規作成はしない
 	// （トンネルのためだけに PTY/コマンドを起動しても仕方がないため）。
 	if *noPTY {
-		if len(localForwards) == 0 {
-			fmt.Fprintf(os.Stderr, "error: -N requires at least one -L\n")
+		if len(localForwards) == 0 && len(remoteForwards) == 0 {
+			fmt.Fprintf(os.Stderr, "error: -N requires at least one -L or -R\n")
 			os.Exit(1)
 		}
 		if *sessionID == "" && !*resume && *name == "" {
@@ -129,8 +146,8 @@ func main() {
 	// -wait は attach しない終了待ちなので、attach 系のモード・オプションとは併用不可。
 	// 新規作成もしない（終了を待つ対象が既存であることが前提）。
 	if *wait {
-		if *noPTY || *agentForward || len(localForwards) > 0 || *peek {
-			fmt.Fprintf(os.Stderr, "error: -wait cannot be combined with -N, -A, -L, or -peek\n")
+		if *noPTY || *agentForward || len(localForwards) > 0 || len(remoteForwards) > 0 || *peek {
+			fmt.Fprintf(os.Stderr, "error: -wait cannot be combined with -N, -A, -L, -R, or -peek\n")
 			os.Exit(1)
 		}
 		if *sessionID == "" && !*resume && *name == "" {
@@ -170,22 +187,25 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Resuming latest session: %s\n", latestSessionID)
 	}
 
+	sessCmd, sessArgs := resolveCommand(*cmd, flag.Args())
+
 	// -name: 名前で attach-or-create（tmux new -A -s / screen -S 相当）
 	if *name != "" {
 		if err := proto.ValidateSessionName(*name); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
-		namedSessionID, err := findSessionIDByName(connectAddr, *name)
+		named, err := findSessionByName(connectAddr, *name)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: failed to look up session by name: %v\n", err)
 			os.Exit(1)
 		}
-		if namedSessionID != "" {
+		if named != nil {
 			// 既存セッションに attach（未発見なら run() が名前付きで新規作成）
-			*sessionID = namedSessionID
+			*sessionID = named.SessionID
 			if !*wait {
-				fmt.Fprintf(os.Stderr, "Attaching to session %q: %s\n", *name, namedSessionID)
+				fmt.Fprint(os.Stderr, ignoredCommandNotice(*name, named.Cmd, sessCmd, sessArgs))
+				fmt.Fprintf(os.Stderr, "Attaching to session %q: %s\n", *name, named.SessionID)
 			}
 		} else if *noPTY || *wait || *peek {
 			fmt.Fprintf(os.Stderr, "error: no active session named %q\n", *name)
@@ -213,6 +233,26 @@ func main() {
 		}
 		forwards = append(forwards, sp)
 	}
+	// -R も接続前に検証し、端末 ID を用意する（同じ端末からの登録をサーバ側で束ねるため）
+	rforwards, err := parseRemoteForwardSpecs(remoteForwards)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	devID := ""
+	if len(rforwards) > 0 {
+		path, perr := deviceIDPath()
+		if perr != nil {
+			fmt.Fprintf(os.Stderr, "error: -R: %v\n", perr)
+			os.Exit(1)
+		}
+		secret, warn := loadOrCreateDeviceID(path)
+		if warn != nil {
+			fmt.Fprintf(os.Stderr, "warning: -R: cannot save device ID to %s (%v); other tezzer clients on this machine will be treated as another device\n", path, warn)
+		}
+		hostname, _ := os.Hostname() // 取れなければ空文字（乱数だけで区別する）
+		devID = deviceID(secret, hostname)
+	}
 
 	// エスケープキーのバイト値を計算
 	escapeByte, err := parseEscapeKey(*escapeKey)
@@ -232,7 +272,7 @@ func main() {
 		}
 	}
 
-	exitCode, err := run(connectAddr, *sessionID, *cmd, *name, escapeByte, *ipv4Only, forwards, *noPTY, *agentForward, *peek, agentSockPath)
+	exitCode, err := run(connectAddr, *sessionID, sessCmd, sessArgs, *name, escapeByte, *ipv4Only, forwards, rforwards, devID, *noPTY, *agentForward, *peek, agentSockPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -284,7 +324,19 @@ func escapeKeyDisplay(b byte) string {
 // noPTY（-N）のときは端末を触らず（raw mode・stdin・出力表示なし）、転送だけを行う。
 // run はセッションへ接続し、終了コード（セッションプロセスのもの。不明・detach は 0）
 // とエラーを返す。
-func run(addr, sessionID, cmd, name string, escapeByte byte, ipv4Only bool, forwards []forwardSpec, noPTY, agentForward, readOnly bool, agentSockPath string) (int, error) {
+// resolveCommand はセッション作成時のコマンドと引数を決める。
+// `tezzer -- tmux new -A` のように -cmd 未指定で -- 以降があれば先頭をコマンドとする
+// （ssh host cmd args と同じ感覚）。-cmd 指定時は -- 以降をそのコマンドの引数とする
+// （tezzer-ssh は常にこの形 `-cmd CMD -- ARGS...` で呼ぶ）。どちらもなければ ""
+// （サーバ側のログインシェル）を返す。
+func resolveCommand(cmd string, args []string) (string, []string) {
+	if cmd == "" && len(args) > 0 {
+		return args[0], args[1:]
+	}
+	return cmd, args
+}
+
+func run(addr, sessionID, cmd string, cmdArgs []string, name string, escapeByte byte, ipv4Only bool, forwards []forwardSpec, rforwards []remoteForwardSpec, deviceID string, noPTY, agentForward, readOnly bool, agentSockPath string) (int, error) {
 	// 再帰接続チェック（tezzerセッション内からtezzerを起動した場合）
 	if parentSession := os.Getenv("TEZZER_SESSION"); parentSession != "" {
 		if sessionID != "" && sessionID == parentSession {
@@ -315,18 +367,26 @@ func run(addr, sessionID, cmd, name string, escapeByte byte, ipv4Only bool, forw
 
 	// Create or attach session
 	var actualSessionID string
+	// セッション名（Ctrl-^ i 表示用）。サーバ応答の Name を優先し、Name を返さない
+	// 旧サーバでは -name の指定値を使う（-resume / -session では不明のまま）
+	sessionName := name
 	var quicInfo *QUICInfo // QUIC 接続情報（nil の場合は QUIC 無効）
+	var termModes []byte   // attach 時にサーバーが返す端末モードの再現シーケンス
 
 	if sessionID == "" {
 		// Create session
-		// flag.Args() で -- 以降の引数を取得
-		args := flag.Args()
-
+		// コマンド未指定ならサーバ側のログインシェル。LoginShell を知らない旧サーバ向けに
+		// Cmd には従来の既定値を入れておく（旧サーバは従来どおり /bin/bash を起動する）
+		loginShell := cmd == ""
+		if loginShell {
+			cmd = "/bin/bash"
+		}
 		createdMsg, err := roundTrip[proto.SessionCreatedMsg](conn, proto.CreateSessionMsg{
 			Type:         "CREATE_SESSION",
 			Name:         name,
 			Cmd:          cmd,
-			Args:         args,
+			Args:         cmdArgs,
+			LoginShell:   loginShell,
 			Cols:         width,
 			Rows:         height,
 			Env:          map[string]string{"TERM": os.Getenv("TERM")},
@@ -336,6 +396,9 @@ func run(addr, sessionID, cmd, name string, escapeByte byte, ipv4Only bool, forw
 			return 0, err
 		}
 		actualSessionID = createdMsg.SessionID
+		if createdMsg.Name != "" {
+			sessionName = createdMsg.Name
+		}
 
 		// PTY終了チェック
 		if createdMsg.PTYClosed {
@@ -390,13 +453,18 @@ func run(addr, sessionID, cmd, name string, escapeByte byte, ipv4Only bool, forw
 			return 0, fmt.Errorf("session PTY has already terminated")
 		}
 
+		if attachedMsg.Name != "" {
+			sessionName = attachedMsg.Name
+		}
 		quicInfo = quicInfoFromSessionCreated(attachedMsg)
+		termModes = attachedMsg.TermModes
 	}
 
 	// Create client
 	client := &Client{
 		conn:          conn,
 		sessionID:     actualSessionID,
+		sessionName:   sessionName,
 		termFd:        termFd,
 		width:         width,
 		height:        height,
@@ -406,6 +474,8 @@ func run(addr, sessionID, cmd, name string, escapeByte byte, ipv4Only bool, forw
 		errCh:         make(chan error, 1),
 		udsAddr:       addr,
 		forwards:      forwards,
+		rforwards:     rforwards,
+		deviceID:      deviceID,
 		noPTY:         noPTY,
 		readOnly:      readOnly,
 		agentSockPath: agentSockPath,
@@ -413,6 +483,20 @@ func run(addr, sessionID, cmd, name string, escapeByte byte, ipv4Only bool, forw
 	client.sessionExitCode.Store(-1)
 	// デバッグフラグの初期値（環境変数から）
 	client.debugEnabled.Store(os.Getenv("TEZZER_DEBUG") != "")
+	// TEZZER_STATUS=redraw: ステータス行の消去後に alt screen 中なら再描画を促す（opt-in）
+	// TEZZER_STATUS=off: 頼まれていない通知をステータス行に出さない（ログのみ）
+	switch v := os.Getenv("TEZZER_STATUS"); v {
+	case "":
+	case "off":
+		client.statusOff = true
+	case "redraw":
+		if !noPTY {
+			client.statusRedraw = true
+			client.altScreen = termui.NewAltScreenTracker(termui.ScreenUnknown)
+		}
+	default:
+		fmt.Fprintf(os.Stderr, "tezzer: ignoring unknown TEZZER_STATUS=%q (supported: off, redraw)\n", v)
+	}
 
 	// セッション開始メッセージを設定（後でステータス行に表示される）
 	if !noPTY {
@@ -431,6 +515,15 @@ func run(addr, sessionID, cmd, name string, escapeByte byte, ipv4Only bool, forw
 		if err != nil {
 			return 0, fmt.Errorf("failed to set raw mode: %w", err)
 		}
+		// attach 先のアプリが有効にしている端末モード（マウス・alt screen 等）を、出力の
+		// 再生より前に入れ直す。アプリは起動時に 1 回だけ有効化することが多く、再生
+		// バッファにはもう残っていない（detach 時は restoreTerminalModes が解除している）。
+		if len(termModes) > 0 {
+			if client.altScreen != nil {
+				client.altScreen.Scan(termModes)
+			}
+			os.Stdout.Write(termModes)
+		}
 	}
 
 	// クライアントログファイルを開く（失敗しても続行）
@@ -439,7 +532,7 @@ func run(addr, sessionID, cmd, name string, escapeByte byte, ipv4Only bool, forw
 	} else {
 		client.logFile = lf
 		client.fileLog = newFileLogger(lf)
-		client.fileLog.Printf("tezzer client started (pid=%d, commit=%s)", os.Getpid(), version.GitCommit)
+		client.fileLog.Printf("tezzer client started (pid=%d, version=%s, commit=%s)", os.Getpid(), version.Version, version.GitCommit)
 		client.fileLog.Printf("session=%s server=%s", actualSessionID, addr)
 		createSessionLogSymlink(actualSessionID, lf)
 	}
@@ -463,6 +556,7 @@ func run(addr, sessionID, cmd, name string, escapeByte byte, ipv4Only bool, forw
 			},
 			func() {
 				fmt.Fprintf(os.Stderr, "\033[s\033[H\033[K\033[u")
+				client.maybeRedrawAfterStatus()
 			},
 		)
 	}
@@ -475,10 +569,8 @@ func run(addr, sessionID, cmd, name string, escapeByte byte, ipv4Only bool, forw
 			_ = ct.Close()
 		}
 		if !noPTY {
-			// StatusManagerをクリーンアップ
-			client.statusMgr.Close()
-			// カーソルを表示（念のため）
-			fmt.Fprintf(os.Stderr, "\033[?25h")
+			// 端末モードを解除（終了メッセージを出す経路では既に解除済み）
+			client.restoreTerminalModes()
 			// ターミナル状態を復元
 			term.Restore(termFd, oldState)
 			// ONLCR を明示的に有効化（stty sane相当）
@@ -509,6 +601,12 @@ func run(addr, sessionID, cmd, name string, escapeByte byte, ipv4Only bool, forw
 		client.startForwardListeners()
 		go client.warnIfForwardingUnsupported()
 	}
+	if len(rforwards) > 0 {
+		for _, sp := range rforwards {
+			client.fileLog.Printf("remote forward: %s", sp)
+		}
+		go client.warnIfRemoteForwardingUnsupported()
+	}
 	if client.agentSockPath != "" {
 		go client.warnIfAgentForwardingUnsupported()
 	}
@@ -525,7 +623,7 @@ func run(addr, sessionID, cmd, name string, escapeByte byte, ipv4Only bool, forw
 				// UDS が生きている間、QUIC 確立を再試行する（高遅延でハンドシェイクが
 				// 間に合わなかった等、後から繋がりうる）。
 				client.setStatusMessage(fmt.Sprintf("QUIC setup failed, retrying in background: %v", err))
-				client.retryQUICTransport(addr, quicInfo)
+				client.retryQUICTransport(addr, quicInfo, err)
 				return
 			}
 			client.setStatusMessage(fmt.Sprintf("QUIC enabled: server port %d", quicInfo.Port))

@@ -22,11 +22,14 @@
 #   tezzer-ssh example-host kill --session eQAJHANNIhFVZQ5lSKr0GQ
 #   tezzer-ssh example-host wait --name build && notify-send done
 #   tezzer-ssh example-host peek --name agent
+#   tezzer-ssh example-host version
+#   tezzer-ssh -version
 
 set -euo pipefail
 
 TEZZER_CLIENT=${TEZZER_CLIENT:-tezzer}
 TEZZER_SERVER=${TEZZER_SERVER:-tezzerd}
+TEZZER_SERVER_ARGS=${TEZZER_SERVER_ARGS:-}
 
 show_usage() {
     cat >&2 <<'EOF'
@@ -34,7 +37,7 @@ Usage: tezzer-ssh <target> <subcommand> [options...] [-- <cmd> [args...]]
 
 Arguments:
   <target>      SSH host name from ~/.ssh/config
-  <subcommand>  One of: run, list, resume, forward, info, kill, wait, peek
+  <subcommand>  One of: run, list, resume, forward, info, kill, wait, peek, version
 
 Subcommands:
   run     Run a new tezzer session: tezzer-ssh HOST run [opts] -- CMD [args]
@@ -44,8 +47,9 @@ Subcommands:
   resume  Attach to the most recent session (or specific via --session <id>,
           or by name via --name <name>: attach-or-create)
   forward Forward-only attach (no terminal; tezzer -N). Select the session via
-          --session <id> / --name <name> (default: most recent), plus -L specs:
+          --session <id> / --name <name> (default: most recent), plus -L/-R specs:
             tezzer-ssh example-host forward --name work -L 8080:localhost:3000
+            tezzer-ssh example-host forward --name work -R 9222:localhost:9222
   info    Show session info:  --session <id>
   kill    Kill a session:     --session <id>
   wait    Wait for the session command to exit; the exit code is propagated.
@@ -53,10 +57,21 @@ Subcommands:
             tezzer-ssh example-host wait --name build && notify-send done
   peek    Read-only attach (tezzer -peek): view output but never send input.
           Select via --session <id> / --name <name> (default: most recent)
+  version Show the local tezzer version, the version of the tezzerd running on
+          the remote host, and the version of the tezzerd installed there
+          (they differ if tezzerd was upgraded but not restarted). Does not
+          start tezzerd. Without a host, `tezzer-ssh -version` shows only the
+          local tezzer version.
 
 Environment Variables:
   TEZZER_CLIENT   Path to tezzer client binary (default: tezzer)
   TEZZER_SERVER   Path to tezzerd server binary (default: tezzerd)
+  TEZZER_SERVER_ARGS
+                  Extra arguments for tezzerd when this script auto-starts it
+                  on the remote host (not used if tezzerd is already running).
+                  Set this if you rely on a fixed UDP port with NAT port
+                  forwarding; otherwise sessions get random ports:
+                    Example: TEZZER_SERVER_ARGS="--udp-port 7020" tezzer-ssh host run -- zsh
   TEZZER_INSTANCE Instance name for running side-by-side (e.g. "dev").
                   Uses a separate remote socket (tezzer-<name>.sock) and a
                   dedicated tezzerd started with -listen-unix, coexisting with
@@ -70,6 +85,9 @@ EOF
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
     show_usage; exit 0
 fi
+if [ "${1:-}" = "-version" ] || [ "${1:-}" = "--version" ]; then
+    exec $TEZZER_CLIENT -version
+fi
 if [ $# -lt 2 ]; then
     show_usage; exit 1
 fi
@@ -79,7 +97,7 @@ SUBCOMMAND="$2"
 shift 2
 
 case "$SUBCOMMAND" in
-    run|list|resume|forward|info|kill|wait|peek) ;;
+    run|list|resume|forward|info|kill|wait|peek|version) ;;
     *)
         echo "Error: Unknown subcommand '$SUBCOMMAND'" >&2
         echo "" >&2
@@ -149,27 +167,39 @@ else
 fi
 
 # Step 1: tezzerd確認・起動 + リモートソケットパス取得（1回のSSH接続で実施）
+# version サブコマンドでは起動せず（動いている版を確認したいので）、代わりに
+# インストール済み tezzerd の -version を 2 行目に返す。
 echo "Connecting to $SSH_TARGET..." >&2
-REMOTE_SOCKET=$(ssh "$SSH_TARGET" "
+REMOTE_OUT=$(ssh "$SSH_TARGET" "
     SOCK_DIR=\${XDG_RUNTIME_DIR:-\$HOME/.tezzer}
     mkdir -p \"\$SOCK_DIR\"
     SOCK_PATH=\"\$SOCK_DIR/$REMOTE_SOCK_NAME\"
+    if [ \"$SUBCOMMAND\" = version ]; then
+        echo \"\$SOCK_PATH\"
+        $TEZZER_SERVER -version 2>/dev/null || echo 'unknown (tezzerd -version failed: not installed or older than -version)'
+        exit 0
+    fi
     if [ -n \"$INSTANCE\" ]; then
         # 名前付きインスタンス: 専用ソケットで起動。-listen-unix をコマンドラインに含めるので
         # pgrep -f でインスタンス単位に存在判定でき、既定の tezzerd と共存できる。
         if ! pgrep -f -- \"-listen-unix \$SOCK_PATH\" > /dev/null 2>&1; then
             echo \"Starting tezzerd (instance: $INSTANCE) on remote host...\" >&2
-            nohup $TEZZER_SERVER -listen-unix \"\$SOCK_PATH\" > \"\$SOCK_DIR/tezzerd-$INSTANCE.log\" 2>&1 &
+            nohup $TEZZER_SERVER $TEZZER_SERVER_ARGS -listen-unix \"\$SOCK_PATH\" > \"\$SOCK_DIR/tezzerd-$INSTANCE.log\" 2>&1 &
         fi
     else
         # 既定インスタンス: 従来どおり（挙動不変）。
         if ! pgrep -u \"\$USER\" -x tezzerd > /dev/null 2>&1; then
             echo 'Starting tezzerd on remote host...' >&2
-            nohup $TEZZER_SERVER > \"\$SOCK_DIR/tezzerd.log\" 2>&1 &
+            nohup $TEZZER_SERVER $TEZZER_SERVER_ARGS > \"\$SOCK_DIR/tezzerd.log\" 2>&1 &
         fi
     fi
     echo \"\$SOCK_PATH\"
 ")
+REMOTE_SOCKET=${REMOTE_OUT%%$'\n'*}
+REMOTE_INSTALLED=""
+if [ "$REMOTE_OUT" != "$REMOTE_SOCKET" ]; then
+    REMOTE_INSTALLED=${REMOTE_OUT#*$'\n'}
+fi
 
 # Step 2: SSH Unix Socket フォワーディングを開始
 echo "Setting up SSH socket forwarding..." >&2
@@ -203,6 +233,15 @@ echo "SSH socket forwarding established." >&2
 export TEZZER_SOCKET="$LOCAL_SOCKET"
 
 case "$SUBCOMMAND" in
+    version)
+        echo "local:              $($TEZZER_CLIENT -version)"
+        if RUNNING=$($TEZZER_CLIENT -server-version 2>&1); then
+            echo "remote (running):   $RUNNING"
+        else
+            echo "remote (running):   not available: $RUNNING"
+        fi
+        echo "remote (installed): $REMOTE_INSTALLED"
+        ;;
     run)
         TEZZER_ARGS=()
         [ ${#TEZZER_OPTS[@]} -gt 0 ] && TEZZER_ARGS+=("${TEZZER_OPTS[@]}")

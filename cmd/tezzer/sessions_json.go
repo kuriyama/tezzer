@@ -60,7 +60,24 @@ type sessionJSON struct {
 }
 
 type sessionsListJSON struct {
-	Sessions []sessionJSON `json:"sessions"`
+	Sessions       []sessionJSON       `json:"sessions"`
+	RemoteForwards []remoteForwardJSON `json:"remote_forwards,omitempty"`
+}
+
+// remoteForwardJSON はサーバ全体の -R 1 ポート分（-list -json の remote_forwards）。
+type remoteForwardJSON struct {
+	Port       uint16 `json:"port"`
+	Device     string `json:"device,omitempty"`
+	Listening  bool   `json:"listening"`
+	BindError  string `json:"bind_error,omitempty"`
+	Live       int    `json:"live_clients"`
+	Dormant    int    `json:"dormant_clients"`
+	Waiting    int    `json:"waiting_clients"`
+	Active     int    `json:"active"`
+	Opened     uint64 `json:"opened"`
+	BytesIn    uint64 `json:"bytes_in"`
+	BytesOut   uint64 `json:"bytes_out"`
+	ListenFrom string `json:"listening_since,omitempty"`
 }
 
 // unixRFC3339 は Unix 秒を RFC3339 文字列にする。0 は「未設定」として空文字。
@@ -131,10 +148,26 @@ func toSessionJSON(s proto.SessionInfo, loc *time.Location) sessionJSON {
 }
 
 // formatSessionsListJSON は -list -json の出力文字列を組み立てる純粋関数。
-func formatSessionsListJSON(sessions []proto.SessionInfo, loc *time.Location) (string, error) {
+func formatSessionsListJSON(sessions []proto.SessionInfo, rfs []proto.RemoteForwardInfo, loc *time.Location) (string, error) {
 	out := sessionsListJSON{Sessions: make([]sessionJSON, 0, len(sessions))}
 	for _, s := range sessions {
 		out.Sessions = append(out.Sessions, toSessionJSON(s, loc))
+	}
+	for _, rf := range rfs {
+		out.RemoteForwards = append(out.RemoteForwards, remoteForwardJSON{
+			Port:       rf.Port,
+			Device:     rf.Device,
+			Listening:  rf.Device != "",
+			BindError:  rf.BindError,
+			Live:       rf.Live,
+			Dormant:    rf.Dormant,
+			Waiting:    rf.Waiting,
+			Active:     rf.Active,
+			Opened:     rf.Opened,
+			BytesIn:    rf.BytesIn,
+			BytesOut:   rf.BytesOut,
+			ListenFrom: unixRFC3339(rf.ListenFrom, loc),
+		})
 	}
 	data, err := json.MarshalIndent(out, "", "  ")
 	if err != nil {

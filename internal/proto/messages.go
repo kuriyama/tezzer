@@ -36,6 +36,11 @@ type CreateSessionMsg struct {
 	// creation time and is immutable for the session's lifetime
 	// (docs/dev/agent-forwarding.md).
 	AgentForward bool `msgpack:"agent_forward,omitempty"`
+	// LoginShell asks the server to run the user's login shell instead of Cmd
+	// (the client sets it when no command was given). Cmd still carries a
+	// fallback (/bin/bash) so that servers unaware of this field behave as
+	// before.
+	LoginShell bool `msgpack:"login_shell,omitempty"`
 }
 
 type AttachSessionMsg struct {
@@ -111,8 +116,11 @@ type WelcomeMsg struct {
 }
 
 type SessionCreatedMsg struct {
-	Type       string `msgpack:"type"`
-	SessionID  string `msgpack:"session_id"`
+	Type      string `msgpack:"type"`
+	SessionID string `msgpack:"session_id"`
+	// Name is the session name (-name), empty for unnamed sessions and from
+	// servers that predate it.
+	Name       string `msgpack:"name,omitempty"`
 	UDPEnabled bool   `msgpack:"udp_enabled,omitempty"` // whether the QUIC (UDP) transport is enabled
 	UDPPort    int    `msgpack:"udp_port,omitempty"`    // server-side UDP port
 	UDPKey     []byte `msgpack:"udp_key,omitempty"`     // shared key (32 bytes, used for mTLS pinning)
@@ -120,12 +128,22 @@ type SessionCreatedMsg struct {
 	// InitialOutput is the buffered output for a PTY that exited immediately
 	// (non-interactive commands such as env).
 	InitialOutput []byte `msgpack:"initial_output,omitempty"`
+	// TermModes is the escape sequence that reproduces the terminal modes the
+	// session's apps have set (mouse reporting, bracketed paste, the alternate
+	// screen, ...). Set on attach; the client writes it before the replayed
+	// output. Empty when no mode differs from a fresh terminal, and from older
+	// servers.
+	TermModes []byte `msgpack:"term_modes,omitempty"`
 	// STUNAddrs are the server's public address candidates discovered via
 	// STUN, one per address family (at most 2: IPv4/IPv6; a family that is
 	// unavailable is omitted). Example:
 	// ["203.0.113.1:54321", "[2001:db8::1]:54321"].
 	STUNAddrs []string `msgpack:"stun_addrs,omitempty"`
-	LocalAddr string   `msgpack:"local_addr,omitempty"` // server's local address for same-LAN connects (e.g. "192.168.1.10")
+	// LocalAddrs are the server's local address candidates for same-LAN
+	// connects, one per address family that resolved (at most 2: IPv4/IPv6;
+	// a family with no local route is omitted). Example:
+	// ["192.168.1.10:7020", "[2001:db8::10]:7020"].
+	LocalAddrs []string `msgpack:"local_addrs,omitempty"`
 	// STUNServer is the STUN server the server itself queried (the value of
 	// tezzerd --stun-server). The client uses the same server for its own
 	// STUN queries, so a self-hosted STUN server applies to both ends.
@@ -220,6 +238,25 @@ type SessionInfo struct {
 type SessionsListMsg struct {
 	Type     string        `msgpack:"type"`
 	Sessions []SessionInfo `msgpack:"sessions"`
+	// RemoteForwards lists the server-wide remote forward (-R) ports. Remote
+	// forwards belong to the server rather than to a session, so they are
+	// reported here instead of in SessionInfo.
+	RemoteForwards []RemoteForwardInfo `msgpack:"remote_forwards,omitempty"`
+}
+
+// RemoteForwardInfo is a snapshot of one remote forward (-R) port.
+type RemoteForwardInfo struct {
+	Port       uint16 `msgpack:"port"`
+	Device     string `msgpack:"device,omitempty"`      // listening device (first 8 chars of its ID; empty = not listening)
+	BindError  string `msgpack:"bind_error,omitempty"`  // last bind failure while not listening
+	Live       int    `msgpack:"live,omitempty"`        // connected clients of the listening device
+	Dormant    int    `msgpack:"dormant,omitempty"`     // clients of the listening device that lost their connection
+	Waiting    int    `msgpack:"waiting,omitempty"`     // clients of other devices (or of any device while not listening)
+	Active     int    `msgpack:"active,omitempty"`      // relayed connections in progress
+	Opened     uint64 `msgpack:"opened,omitempty"`      // relayed connections since the port was first registered
+	BytesIn    uint64 `msgpack:"bytes_in,omitempty"`    // bytes from server-side peers to the client-side target
+	BytesOut   uint64 `msgpack:"bytes_out,omitempty"`   // bytes from the client-side target to server-side peers
+	ListenFrom int64  `msgpack:"listen_from,omitempty"` // when the current device started listening (Unix seconds)
 }
 
 type SessionInfoMsg struct {
@@ -239,6 +276,9 @@ type ServerMetaMsg struct {
 	ServerBuildID    string `msgpack:"server_build_id,omitempty"`    // server build ID (git hash)
 	ServerBuildTime  string `msgpack:"server_build_time,omitempty"`  // server build time
 	ServerInstanceID []byte `msgpack:"server_instance_id,omitempty"` // server instance ID (8 bytes; restart detection)
+	// ServerVersion is the server's release version (x.y.z, or x.y.z+dev for
+	// development builds). Empty from servers that predate it.
+	ServerVersion string `msgpack:"server_version,omitempty"`
 }
 
 // Encode encodes a message to msgpack bytes

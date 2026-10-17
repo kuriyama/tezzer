@@ -139,7 +139,10 @@ the NAT preserves ports. Run it once on the server host to learn whether
 STUN-derived direct QUIC will work in your environment, or whether you should
 set up a fixed port (`--udp-port`) with router port forwarding instead. The
 comparison server defaults to Cloudflare and can be overridden with
-`--stun-server2`.
+`--stun-server2`. It also reports the same-LAN candidate address (the one
+used to skip a public-STUN round-trip when client and server share a LAN),
+including which address family it resolved from — handy for checking
+IPv4-only/IPv6-only/dual-stack behavior with a single command.
 
 `tezzerd` accepts client connections over a Unix domain socket. Remote clients
 reach it by forwarding that socket over SSH (see `tezzer-ssh`).
@@ -147,12 +150,15 @@ reach it by forwarding that socket over SSH (see `tezzer-ssh`).
 ### Client (`tezzer`)
 
 ```bash
-tezzer                       # create + attach a session running $SHELL (default /bin/bash)
+tezzer                       # create + attach a session running your login shell (as ssh does)
 tezzer -cmd zsh              # create a session running a specific command
+tezzer -cmd tmux -- new -A   # with -cmd, args after -- are passed to that command
 tezzer -name work            # attach the session named "work", or create it
                              #   (attach-or-create, like tmux new -A -s work)
 tezzer -- tmux new -A        # everything after -- is the command + args
 tezzer -list                 # list sessions and exit
+tezzer -version              # print version, commit, and build time (tezzerd -version too)
+tezzer -server-version       # print the running tezzerd's version
 tezzer -list -json           # same, as JSON (for scripting; also works with -info/-stats)
 tezzer -resume               # attach to the most recent session
 tezzer -session <id>         # attach to a specific session
@@ -169,6 +175,9 @@ tezzer -L 8080:localhost:3000   # forward local port 8080 to localhost:3000 on
 tezzer -N -name work -L 8080:localhost:3000
                                 # forward-only attach to an existing session:
                                 # no terminal I/O, just the tunnels (like ssh -N)
+tezzer -R 9222:localhost:9222   # listen on the server's localhost:9222 and dial
+                                # localhost:9222 on this machine (ssh -R
+                                # compatible; repeatable; bind is loopback-only)
 ```
 
 Port forwards ride the same QUIC connection as the terminal: a network change
@@ -180,6 +189,28 @@ new connections. Forwarding can be disabled server-wide with
 
 To add a tunnel to a session you are already attached to, open one from another
 terminal with `-N` (`tezzer-ssh myserver forward --name work -L ...`).
+
+**Remote forwards (`-R`) belong to the server, not to a client.** A typical
+use is letting programs on the server drive a browser on your machine through
+the Chrome DevTools Protocol: start Chrome with
+`--remote-debugging-port=9222 --user-data-dir=<a non-default profile>` and
+attach with `-R 9222:localhost:9222`. You can put the same `-R` in every
+terminal you open from that machine: tezzerd listens once and relays each
+connection through whichever of that machine's clients is connected, so the
+tunnel lasts as long as any of them does. Each machine identifies itself with an ID derived from a
+random secret in `~/.tezzer/device-id` and its hostname (if you clone a whole
+machine, hostname included, delete that file on the clone). If another machine asks for the same
+port, it waits and takes the port over once the first machine's clients have
+all exited. When a machine's clients lose their connection (sleep, network
+outage) rather than exit, the server keeps the port bound for up to 24 hours,
+refusing connections until a client reconnects, so no other process can grab
+it meanwhile. If the port is taken by another program on the server, tezzerd
+retries every 30 seconds. Connections in flight do not survive a reconnect or a
+`tezzerd` restart (CDP clients need to reconnect), but new ones work as soon as
+a client is back. Server-wide `-R` state appears at the end of `tezzer -list`
+(and under `remote_forwards` in `-list -json`); `Ctrl-^ i` shows
+`rfwd:<active>/<defined>`. As with `ssh -R`, any local user on the server can
+connect to a forwarded port. `--no-tcp-forwarding` disables `-R` too.
 
 **Exit status is propagated like ssh.** When the session's command exits while
 you are attached, the client exits with the same status code (signal death maps
@@ -217,6 +248,22 @@ tezzer-ssh myserver wait --name build    # block until the session command exits
                                          # (exit code propagated)
 tezzer-ssh myserver peek --name agent    # read-only attach (never sends input)
 tezzer-ssh myserver run --ipv4-only -- tmux new -A
+tezzer-ssh myserver version              # local tezzer + remote tezzerd versions
+tezzer-ssh -version                      # local tezzer version only
+```
+
+`tezzer-ssh myserver version` shows the local `tezzer`, the `tezzerd` actually
+running on the remote host, and the `tezzerd` installed there. If the last two
+differ, the server was upgraded but not restarted. It does not start `tezzerd`.
+
+If `tezzerd` is not running on the remote host, `tezzer-ssh` starts it without
+arguments, so sessions get random UDP ports. If you rely on a fixed UDP port
+with router port forwarding, pass the server arguments via
+`TEZZER_SERVER_ARGS` (used only when `tezzer-ssh` auto-starts `tezzerd`), or
+run `tezzerd` persistently (e.g. the systemd user service below):
+
+```bash
+TEZZER_SERVER_ARGS="--udp-port 7020" tezzer-ssh myserver run -- zsh
 ```
 
 ### Keyboard shortcuts (while connected)
@@ -225,7 +272,7 @@ The escape prefix is `Ctrl-^` (Ctrl-Shift-6) by default; change it with
 `tezzer -escape-key`.
 
 - `Ctrl-^ .` — detach from the session
-- `Ctrl-^ i` — show connection status (state, RTT, output freshness)
+- `Ctrl-^ i` — show connection status (session name, state, RTT, output freshness)
 - `Ctrl-^ h` — show help
 - `Ctrl-^ s` — write stats to `~/.tezzer/stats/<session>.stats.json` (see `tezzer -stats`)
 - `Ctrl-^ d` — toggle debug output
@@ -234,8 +281,22 @@ The escape prefix is `Ctrl-^` (Ctrl-Shift-6) by default; change it with
 - `Ctrl-^ f` — force a full server-side redraw
 
 All of these flash a single status line at the top of the terminal for a few
-seconds; they do not restore whatever was there before — full-screen apps
-(vim, tmux, etc.) repaint it on their own.
+seconds; they do not restore whatever was there before. Full-screen apps
+repaint that row only when they next redraw it, so a top bar that rarely
+changes (Zellij's tab bar, tmux with `status-position top`) can stay blank.
+
+Experimental: with `TEZZER_STATUS=redraw`, the client nudges the remote app
+to repaint (the same resize trick as `Ctrl-^ f`) right after the status line
+is cleared, but only while it has seen the app switch to the alternate
+screen. Plain shells and inline TUIs are left alone. The inferred state
+(`scr:alt` / `scr:main` / `scr:unknown`) is shown in `Ctrl-^ i`, and
+transitions are recorded in the client log.
+
+Experimental: with `TEZZER_STATUS=off`, notifications you did not ask for
+(the attach banner, connection state changes, stall warnings, ...) are not
+drawn at all and only go to the client log (`tezzer -logs <session>`).
+Status lines you request with a key (`Ctrl-^ i`, `Ctrl-^ h`, ...) are still
+shown.
 
 ## Do you still need a remote multiplexer?
 
@@ -323,6 +384,10 @@ Environment=SHELL=/bin/bash
 # may differ when launched from systemd. Set SCREENDIR to match your system,
 # e.g. (path varies by distribution):
 #   Environment=SCREENDIR=/run/screen/S-%u
+# Commands given to `tezzer-ssh host run -- CMD` are looked up in tezzerd's
+# PATH, which under systemd does not include directories your login shell
+# adds (~/.local/bin, ~/.cargo/bin, ...). Add them if needed, e.g.:
+#   Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=default.target
@@ -332,7 +397,9 @@ systemctl --user daemon-reload
 systemctl --user enable --now tezzerd
 ```
 
-To keep the service running when you are not logged in:
+To keep the service running when you are not logged in (and to have it
+running after a reboot before your first login — otherwise `tezzer-ssh` may
+auto-start a plain `tezzerd` without `--udp-port` first):
 
 ```bash
 loginctl enable-linger "$USER"

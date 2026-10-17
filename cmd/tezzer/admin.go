@@ -1,11 +1,13 @@
 package main
 
-// admin.go: 管理コマンド（-list / -info / -wait / -kill）の実装と表示整形。
+// admin.go: 管理コマンド（-list / -info / -wait / -kill / -server-version）の実装と表示整形。
 // サーバとの往復は rpc.go の roundTrip / connectToServer を使う。
 
 import (
 	"fmt"
 	"github.com/kuriyama/tezzer/internal/proto"
+	"io"
+	"log"
 	"strings"
 	"time"
 )
@@ -29,14 +31,18 @@ func formatAgo(d time.Duration) string {
 
 // fetchSessions はサーバから SESSIONS_LIST を取得する
 // （-list / -resume / -name の共通処理）。
-func fetchSessions(addr string) ([]proto.SessionInfo, error) {
+func fetchSessionsList(addr string) (*proto.SessionsListMsg, error) {
 	conn, err := connectToServer(addr)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
 
-	resp, err := roundTrip[proto.SessionsListMsg](conn, proto.ListSessionsMsg{Type: "LIST_SESSIONS"})
+	return roundTrip[proto.SessionsListMsg](conn, proto.ListSessionsMsg{Type: "LIST_SESSIONS"})
+}
+
+func fetchSessions(addr string) ([]proto.SessionInfo, error) {
+	resp, err := fetchSessionsList(addr)
 	if err != nil {
 		return nil, err
 	}
@@ -44,13 +50,13 @@ func fetchSessions(addr string) ([]proto.SessionInfo, error) {
 }
 
 func listSessions(addr string, jsonOut bool) error {
-	sessions, err := fetchSessions(addr)
+	resp, err := fetchSessionsList(addr)
 	if err != nil {
 		return err
 	}
 
 	if jsonOut {
-		out, err := formatSessionsListJSON(sessions, time.Local)
+		out, err := formatSessionsListJSON(resp.Sessions, resp.RemoteForwards, time.Local)
 		if err != nil {
 			return fmt.Errorf("json encode error: %w", err)
 		}
@@ -58,25 +64,65 @@ func listSessions(addr string, jsonOut bool) error {
 		return nil
 	}
 
-	fmt.Print(formatSessionsList(sessions, time.Local))
+	fmt.Print(formatSessionsList(resp.Sessions, time.Local))
+	fmt.Print(formatRemoteForwards(resp.RemoteForwards, time.Local))
 	return nil
 }
 
-// findSessionIDByName は名前が一致するアクティブなセッションの ID を返す。
-// 見つからなければ空文字（エラーではない）。PTY 終了済みセッションは
-// 名前を保持しない扱い（サーバ側の一意性チェックと同じ規則）。
-func findSessionIDByName(addr, name string) (string, error) {
+// formatRemoteForwards は -list の末尾に出すサーバ全体の -R 一覧を組み立てる純粋関数
+// （-R はセッションではなくサーバに属するため、セッション表とは別に出す）。
+func formatRemoteForwards(rfs []proto.RemoteForwardInfo, loc *time.Location) string {
+	if len(rfs) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "\r\nREMOTE FORWARDS (-R)\r\n")
+	fmt.Fprintf(&b, "%-6s %-9s %-24s %6s %8s %s\r\n", "PORT", "DEVICE", "CLIENTS", "ACTIVE", "OPENED", "STATE")
+	for _, rf := range rfs {
+		device := rf.Device
+		state := "listening since " + time.Unix(rf.ListenFrom, 0).In(loc).Format("2006-01-02 15:04:05")
+		if device == "" {
+			device = "-"
+			state = "not listening"
+			if rf.BindError != "" {
+				state = "bind failed: " + rf.BindError
+			}
+		}
+		clients := fmt.Sprintf("%d live/%d dormant/%d wait", rf.Live, rf.Dormant, rf.Waiting)
+		fmt.Fprintf(&b, "%-6d %-9s %-24s %6d %8d %s\r\n", rf.Port, device, clients, rf.Active, rf.Opened, state)
+	}
+	return b.String()
+}
+
+// findSessionByName は名前が一致するアクティブなセッションを返す（見つからなければ nil、
+// エラーではない）。PTY 終了済みセッションは名前を保持しない扱い（サーバ側の一意性
+// チェックと同じ規則）。-name の attach-or-create 判定に使う。
+func findSessionByName(addr, name string) (*proto.SessionInfo, error) {
 	sessions, err := fetchSessions(addr)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	for i := range sessions {
 		s := &sessions[i]
 		if s.Name == name && !s.PTYClosed {
-			return s.SessionID, nil
+			return s, nil
 		}
 	}
-	return "", nil
+	return nil, nil
+}
+
+// ignoredCommandNotice は -name で既存セッションに attach する際、指定したコマンドが
+// 使われないことを知らせる文言を返す（コマンド指定がなければ ""）。zsh のつもりで
+// 実は zellij のセッションに入っていた、という取り違えを防ぐ。
+// 作成時と同じコマンドを引数なしで指定した場合（同じコマンドラインで入り直す使い方）も
+// 取り違えではないので "" を返す。SessionInfo は引数を持たないため、引数つきの指定は
+// 比較できず常に知らせる。
+func ignoredCommandNotice(name, existingCmd, cmd string, args []string) string {
+	if cmd == "" || (cmd == existingCmd && len(args) == 0) {
+		return ""
+	}
+	given := strings.Join(append([]string{cmd}, args...), " ")
+	return fmt.Sprintf("Session %q already exists (running %s); the given command %q is not used\n", name, existingCmd, given)
 }
 
 // formatSessionsList は -list の表示文字列を組み立てる純粋関数。
@@ -358,16 +404,34 @@ func getLatestSessionID(addr string) (string, error) {
 	return latestSession.SessionID, nil
 }
 
-// formatBytes はバイト数を人間が読みやすい形式に変換する
-func formatBytes(b uint64) string {
-	switch {
-	case b >= 1024*1024*1024:
-		return fmt.Sprintf("%.1f GB", float64(b)/(1024*1024*1024))
-	case b >= 1024*1024:
-		return fmt.Sprintf("%.1f MB", float64(b)/(1024*1024))
-	case b >= 1024:
-		return fmt.Sprintf("%.1f KB", float64(b)/1024)
-	default:
-		return fmt.Sprintf("%d B", b)
+// showServerVersion は動作中の tezzerd にバージョン情報を問い合わせて表示する
+// （-server-version）。ディスク上のバイナリではなく実際に動いているプロセスの情報なので、
+// 更新後に再起動し忘れていないかの確認に使える。
+func showServerVersion(addr string) error {
+	// dialAndHandshake の "connected to tezzerd" ログは出力を汚すので捨てる（tezzer-ssh が取り込む）
+	log.SetOutput(io.Discard)
+	conn, err := connectToServer(addr)
+	if err != nil {
+		return fmt.Errorf("failed to connect to tezzerd (is it running?): %w", err)
 	}
+	defer conn.Close()
+	meta, err := roundTrip[proto.ServerMetaMsg](conn, proto.GetServerMetaMsg{Type: "GET_SERVER_META"})
+	if err != nil {
+		// attach 前の GET_SERVER_META に対応していない旧サーバは BAD_REQUEST を返す
+		if strings.Contains(err.Error(), proto.ErrBadRequest) {
+			return fmt.Errorf("tezzerd is too old to report its version (%v)", err)
+		}
+		return err
+	}
+	fmt.Println(formatServerVersion(meta))
+	return nil
+}
+
+// formatServerVersion は -server-version の表示文字列を組み立てる純粋関数。
+func formatServerVersion(m *proto.ServerMetaMsg) string {
+	ver := m.ServerVersion
+	if ver == "" {
+		ver = "unknown"
+	}
+	return fmt.Sprintf("tezzerd %s (commit %s, built %s)", ver, m.ServerBuildID, m.ServerBuildTime)
 }

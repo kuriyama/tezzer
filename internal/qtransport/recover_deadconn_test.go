@@ -91,4 +91,29 @@ func TestQUICTransport_RecoverOnDeadConn(t *testing.T) {
 
 	// 新しい接続で往復が回復すること。
 	roundTrip("after-recover")
+
+	// 長スリープ復帰（サーバー側 idle timeout 見込み）では、接続が生きて見えても
+	// migration を試さず直接 reconnect する（Probe の 4 秒待ちを避ける）。
+	qc.migrateMu.Lock()
+	before := qc.conn
+	qc.migrateMu.Unlock()
+	qc.recoverWith("test long sleep", false)
+	qc.migrateMu.Lock()
+	after, held := qc.conn, len(qc.pathTransports)
+	qc.migrateMu.Unlock()
+	if after == before || held != 0 {
+		t.Fatalf("recoverWith(tryMigrate=false) did not reconnect (conn replaced=%v, paths held=%d)", after != before, held)
+	}
+	roundTrip("after-long-sleep")
+}
+
+func TestServerLikelyTimedOut(t *testing.T) {
+	cfg := quicConfig()
+	threshold := cfg.MaxIdleTimeout - cfg.KeepAlivePeriod
+	if serverLikelyTimedOut(threshold - time.Second) {
+		t.Errorf("slept %v: want false", threshold-time.Second)
+	}
+	if !serverLikelyTimedOut(threshold) {
+		t.Errorf("slept %v: want true", threshold)
+	}
 }

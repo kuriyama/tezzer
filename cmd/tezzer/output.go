@@ -153,7 +153,7 @@ func (c *Client) handleServer() {
 				if c.transport() != nil {
 					continue
 				}
-				msg := "Output was dropped (use Ctrl-^ r to redraw)"
+				msg := "Output was dropped (use Ctrl-^ f to redraw)"
 				if m.Msg != "" {
 					msg = m.Msg
 				}
@@ -165,6 +165,7 @@ func (c *Client) handleServer() {
 					c.noteSessionExitCode(*m.ExitCode)
 				}
 				if c.sessionClosedNotified.CompareAndSwap(false, true) {
+					c.restoreTerminalModes()
 					fmt.Fprintf(os.Stderr, "\r\n[Tezzer] Session closed: %s\r\n", m.Msg)
 				}
 				c.doneOnce.Do(func() { close(c.done) })

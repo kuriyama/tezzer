@@ -108,16 +108,24 @@ Control frames are `[u32be length][MessagePack]`, max 1 MiB. Frame types:
 |---|---|---|---|
 | 1 | Hello | C→S | bind connection to `(session_id, client_id)`; carries `last_offset` for resync |
 | 2 | Resize | C→S | terminal resize |
-| 3 | ServerMeta | S→C | build ID/time, instance ID, feature bits (bit 0 = tcp-forwarding) |
+| 3 | ServerMeta | S→C | build ID/time, instance ID, feature bits (bit 0 = tcp-forwarding, bit 1 = agent-forwarding, bit 2 = liveness ping, bit 3 = remote-forwarding) |
 | 4 | SessionGone | S→C | session no longer exists (restart/kill); when the session's process exited, carries its exit code (`ec`, optional; signal death is 128+signal), which the client adopts as its own exit status like ssh |
 | 5 | Status | S→C | status message for the user |
 | 6 | Log | S→C | log message |
 | 7 | FwdOpen | C→S | first frame of a forward stream: `msg` = dial target `"host:port"` |
 | 8 | FwdOpenOK | S→C | dial succeeded; stream switches to raw relay |
 | 9 | FwdOpenErr | S→C | dial failed / forwarding rejected; `msg` = reason |
+| 10 | AgentOpen | S→C | first frame of an agent-forwarding stream opened by the server |
+| 11 | AgentOpenOK | C→S | the client connected to its local agent; stream switches to raw relay |
+| 12 | AgentOpenErr | C→S | agent forwarding refused; `msg` = reason |
+| 13 | Ping | C→S | liveness check (sent only to servers advertising bit 2) |
+| 14 | Pong | S→C | reply to Ping |
+| 15 | RFwdOpen | S→C | first frame of a remote-forward stream opened by the server: `p` = server-side listen port |
+| 16 | RFwdOpenOK | C→S | the client dialed its target for that port; stream switches to raw relay |
+| 17 | RFwdOpenErr | C→S | dial failed or port not defined on this client; `msg` = reason |
 
-Types 7–9 appear only at the head of forward streams, never on the control
-stream (they share the frame encoding).
+Types 7–12 and 15–17 appear only at the head of forward streams, never on the
+control stream (they share the frame encoding).
 
 ### Output offsets and resync
 
@@ -167,3 +175,20 @@ each other.
 Limits: 64 concurrent forwarded connections per client (excess rejected with
 `FwdOpenErr`). Servers started with `--no-tcp-forwarding` clear the feature
 bit in ServerMeta *and* reject `FwdOpen`.
+
+### Remote port forwarding
+
+A client with `-R` adds `dv` (device ID) and `rf` (server-side listen ports)
+to every Hello; the dial targets stay on the client. tezzerd keeps one
+listener per port for the whole server and groups the clients that offer it
+by device ID. For each accepted connection the server opens a bidi stream to
+the most recently connected client of the listening device and sends
+`RFwdOpen{p: port}`; the client dials its own target for that port and
+replies `RFwdOpenOK` or `RFwdOpenErr{msg}`, after which the stream is a raw
+relay with the same half-close rules as `-L`.
+
+A client that exits on purpose closes its QUIC connection with application
+error code 3; any other end of the connection counts as lost, and the server
+keeps the port bound (refusing connections) for up to 24 hours waiting for
+that device to reconnect. Servers started with `--no-tcp-forwarding` do not
+set bit 3 and ignore `rf`.

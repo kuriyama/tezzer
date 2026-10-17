@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"log"
 	"net"
 	"strings"
 	"sync"
@@ -75,8 +76,14 @@ type quicClient struct {
 	clientID     uint16
 	sessionID    string
 
+	// pathTransports は現在の conn が migration 前に使っていた（または probe に失敗した）
+	// transport。quic-go は AddPath した transport にも conn を登録し、transport を閉じると
+	// 登録中の conn ごと destroy するため、conn を差し替えるまで閉じられない。migrateMu で保護
+	pathTransports []*quic.Transport
+
 	tr       *quic.Transport
 	conn     *quic.Conn
+	connAddr string           // conn の dial 先候補（"host:port"）。migrateMu で保護
 	ctrl     *quic.Stream     // control bidi（Hello/Resize 送信）
 	in       *quic.SendStream // 入力 uni
 	inConn   *quic.Conn       // in が属する conn（datagram 送信用。in と同時に差し替える）
@@ -102,16 +109,24 @@ type quicClient struct {
 	backoffMu    sync.Mutex
 	backoffFails int       // 連続失敗回数
 	backoffUntil time.Time // この時刻まで次の復帰試行を控える
+	// 打鍵起点の resetBackoff を最後に行った時刻（resetBackoffByInput の間引き用）
+	lastInputBackoffReset time.Time
 
 	state          atomic.Int32
 	lastOffset     atomic.Uint64 // 最後に配信した出力 offset（再同期 Hello・重複排除用）
 	lastRecoveryMs atomic.Uint64 // 直近の復帰所要時間（ms）
 	recoveryCount  atomic.Uint64 // ローミング/再接続の累計回数
 	serverFeatures atomic.Uint64 // serverMeta で広告された機能ビット（FeatureTCPForward 等）
+	lastPongNano   atomic.Int64  // 最後に pong を受けた時刻（liveness.go）
 
 	// agent forwarding（-A）。Start() 前に SetAgentSockPath で設定する（agent.go）。
 	// 空文字なら Hello の AgentForward は false（-A 未指定 or $SSH_AUTH_SOCK 不可）。
 	agentSockPath string
+
+	// -R（rforward.go）。Start() 前に SetRemoteForwards で設定し、以後は読み取りのみ。
+	deviceID    string
+	rfwdTargets map[uint16]string // サーバ側 listen ポート → クライアント側 dial 先
+	rfwdActive  atomic.Int32
 
 	candidatesRefresher   func() []string // 全候補失敗時に呼ぶ候補再生成関数
 	candidatesRefresherMu sync.Mutex
@@ -164,6 +179,7 @@ func (c *quicClient) Start(ctx context.Context) error {
 	c.tr = winner.tr
 	conn := winner.conn
 	c.conn = conn
+	c.connAddr = winner.addr
 
 	// control bidi を開いて Hello を送る。
 	ctrl, err := conn.OpenStreamSync(ctx)
@@ -171,7 +187,7 @@ func (c *quicClient) Start(ctx context.Context) error {
 		return err
 	}
 	c.ctrl = ctrl
-	if err := writeFrame(ctrl, &ctrlMsg{Type: ctrlHello, ClientID: c.clientID, SessionID: c.sessionID, LastOffset: c.lastOffset.Load(), AgentForward: c.agentSockPath != ""}); err != nil {
+	if err := writeFrame(ctrl, c.helloMsg()); err != nil {
 		return err
 	}
 
@@ -191,6 +207,7 @@ func (c *quicClient) Start(ctx context.Context) error {
 	go c.readCtrl(ctrl)
 	go c.acceptServerStreams(conn)
 	go c.watchdog()
+	go c.livenessLoop()
 	return nil
 }
 
@@ -225,7 +242,8 @@ func (c *quicClient) watchdog() {
 			// スリープ検出は wall-clock 差で行う。OS サスペンド中は monotonic clock が
 			// 止まるため now.Sub(last)（monotonic）ではジャンプを検出できない。Round(0) で
 			// monotonic を剥がし、wall 時計の差（サスペンド時間を含む）で判定する。
-			jumped := now.Round(0).Sub(last.Round(0)) > sleepThreshold
+			slept := now.Round(0).Sub(last.Round(0))
+			jumped := slept > sleepThreshold
 			// tick gap の計測は ticker の値 now ではなく配送時点の実時刻で行う。
 			// runtime は遅延した tick に「予定時刻」（Now() から遅延分を引いた値）を
 			// 載せるため、monotonic が進むタイプの停止（SIGSTOP・VM pause 等）は
@@ -255,7 +273,13 @@ func (c *quicClient) watchdog() {
 				// スリープ復帰はネットワーク環境が変わった可能性が高いので、
 				// バックオフをリセットして即試行する。
 				c.resetBackoff()
-				go c.recover("sleep wake detected")
+				if serverLikelyTimedOut(slept) {
+					// サーバー側は idle timeout で接続を捨てている見込みが高く、migration の
+					// Probe は応答なしで 4 秒待つだけになるので、直接 reconnect する。
+					go c.recoverWith("sleep wake detected", false)
+				} else {
+					go c.recover("sleep wake detected")
+				}
 			case c.connDead():
 				// サスペンドを伴わない経路断・接続死も拾う。
 				go c.recover("connection lost")
@@ -278,6 +302,10 @@ func (c *quicClient) connDead() bool {
 const (
 	reconnectBackoffBase = 1 * time.Second
 	reconnectBackoffMax  = 60 * time.Second
+	// 打鍵起点でバックオフをリセットする最小間隔。接続断中はマウストラッキング等で
+	// 端末が自動生成する ESC シーケンスが送信失敗を連発するため、毎回リセットすると
+	// バックオフが効かず reconnect を間断なく試し続けてしまう。
+	inputBackoffResetInterval = 5 * time.Second
 )
 
 // inBackoff は次の復帰試行を控えるべき間 true を返す。
@@ -311,9 +339,37 @@ func (c *quicClient) resetBackoff() {
 	c.backoffMu.Unlock()
 }
 
+// resetBackoffByInput は打鍵起点のバックオフリセットを inputBackoffResetInterval に
+// 1 回までに間引く（ユーザーが使おうとしている場面で即復帰させる意図は保ちつつ、
+// 自動生成入力による reconnect 連打を防ぐ）。
+func (c *quicClient) resetBackoffByInput() {
+	c.backoffMu.Lock()
+	defer c.backoffMu.Unlock()
+	now := time.Now()
+	if !c.lastInputBackoffReset.IsZero() && now.Sub(c.lastInputBackoffReset) < inputBackoffResetInterval {
+		return
+	}
+	c.lastInputBackoffReset = now
+	c.backoffFails = 0
+	c.backoffUntil = time.Time{}
+}
+
+// serverLikelyTimedOut は、クライアントが slept の間止まっていた（スリープ等）場合に、
+// サーバー側で接続が idle timeout 済みと見込めるかを返す。サーバーが最後に受信したのは
+// 停止の最大 KeepAlivePeriod 前なので、slept が MaxIdleTimeout − KeepAlivePeriod 以上なら
+// サーバーから見た無音は idle timeout に達しうる。クライアント側は停止中に monotonic
+// clock が進まず自分の接続を生きていると見なすため、connDead() では判定できない。
+func serverLikelyTimedOut(slept time.Duration) bool {
+	cfg := quicConfig()
+	return slept >= cfg.MaxIdleTimeout-cfg.KeepAlivePeriod
+}
+
 // recover は経路復帰を試みる。まず能動 migration（接続生存時）、失敗したら
 // full reconnect（接続死＝idle timeout 超の長スリープ時）にフォールバックする。
-func (c *quicClient) recover(reason string) {
+func (c *quicClient) recover(reason string) { c.recoverWith(reason, true) }
+
+// recoverWith は recover の本体。tryMigrate=false なら migration を試さず直接 reconnect する。
+func (c *quicClient) recoverWith(reason string, tryMigrate bool) {
 	// 多重起動防止（打鍵連打 ＋ watchdog tick が同時に来ても 1 本だけ走らせる）。
 	if !c.recovering.CompareAndSwap(false, true) {
 		return
@@ -330,7 +386,7 @@ func (c *quicClient) recover(reason string) {
 	// 接続が生きていれば軽い能動 migration を試す（同一 NW のスリープ/NAT rebind）。
 	// 既に死んでいる場合は migrate（AddPath/Probe）が無駄に Probe タイムアウトまで
 	// 待つので、直接 reconnect する。
-	if !c.connDead() {
+	if tryMigrate && !c.connDead() {
 		if err := c.migrate(reason); err == nil {
 			c.resetBackoff()
 			return
@@ -394,6 +450,18 @@ func (c *quicClient) reconnect(reason string) error {
 		return fmt.Errorf("reconnect: all %d candidate(s) failed: %s", len(candidates), strings.Join(failures, "; "))
 	}
 
+	if err := c.adoptConn(winner); err != nil {
+		return err
+	}
+	d := c.recordRecovery(start)
+	c.setState(transport.StateConnected, fmt.Sprintf("reconnected via %s (recovery %dms)", winner.addr, d.Milliseconds()))
+	return nil
+}
+
+// adoptConn は dial 済みの winner 上にストリーム（control/入力）を構築して Hello を送り、
+// 現在の接続と差し替える。migrateMu を保持した状態で呼ぶこと。失敗時は winner を閉じ、
+// 現在の接続には触れない。reconnect と liveness の別 family 切替（liveness.go）で共用する。
+func (c *quicClient) adoptConn(winner *dialResult) error {
 	// winner への接続でストリームを構築する。
 	// dialCtx はキャンセル済みなので新たなコンテキストを用いる。
 	setupCtx, setupCancel := context.WithTimeout(c.ctx, 10*time.Second)
@@ -405,7 +473,7 @@ func (c *quicClient) reconnect(reason string) error {
 		_ = closeTransport(winner.tr)
 		return err
 	}
-	if err := writeFrame(ctrl, &ctrlMsg{Type: ctrlHello, ClientID: c.clientID, SessionID: c.sessionID, LastOffset: c.lastOffset.Load(), AgentForward: c.agentSockPath != ""}); err != nil {
+	if err := writeFrame(ctrl, c.helloMsg()); err != nil {
 		_ = winner.conn.CloseWithError(0, "")
 		_ = closeTransport(winner.tr)
 		return err
@@ -422,7 +490,12 @@ func (c *quicClient) reconnect(reason string) error {
 		_ = c.conn.CloseWithError(0, "reconnect")
 	}
 	c.retireTransport(c.tr)
+	for _, tr := range c.pathTransports {
+		c.retireTransport(tr)
+	}
+	c.pathTransports = nil
 	c.conn = winner.conn
+	c.connAddr = winner.addr
 	c.tr = winner.tr
 	c.ctrlMu.Lock()
 	c.ctrl = ctrl
@@ -435,8 +508,6 @@ func (c *quicClient) reconnect(reason string) error {
 	c.inOffset = 0 // 新しい入力ストリームなので offset を振り直す（server 側 dedup も接続単位）
 	c.inMu.Unlock()
 
-	c.recordRecovery(start)
-	c.setState(transport.StateConnected, fmt.Sprintf("reconnected via %s", winner.addr))
 	go c.pumpOutput(winner.conn)
 	go c.readCtrl(ctrl)
 	go c.acceptServerStreams(winner.conn)
@@ -448,6 +519,12 @@ func (c *quicClient) reconnect(reason string) error {
 func (c *quicClient) migrate(reason string) error {
 	c.migrateMu.Lock()
 	defer c.migrateMu.Unlock()
+
+	// 上限に達したら migration せず reconnect に任せる（maxPathTransports 参照。
+	// 新しい conn で張り直せば adoptConn が保持分をまとめて退役させる）。
+	if len(c.pathTransports) >= maxPathTransports {
+		return fmt.Errorf("migrate: %d paths held on this connection; reconnecting instead", len(c.pathTransports))
+	}
 
 	start := time.Now()
 	c.setState(transport.StateRecovering, "roaming: "+reason)
@@ -462,48 +539,84 @@ func (c *quicClient) migrate(reason string) error {
 		_ = closeTransport(tr)
 		return err
 	}
+	// Probe を送った時点で tr にも conn が登録されるため、失敗しても tr は閉じずに
+	// 保持する（閉じると、まだ生きている conn まで destroy してしまう）。
+	fail := func(err error) error {
+		closePath(c.conn, path)
+		c.pathTransports = append(c.pathTransports, tr)
+		return err
+	}
 	// Probe タイムアウトは短め（高遅延でも空振りを長引かせず reconnect へ早く落とす）。
 	pctx, cancel := context.WithTimeout(c.ctx, 4*time.Second)
 	defer cancel()
 	if err := path.Probe(pctx); err != nil {
-		_ = closeTransport(tr)
-		return err
+		return fail(err)
 	}
 	if err := path.Switch(); err != nil {
-		_ = closeTransport(tr)
-		return err
+		return fail(err)
 	}
 
-	// 旧 transport は即閉じると競合しうるため、猶予をおいて閉じる。
-	c.retireTransport(c.tr)
+	// 旧 transport にも conn が登録されたままなので、conn の差し替えまで保持する。
+	c.pathTransports = append(c.pathTransports, c.tr)
 	c.tr = tr
-	c.recordRecovery(start)
-	c.setState(transport.StateConnected, "roaming: migrated")
+	d := c.recordRecovery(start)
+	c.setState(transport.StateConnected, fmt.Sprintf("roaming: migrated (recovery %dms)", d.Milliseconds()))
 	return nil
 }
+
+// closePath は migration に失敗した path を閉じる。quic-go v0.60 の Path.Close は
+// 接続終了後（connIDManager が Close 済み）に呼ぶと、PATH_CHALLENGE を送った path では
+// RetireConnIDForPath の assertNotClosed で panic する（Probe 中に idle timeout 等で
+// 接続が死んだ場合に実機で発生）。接続が死んでいれば path を閉じる意味はないので
+// 呼ばず、確認と Close の間に接続が死ぬ競合は recover で吸収する。
+func closePath(conn *quic.Conn, path *quic.Path) {
+	if conn.Context().Err() != nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("qtransport: path close after connection closed: %v", r)
+		}
+	}()
+	_ = path.Close()
+}
+
+// maxPathTransports は 1 つの conn で migration できる回数の上限（= 保持する
+// migration 前 transport の上限）。超えたら migration をやめて reconnect する。
+// quic-go v0.60 は path probe ごとにサーバー発行の接続 ID を 1 つ割り当て、検証済み
+// path の分は path を閉じても retire しない（removePathImpl）。active_connection_id_limit
+// が 4 のため、実測で 3 回目の migration は ID 枯渇で Probe がタイムアウトする。
+// 上限で打ち切ることで、その 4 秒を待たずに reconnect へ進む（fd も頭打ちになる）。
+const maxPathTransports = 2
 
 // transportRetireGrace は退役した transport（旧 UDP ソケット）を閉じるまでの猶予。
 // Switch/reconnect 直後に即閉じすると quic-go 内部のパス処理（旧経路への
 // CONNECTION_CLOSE 送出・再送等）と競合しうるため少し待つ。
-const transportRetireGrace = 30 * time.Second
+// テストから短縮できるよう差し替え可能（server.go の stall 水位と同じパターン）。
+var transportRetireGrace = newAtomicDuration(30 * time.Second)
 
 // retireTransport は退役した transport を猶予をおいて（または Close 時に即）閉じる。
 // 従来は Close() までまとめて保持していたが、復帰のたびに UDP ソケット fd が溜まり
 // リークしていた（WSL2 の watchdog 誤検知事案では 90h で recovery 1659 回 = fd 1659 個）。
+// 対象は conn ごと退役した transport に限る。migration で離れただけの transport は
+// conn が登録されたままで、閉じると conn ごと destroy される（pathTransports 参照）。
 func (c *quicClient) retireTransport(tr *quic.Transport) {
 	go func() {
 		select {
-		case <-time.After(transportRetireGrace):
+		case <-time.After(transportRetireGrace.Get()):
 		case <-c.ctx.Done():
 		}
 		_ = closeTransport(tr)
 	}()
 }
 
-// recordRecovery は復帰所要時間と回数を記録する。
-func (c *quicClient) recordRecovery(start time.Time) {
-	c.lastRecoveryMs.Store(uint64(time.Since(start).Milliseconds()))
+// recordRecovery は復帰所要時間と回数を記録し、記録した所要時間を返す
+// （呼び出し側が完了ログに埋め込めるように）。
+func (c *quicClient) recordRecovery(start time.Time) time.Duration {
+	d := time.Since(start)
+	c.lastRecoveryMs.Store(uint64(d.Milliseconds()))
 	c.recoveryCount.Add(1)
+	return d
 }
 
 // pumpOutput は指定 conn のサーバ出力 uni ストリームを受けて Output() へ流す。
@@ -548,9 +661,9 @@ func (c *quicClient) SendInput(data []byte) error {
 	if err != nil {
 		// 接続死（スリープ復帰直後など）を打鍵で踏んだら即復帰を起動する
 		// （watchdog の次 tick を待たず体感を改善）。多重起動は migrateMu で直列化。
-		// ユーザー操作起点なのでバックオフもリセットして待たせない。
+		// ユーザー操作起点なのでバックオフもリセットして待たせない（ただし間引く）。
 		go func() {
-			c.resetBackoff()
+			c.resetBackoffByInput()
 			c.recover("input send failed")
 		}()
 		return err
@@ -758,6 +871,8 @@ func (c *quicClient) readCtrl(ctrl *quic.Stream) {
 			if onLog != nil {
 				onLog(m.Msg)
 			}
+		case ctrlPong:
+			c.lastPongNano.Store(time.Now().UnixNano())
 		}
 	}
 }
@@ -788,12 +903,17 @@ func (c *quicClient) Close() error {
 	}
 	c.setState(transport.StateClosed, "closed")
 	if c.conn != nil {
-		_ = c.conn.CloseWithError(0, "done")
+		// 意図した終了であることをサーバへ伝える（-R の listener を休眠させずに手放させる）。
+		_ = c.conn.CloseWithError(connCodeClientExit, "done")
 	}
 	c.migrateMu.Lock()
 	if c.tr != nil {
 		_ = closeTransport(c.tr)
 	}
+	for _, tr := range c.pathTransports {
+		_ = closeTransport(tr)
+	}
+	c.pathTransports = nil
 	// 退役済み transport は retireTransport の goroutine が ctx.Done（上の cancel）を
 	// 見て閉じる。
 	c.migrateMu.Unlock()

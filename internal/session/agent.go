@@ -7,7 +7,6 @@ package session
 
 import (
 	"context"
-	"io"
 	"log"
 	"net"
 	"os"
@@ -77,26 +76,7 @@ func (s *Session) handleAgentConn(uconn *net.UnixConn) {
 	pipeAgentConn(uconn, fc)
 }
 
-// pipeAgentConn は UDS 接続と QUIC 中継路を双方向に中継する。
-// qtransport.forwardPipe と同じ半クローズ規約（正常 EOF は CloseWrite、エラーは Close）。
+// pipeAgentConn は UDS 接続と QUIC 中継路を双方向に中継する（バイト数は計上しない）。
 func pipeAgentConn(uconn *net.UnixConn, fc transport.ForwardConn) {
-	done := make(chan struct{}, 2)
-	go func() {
-		if _, err := io.Copy(fc, uconn); err == nil {
-			_ = fc.CloseWrite()
-		} else {
-			_ = fc.Close()
-		}
-		done <- struct{}{}
-	}()
-	go func() {
-		if _, err := io.Copy(uconn, fc); err == nil {
-			_ = uconn.CloseWrite()
-		} else {
-			_ = uconn.Close()
-		}
-		done <- struct{}{}
-	}()
-	<-done
-	<-done
+	pipeForward(uconn, fc, nil, nil)
 }

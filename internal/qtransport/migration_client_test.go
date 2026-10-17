@@ -13,6 +13,10 @@ import (
 )
 
 func TestQUICTransport_ClientMigration(t *testing.T) {
+	origGrace := transportRetireGrace.Get()
+	transportRetireGrace.Set(100 * time.Millisecond)
+	defer transportRetireGrace.Set(origGrace)
+
 	k := make([]byte, 32)
 	rand.Read(k)
 
@@ -82,4 +86,25 @@ func TestQUICTransport_ClientMigration(t *testing.T) {
 	// 同一ストリームで往復が継続すること（migration がストリーム状態を保持）。
 	roundTrip("after-migration-1")
 	roundTrip("after-migration-2")
+
+	// 退役猶予を過ぎても接続が生きていること（旧 transport を閉じると、そこに
+	// 登録されたままの conn ごと destroy される。実機で migration 成功の 30 秒後に
+	// 必ず connection lost → reconnect していた回帰の防止）。
+	time.Sleep(3 * transportRetireGrace.Get())
+	if qc.connDead() {
+		t.Fatal("connection died after the old transport's retire grace")
+	}
+	roundTrip("after-retire-grace")
+
+	// 上限（quic-go の接続 ID 枯渇で実際に migration できなくなる回数）に達したら
+	// migrate は Probe を待たずに失敗する（recover は即 reconnect にフォールバックする）。
+	for i := len(qc.pathTransports); i < maxPathTransports; i++ {
+		if err := qc.migrate("test"); err != nil {
+			t.Fatalf("migrate #%d: %v", i+1, err)
+		}
+	}
+	if err := qc.migrate("test"); err == nil {
+		t.Fatalf("migrate beyond %d held paths succeeded, want error", maxPathTransports)
+	}
+	roundTrip("after-cap")
 }

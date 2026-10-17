@@ -146,3 +146,28 @@ func TestReconnectBackoff(t *testing.T) {
 		t.Fatalf("backoff after reset = %v, want %v", d, reconnectBackoffBase)
 	}
 }
+
+// TestResetBackoffByInputThrottled は打鍵起点のバックオフリセットが
+// inputBackoffResetInterval に 1 回までに間引かれることを確認する（接続断中に
+// マウス等の自動生成 ESC シーケンスが送信失敗を連発しても reconnect が連打されない）。
+func TestResetBackoffByInputThrottled(t *testing.T) {
+	c := &quicClient{}
+	c.bumpBackoff()
+	c.resetBackoffByInput()
+	if c.inBackoff() {
+		t.Fatal("first input reset should clear backoff")
+	}
+	c.bumpBackoff()
+	c.resetBackoffByInput()
+	if !c.inBackoff() {
+		t.Fatal("second input reset within interval should be throttled")
+	}
+	// 間隔経過後は再びリセットできる
+	c.backoffMu.Lock()
+	c.lastInputBackoffReset = time.Now().Add(-inputBackoffResetInterval - time.Second)
+	c.backoffMu.Unlock()
+	c.resetBackoffByInput()
+	if c.inBackoff() {
+		t.Fatal("input reset after interval should clear backoff")
+	}
+}

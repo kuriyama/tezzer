@@ -8,6 +8,140 @@ once it reaches a 1.0 release.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-17
+
+### Added
+
+- Remote port forwarding: `tezzer -R [bind:]port:host:hostport` (ssh-compatible,
+  repeatable, loopback-only bind) makes `tezzerd` listen on the server's
+  `localhost:port` and relay each connection to the client, which dials
+  `host:hostport` from its own machine — for example to drive a local Chrome
+  over the DevTools Protocol from the server. The listener belongs to the
+  server rather than to one client: clients on the same machine (identified by
+  a random secret in `~/.tezzer/device-id` hashed with the hostname, so
+  machines sharing a home directory stay distinct) share it, so the same `-R`
+  can go in every terminal and the tunnel lasts while any of them is
+  connected. Another
+  machine asking for the same port waits and takes it over once the first
+  machine's clients have exited; a port held by another program is retried
+  every 30 seconds; when a machine's clients lose their connection rather than
+  exit, the port stays bound (refusing connections) for up to 24 hours. Shown
+  at the end of `tezzer -list` and as `remote_forwards` in `-list -json`;
+  `Ctrl-^ i` shows `rfwd:<active>/<defined>`. Works with `-N` and
+  `tezzer-ssh ... forward`, and is disabled by `tezzerd --no-tcp-forwarding`.
+  As with `ssh -R`, other local users on the server can connect to the port.
+  Needs both client and server updated.
+- `tezzer -version` and `tezzerd -version` print the release version
+  (`x.y.z`; development builds show the latest release plus `+dev`), the
+  git commit (with `-dirty` for uncommitted changes), the build time, and
+  the Go version and platform.
+- `tezzer -server-version` asks the running `tezzerd` for its version, and
+  `tezzer-ssh HOST version` prints the local `tezzer`, the running remote
+  `tezzerd`, and the installed remote `tezzerd` side by side (a mismatch
+  between the last two means the server was upgraded but not restarted).
+  `tezzer-ssh -version` prints the local version only.
+- When `-name` attaches to an existing session but a different command was
+  given (e.g. `tezzer-ssh host run --name work -- zsh` for a session started
+  with `zellij`), the client now says the session already exists, what it is
+  running, and that the given command is not used, instead of silently
+  ignoring it. Running the same command line again (same command, no
+  arguments) attaches without this message.
+- `Ctrl-^ i` now shows the session name (`name:work sess:abc123 | ...`) for
+  named sessions, however you attached (`-name`, `-resume`, or `-session`).
+  Names longer than 20 characters are truncated. With an older server the
+  name is shown only when you attached with `-name`.
+- Experimental `TEZZER_STATUS=redraw` (opt-in): after the status line is
+  cleared, the client nudges the remote app to repaint (the `Ctrl-^ f`
+  resize trick), but only while it has seen the app switch to the alternate
+  screen. This brings back top bars that the status line blanked and that
+  the app would not otherwise repaint soon (e.g. Zellij's tab bar, tmux with
+  `status-position top`). The inferred screen state is shown in `Ctrl-^ i`.
+- Experimental `TEZZER_STATUS=off` (opt-in): unsolicited notifications are
+  written only to the client log instead of the top status line; status lines
+  requested with a key (`Ctrl-^ i`, `Ctrl-^ h`, ...) are still shown.
+- `tezzerd --check-nat` now also reports the same-LAN candidate address and
+  which route family (IPv4/IPv6) it resolved from, so IPv4-only/IPv6-only/
+  dual-stack behavior can be checked with a single command.
+- The client now refreshes its QUIC reconnect candidate list in the
+  background every 90s (cheap local-route check first, then a real STUN
+  query only for families that appear to have a route), instead of only
+  re-deriving candidates reactively after every stored candidate has
+  already failed. On dual-stack links where one address family dies
+  independently (e.g. IPv4 CGN port exhaustion) while the other stays up,
+  reconnect can pick up the still-healthy family without needing the
+  slower reactive refresh path.
+- On dual-stack links, the client now notices within about 10 seconds when
+  the address family it is connected over (IPv4 or IPv6) stops responding,
+  and switches to the other family. Previously this took over a minute
+  (the QUIC idle timeout). The client only checks when the other family is
+  available, and if both are down it waits as before rather than retrying
+  early. It does not switch back when the original family recovers.
+  Requires an updated `tezzerd`.
+
+### Changed
+
+- A bare `tezzer` (no `-cmd` and nothing after `--`) now runs the server
+  user's login shell (from `/etc/passwd`, else tezzerd's `$SHELL`, else
+  `/bin/sh`) instead of always `/bin/bash`, like `ssh host`: it is started as
+  a login shell (`argv[0]` such as `-zsh`, so profile files are read) in the
+  home directory. Older servers keep running `/bin/bash`, and older clients
+  keep getting `/bin/bash`.
+- Detaching (or exiting) while a full-screen app such as zellij, tmux or vim
+  is running now returns the terminal to the screen you had before starting
+  `tezzer`, like quitting tmux or mosh. Previously the remote app's last
+  screen stayed visible after detaching. See the related entry under Fixed.
+- After a sleep of 45 seconds or more, the client now reconnects right
+  away instead of first trying to move the existing connection to a new
+  socket. By then the server has usually dropped the connection, so that
+  attempt only added a 4-second wait before reconnecting.
+
+### Fixed
+
+- The client no longer crashes with `panic: connection ID manager is closed`
+  when the connection dies while it is trying to roam to a new network path
+  (for example on wake from sleep). It now falls back to reconnecting.
+- Attaching again to a session running a full-screen app such as zellij
+  (after `Ctrl-^ .`, or from another terminal) now brings back the modes
+  the app had turned on: mouse support, bracketed paste, focus events and
+  the alternate screen. Previously the mouse stayed off until the app was
+  restarted, because apps turn these on only once at startup. Requires an
+  updated `tezzerd`.
+- Starting a new session with a command that `tezzerd` cannot find (e.g.
+  `tezzer-ssh host run -- zellij` when `zellij` is installed in a directory
+  that is not in `tezzerd`'s `PATH`, which is common under systemd) left the
+  client stuck after `connected to tezzerd` with nothing on screen. The
+  client now exits with an error that names the command and shows
+  `tezzerd`'s `PATH`. If the command is found but fails to start, the
+  client is also told and the session is closed.
+- After the client recovered from a sleep or network change by moving the
+  existing connection to a new local socket (`roaming: migrated` in the
+  log), the connection broke about 30 seconds later and the client had to
+  reconnect (`reconnecting: connection lost`). The connection now stays up.
+  A failed attempt to move the connection also no longer breaks a
+  connection that is still working.
+- `tezzer -- CMD [args]` (without `-cmd`) ran `/bin/bash CMD [args]`, so
+  bash tried to read `CMD` as a script and the session exited immediately.
+  The first argument after `--` is now the command, as the README already
+  described. `-cmd CMD -- ARGS` (the form `tezzer-ssh` uses) is unchanged.
+- The server's same-LAN candidate address (used to avoid a public-STUN
+  round-trip when client and server share a LAN) was resolved via an
+  IPv4-only route probe, so it was silently omitted on IPv6-only hosts.
+  It now falls back to an IPv6 route probe when IPv4 is unavailable
+  (unless `-ipv4-only` is set).
+- After detaching (or when the session ended) from a full-screen app such
+  as zellij, the local terminal was left in the modes the app had enabled,
+  so moving the mouse typed garbage like `^[[<35;12;5M` into the local
+  shell, and the shell kept running on the alternate screen. The client now
+  resets mouse reporting, focus events, bracketed paste, the kitty keyboard
+  protocol, application cursor/keypad modes and the alternate screen on
+  exit, before printing the exit message.
+- Pasting a large amount of text (a few hundred KB) into an app that echoes
+  its input, such as a shell, could deadlock the server: the session froze
+  and `tezzerd` stopped accepting new sessions until it was restarted. The
+  server held a session lock while writing input to the PTY, which blocks
+  until the app reads it, while the app was itself blocked waiting for the
+  server to read its echoed output.
+
 ## [0.1.1] - 2026-07-22
 
 ### Changed

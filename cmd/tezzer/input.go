@@ -21,7 +21,7 @@ func (c *Client) sendInputBytes(data []byte) error {
 	if c.readOnly {
 		if !c.roWarned {
 			c.roWarned = true
-			c.setStatusMessage("read-only attach (-peek): input is not sent")
+			c.showRequestedStatus("read-only attach (-peek): input is not sent")
 		}
 		return nil
 	}
@@ -48,6 +48,30 @@ func (c *Client) sendInputBytes(data []byte) error {
 	return nil
 }
 
+// noteSendResult は入力送信の成否を記録し、エラーログを状態変化時だけに抑える。
+// 接続断中はマウストラッキング等で端末が自動生成する ESC シーケンスが送信を試み続け、
+// 失敗ごとにログを出すと毎秒数十行で画面が崩れるため、成功→失敗の遷移で 1 行、
+// 復帰時に破棄件数を 1 行だけ出す（断中の状態は status line の Recovering 表示で分かる）。
+// handleStdin goroutine からのみ呼ぶ。
+func (c *Client) noteSendResult(kind string, n int, err error) {
+	if err != nil {
+		if !c.sendFailing {
+			c.sendFailing = true
+			log.Printf("%s send error: %v (suppressing further send errors until recovery)", kind, err)
+		}
+		c.sendDropped++
+		c.sendDroppedBytes += n
+		return
+	}
+	if c.sendFailing {
+		log.Printf("input send recovered: %d input chunk(s) (%d bytes) dropped while disconnected",
+			c.sendDropped, c.sendDroppedBytes)
+		c.sendFailing = false
+		c.sendDropped = 0
+		c.sendDroppedBytes = 0
+	}
+}
+
 // flushEscBatch はESC batchingバッファをフラッシュして送信する
 func (c *Client) flushEscBatch(reason string) {
 	if !c.escBatchActive || len(c.escBatchBuf) == 0 {
@@ -63,9 +87,7 @@ func (c *Client) flushEscBatch(reason string) {
 	}
 
 	// 送信（sendInputBytes は同期的にエンコードして返るので元バッファをそのまま渡す）
-	if err := c.sendInputBytes(c.escBatchBuf); err != nil {
-		log.Printf("ESC batch send error: %v", err)
-	}
+	c.noteSendResult("ESC batch", len(c.escBatchBuf), c.sendInputBytes(c.escBatchBuf))
 
 	// 状態リセット
 	c.escBatchActive = false
@@ -143,9 +165,7 @@ func (c *Client) flushInputBatch(reason string) {
 		}
 
 		// 送信（sendInputBytes は同期的にエンコードして返るので元バッファをそのまま渡す）
-		if err := c.sendInputBytes(sendBuf); err != nil {
-			log.Printf("Input batch send error: %v", err)
-		}
+		c.noteSendResult("Input batch", bufLen, c.sendInputBytes(sendBuf))
 	}
 
 	// 不完全な UTF-8 シーケンスがあれば次のバッチに持ち越す
@@ -319,7 +339,7 @@ func (c *Client) handleStdin() {
 						c.escapePressed = false
 						if b == '.' {
 							// エスケープキー + . でデタッチ（正常終了）
-							fmt.Fprintf(os.Stderr, "\033[?25h")
+							c.restoreTerminalModes()
 							select {
 							case c.errCh <- errDetached:
 							default:
@@ -349,7 +369,7 @@ func (c *Client) handleStdin() {
 						if b == 'q' {
 							// エスケープキー + q でセッション終了（-peek では無効）
 							if c.readOnly {
-								c.setStatusMessage("read-only attach (-peek): kill is disabled")
+								c.showRequestedStatus("read-only attach (-peek): kill is disabled")
 								continue
 							}
 							c.killSession()
@@ -364,7 +384,7 @@ func (c *Client) handleStdin() {
 							// エスケープキー + f で resize trick による強制再描画
 							// （-peek では無効: 自分の端末サイズでリモート PTY を触ってしまうため）
 							if c.readOnly {
-								c.setStatusMessage("read-only attach (-peek): server redraw is disabled")
+								c.showRequestedStatus("read-only attach (-peek): server redraw is disabled")
 								continue
 							}
 							c.requestServerRedraw()

@@ -40,6 +40,10 @@ func runCheckNAT(serverA, serverB string, ipv4Only bool) int {
 		fmt.Println()
 	}
 
+	fmt.Println("LAN candidate address (same-LAN connect shortcut, see getLocalAddr):")
+	checkLocalAddr(ipv4Only)
+	fmt.Println()
+
 	fmt.Println("Note: results reflect the outermost NAT on the path; stacked NATs (e.g. CGN)")
 	fmt.Println("      cannot be distinguished. Mapping behavior is a property of the NAT device,")
 	fmt.Println("      so it applies to tezzer's QUIC ports as well.")
@@ -94,6 +98,38 @@ func checkNATFamily(network, label, serverA, serverB string) bool {
 		fmt.Printf("                   Prefer a fixed port (-udp-port) with router port forwarding.\n")
 	}
 	return true
+}
+
+// checkLocalAddr は getLocalAddr と同じ経路解決（v4決め打ち→v6フォールバック）を
+// 両family分実行し、実際にどちらが同一LAN候補として広告されるかを表示する。
+// v4/v6-only/dualstack 環境それぞれで getLocalAddr の挙動を単発コマンドで確認できるように、
+// -check-nat の一部として提供する。
+func checkLocalAddr(ipv4Only bool) {
+	v4 := dialLocalAddr("udp4", "8.8.8.8:80")
+	if v4 != "" {
+		fmt.Printf("  IPv4 route: %s (used)\n", v4)
+	} else {
+		fmt.Printf("  IPv4 route: unavailable\n")
+	}
+
+	var v6 string
+	if ipv4Only {
+		fmt.Printf("  IPv6 route: skipped (-ipv4-only)\n")
+	} else {
+		v6 = dialLocalAddr("udp6", "[2001:4860:4860::8888]:80")
+		switch {
+		case v6 == "":
+			fmt.Printf("  IPv6 route: unavailable\n")
+		case v4 == "":
+			fmt.Printf("  IPv6 route: %s (used; IPv4 fallback)\n", v6)
+		default:
+			fmt.Printf("  IPv6 route: %s (not used; IPv4 succeeded)\n", v6)
+		}
+	}
+
+	if v4 == "" && v6 == "" {
+		fmt.Printf("  advertised:  none (clients will fall back to STUN-derived addresses only)\n")
+	}
 }
 
 // isLocalIP は ip が自ホストのインターフェースに割り当てられているかを返す。

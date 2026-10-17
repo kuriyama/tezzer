@@ -1,0 +1,4 @@
+// 設定ファイルがないと zellij は初回起動で keybinding 選択ダイアログを出すため最小設定を渡す
+show_startup_tips false
+show_release_notes false
+mouse_mode false

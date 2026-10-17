@@ -14,6 +14,7 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"net"
 )
 
@@ -289,4 +290,42 @@ type AgentForwardClient interface {
 	// SetAgentSockPath sets the local agent socket path to relay from.
 	// Call at most once, before Start(). An empty string disables -A.
 	SetAgentSockPath(path string)
+}
+
+// ErrForwardRejected is wrapped by forwarding open errors when the peer
+// explicitly refused the request (for example, its local dial failed), as
+// opposed to the stream itself failing to open. Callers use errors.Is to
+// decide whether retrying through another client is pointless.
+var ErrForwardRejected = errors.New("forward rejected by peer")
+
+// RemoteForwarder is an optional ServerTransport capability for remote port
+// forwarding (-R). The listening side lives above the transport (the session
+// manager owns the server-side listeners); the transport only reports which
+// clients offer which ports and opens relay channels towards them.
+type RemoteForwarder interface {
+	// OnRemoteForward registers the -R callbacks and enables advertising -R
+	// support. hello is called whenever a client that requests remote
+	// forwards says Hello (the first connect and every reconnect). gone is
+	// called when such a client's connection ends and no newer connection
+	// has replaced it; explicit reports that the client closed it on purpose
+	// (detach, exit) rather than being lost (sleep, network failure).
+	OnRemoteForward(hello func(client ClientID, deviceID string, ports []uint16), gone func(client ClientID, explicit bool))
+	// OpenRemoteForward opens a relay channel to client for a connection
+	// accepted on the server-side port. The client dials its own configured
+	// target for that port. ctx applies only to the open handshake.
+	OpenRemoteForward(ctx context.Context, client ClientID, port uint16) (ForwardConn, error)
+}
+
+// RemoteForwardClient is the client-side optional capability for remote
+// port forwarding (-R).
+type RemoteForwardClient interface {
+	// RemoteForwardingSupported reports whether the server advertises -R
+	// support (known once serverMeta has been received; false until then).
+	RemoteForwardingSupported() bool
+	// SetRemoteForwards sets the device ID and the targets to dial, keyed by
+	// server-side port. Call at most once, before Start().
+	SetRemoteForwards(deviceID string, targets map[uint16]string)
+	// RemoteForwardActive returns the number of relayed -R connections in
+	// progress.
+	RemoteForwardActive() int
 }

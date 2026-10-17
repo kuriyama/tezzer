@@ -33,6 +33,16 @@ const (
 	ctrlAgentOpen    ctrlType = 10 // サーバ → クライアント: agent dial 要求
 	ctrlAgentOpenOK  ctrlType = 11 // クライアント → サーバ: dial 成功、以降は生バイトの中継
 	ctrlAgentOpenErr ctrlType = 12 // クライアント → サーバ: 拒否/dial 失敗（Msg = 理由）
+
+	// アプリ層 liveness 確認（liveness.go）。control ストリーム上で使う。
+	ctrlPing ctrlType = 13 // クライアント → サーバ: 生存確認
+	ctrlPong ctrlType = 14 // サーバ → クライアント: ctrlPing への応答
+
+	// リモートフォワード（-R）用。-A と同じくサーバ → クライアントへ bidi ストリームを開く
+	// （rforward.go 参照）。dial 先はクライアントだけが知り、サーバは listen ポートだけを伝える。
+	ctrlRFwdOpen    ctrlType = 15 // サーバ → クライアント: 着信の中継要求（Port = サーバ側 listen ポート）
+	ctrlRFwdOpenOK  ctrlType = 16 // クライアント → サーバ: dial 成功、以降は生バイトの中継
+	ctrlRFwdOpenErr ctrlType = 17 // クライアント → サーバ: 拒否/dial 失敗（Msg = 理由）
 )
 
 // FeatureTCPForward is a ctrlServerMeta.Features bit: TCP port forwarding is
@@ -43,6 +53,16 @@ const FeatureTCPForward uint64 = 1 << 0
 // (-A) is supported. Not set when the server was started with
 // --no-agent-forwarding.
 const FeatureAgentForward uint64 = 1 << 1
+
+// FeatureLiveness is a ctrlServerMeta.Features bit: the server answers
+// ctrlPing with ctrlPong on the control stream. Clients only send pings to
+// servers that advertise it.
+const FeatureLiveness uint64 = 1 << 2
+
+// FeatureRemoteForward is a ctrlServerMeta.Features bit: remote port
+// forwarding (-R) is supported. Not set when the server was started with
+// --no-tcp-forwarding.
+const FeatureRemoteForward uint64 = 1 << 3
 
 const maxCtrlFrame = 1 << 20    // 1 MiB（制御メッセージなので十分すぎる上限）
 const maxOutputFrame = 16 << 20 // 16 MiB（1 PTY 読み取りチャンクの上限）
@@ -61,6 +81,11 @@ type ctrlMsg struct {
 	Rows         int      `msgpack:"y,omitempty"`
 	LastOffset   uint64   `msgpack:"o,omitempty"`  // Hello: クライアントが最後に受信した出力 offset（再同期用）
 	AgentForward bool     `msgpack:"af,omitempty"` // Hello: -A 付き起動 かつ ローカル $SSH_AUTH_SOCK が使える場合のみ true
+	// Hello: -R の登録（rforward.go）。DeviceID は同じ端末からの重複登録を束ねる識別子、
+	// RemoteForwards はサーバ側で listen してほしいポート（dial 先は送らない）。
+	DeviceID       string   `msgpack:"dv,omitempty"`
+	RemoteForwards []uint16 `msgpack:"rf,omitempty"`
+	Port           uint16   `msgpack:"p,omitempty"` // RFwdOpen: 着信したサーバ側 listen ポート
 	// サーバ → クライアント
 	BuildID    string `msgpack:"b,omitempty"`  // ServerMeta: ビルド ID
 	BuildTime  string `msgpack:"bt,omitempty"` // ServerMeta: ビルド時刻

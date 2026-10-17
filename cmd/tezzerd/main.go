@@ -13,6 +13,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strconv"
 	"sync"
@@ -41,7 +42,13 @@ func main() {
 	maxSessions := flag.Int("max-sessions", 0, "maximum number of active sessions (0 = unlimited)")
 	checkNAT := flag.Bool("check-nat", false, "run a one-shot NAT diagnosis (mapping behavior, port preservation) and exit")
 	stunServer2 := flag.String("stun-server2", "stun.cloudflare.com:3478", "second STUN server for -check-nat (mapping comparison needs two servers)")
+	showVersion := flag.Bool("version", false, "print version and build information and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version.String("tezzerd"))
+		return
+	}
 
 	// -check-nat はデーモンを起動せず診断だけして終了する。
 	if *checkNAT {
@@ -95,6 +102,12 @@ func main() {
 		if err := mgr.InitSharedTransport(*udpPort, *ipv4Only); err != nil {
 			log.Fatalf("failed to initialize shared QUIC transport: %v", err)
 		}
+	}
+	if !mgr.IsSharedTransportEnabled() {
+		// 固定ポート＋ポート転送のつもりが引数なしで起動されていた（tezzer-ssh の自動起動等）
+		// ケースを tezzerd.log から即座に気づけるよう、モードを明示する。
+		log.Printf("QUIC: per-session mode (no --udp-port): each session listens on a random UDP port; " +
+			"behind NAT port forwarding, start tezzerd with --udp-port <forwarded port>")
 	}
 
 	// デフォルトでUnix Socketを使用
@@ -312,8 +325,9 @@ func handleConnection(rawConn net.Conn, mgr *session.Manager, stunServer string,
 			sessInfos[i] = sessionProtoInfo(s)
 		}
 		listMsg := proto.SessionsListMsg{
-			Type:     "SESSIONS_LIST",
-			Sessions: sessInfos,
+			Type:           "SESSIONS_LIST",
+			Sessions:       sessInfos,
+			RemoteForwards: mgr.RemoteForwards(),
 		}
 		listData, err := msgpack.Marshal(listMsg)
 		if err != nil {
@@ -352,6 +366,18 @@ func handleConnection(rawConn net.Conn, mgr *session.Manager, stunServer string,
 		killSessionAndRespond(conn, mgr, m.SessionID)
 		return
 
+	case *proto.GetServerMetaMsg:
+		// セッションに attach せずサーバー情報だけを返す（tezzer -server-version）
+		metaData, err := msgpack.Marshal(serverMetaMsg(mgr))
+		if err != nil {
+			log.Printf("marshal server meta error: %v", err)
+			return
+		}
+		if err := conn.WriteFrame(metaData); err != nil {
+			log.Printf("write server meta error: %v", err)
+		}
+		return
+
 	case *proto.WaitSessionMsg:
 		// セッションのコマンド終了を待つ（-wait）
 		waitSessionAndRespond(conn, mgr, m.SessionID)
@@ -364,8 +390,12 @@ func handleConnection(rawConn net.Conn, mgr *session.Manager, stunServer string,
 				return
 			}
 		}
-		log.Printf("creating session: cmd=%s args=%v name=%q", m.Cmd, m.Args, m.Name)
-		sess, err = mgr.CreateSession(m.Name, m.Cmd, m.Args, m.Env, m.Cwd, m.Rows, m.Cols, ipv4Only, fixedUDPPort, m.AgentForward)
+		cmd := m.Cmd
+		if m.LoginShell {
+			cmd = session.LoginShell()
+		}
+		log.Printf("creating session: cmd=%s args=%v name=%q", cmd, m.Args, m.Name)
+		sess, err = mgr.CreateSession(m.Name, cmd, m.Args, m.Env, m.Cwd, m.Rows, m.Cols, ipv4Only, fixedUDPPort, m.AgentForward)
 		if err != nil {
 			log.Printf("create session error: %v", err)
 			if errors.Is(err, session.ErrDuplicateName) {
@@ -376,20 +406,30 @@ func handleConnection(rawConn net.Conn, mgr *session.Manager, stunServer string,
 				sendError(conn, proto.ErrTooManySessions, err.Error())
 				return
 			}
-			sendError(conn, proto.ErrInternal, fmt.Sprintf("failed to create session: %v", err))
+			msg := fmt.Sprintf("failed to create session: %v", err)
+			if errors.Is(err, exec.ErrNotFound) {
+				// systemd 等で起動した tezzerd の PATH はログインシェルより狭いことが多い
+				msg += fmt.Sprintf(" (tezzerd PATH=%s; give an absolute path or add the directory to tezzerd's PATH)", os.Getenv("PATH"))
+			}
+			sendError(conn, proto.ErrInternal, msg)
 			return
 		}
+		if m.LoginShell {
+			// ssh と同様にログインシェルとして起動する（argv[0] を "-zsh" 等に、cwd は $HOME）
+			sess.UseLoginShell()
+		}
 
-		stunAddrs, localAddr := resolveUDPAddrs(sess, stunServer, ipv4Only)
+		stunAddrs, localAddrs := resolveUDPAddrs(sess, stunServer, ipv4Only)
 
 		createdMsg := proto.SessionCreatedMsg{
 			Type:       "SESSION_CREATED",
 			SessionID:  sess.ID,
+			Name:       sess.Name,
 			UDPEnabled: sess.IsQUICEnabled(),
 			UDPPort:    sess.GetQUICPort(),
 			UDPKey:     sess.GetQUICKey(),
 			STUNAddrs:  stunAddrs,
-			LocalAddr:  localAddr,
+			LocalAddrs: localAddrs,
 			STUNServer: stunServer,
 		}
 
@@ -418,7 +458,11 @@ func handleConnection(rawConn net.Conn, mgr *session.Manager, stunServer string,
 			select {
 			case <-sess.QuicReadyCh():
 				if err := sess.StartProcess(); err != nil {
+					// ログだけだとクライアントは何も表示されないまま止まるので、
+					// 通知してセッションを閉じる（Close が QUIC 経由で sessionGone も送る）。
 					log.Printf("session %s: start process error: %v", sess.ID, err)
+					sendError(conn, proto.ErrInternal, fmt.Sprintf("failed to start %s: %v", sess.Cmd, err))
+					sess.Close()
 				}
 			case <-sess.Done():
 				// 他経路（detach・kill 等）で既に Close 済み。タイムアウト処理は不要。
@@ -449,18 +493,20 @@ func handleConnection(rawConn net.Conn, mgr *session.Manager, stunServer string,
 		client = sess.AttachClient(m.FromSeq, protocol, remoteAddr, m.ClientID)
 
 		// Send SESSION_CREATED (attach成功の通知として)
-		stunAddrs, localAddr := resolveUDPAddrs(sess, stunServer, ipv4Only)
+		stunAddrs, localAddrs := resolveUDPAddrs(sess, stunServer, ipv4Only)
 
 		attachedMsg := proto.SessionCreatedMsg{
 			Type:       "SESSION_CREATED",
 			SessionID:  sess.ID,
+			Name:       sess.Name,
 			UDPEnabled: sess.IsQUICEnabled(),
 			UDPPort:    sess.GetQUICPort(),
 			UDPKey:     sess.GetQUICKey(),
 			STUNAddrs:  stunAddrs,
-			LocalAddr:  localAddr,
+			LocalAddrs: localAddrs,
 			STUNServer: stunServer,
 			PTYClosed:  sess.IsPTYClosed(),
+			TermModes:  sess.TermModeRestore(),
 		}
 
 		attachedData, err := msgpack.Marshal(attachedMsg)
@@ -575,15 +621,7 @@ func handleConnection(rawConn net.Conn, mgr *session.Manager, stunServer string,
 
 		case *proto.GetServerMetaMsg:
 			// サーバーのメタ情報を返す
-			serverInstanceID := mgr.GetServerInstanceID()
-			metaMsg := proto.ServerMetaMsg{
-				Type:             "SERVER_META",
-				ServerBuildID:    version.GetVersion(),
-				ServerBuildTime:  version.GetBuildTime(),
-				ServerInstanceID: serverInstanceID[:],
-			}
-
-			metaData, err := msgpack.Marshal(metaMsg)
+			metaData, err := msgpack.Marshal(serverMetaMsg(mgr))
 			if err != nil {
 				log.Printf("marshal server meta error: %v", err)
 				continue
@@ -786,9 +824,22 @@ func waitSessionAndRespond(conn *udsConn, mgr *session.Manager, sessionID string
 	}
 }
 
-// resolveUDPAddrs はセッションのSTUNアドレス候補（IPv4/IPv6、取得できた分）と
-// ローカルアドレスを解決する。初回接続の候補を増やすため両familyを問い合わせる。
-func resolveUDPAddrs(sess *session.Session, stunServer string, ipv4Only bool) (stunAddrs []string, localAddr string) {
+// resolveUDPAddrs はセッションのSTUNアドレス候補・ローカルアドレス候補
+// （いずれもIPv4/IPv6、取得できた分すべて）を解決する。初回接続の候補を
+// 増やすため両familyを問い合わせる。
+// serverMetaMsg は GET_SERVER_META への応答を組み立てる。
+func serverMetaMsg(mgr *session.Manager) proto.ServerMetaMsg {
+	serverInstanceID := mgr.GetServerInstanceID()
+	return proto.ServerMetaMsg{
+		Type:             "SERVER_META",
+		ServerBuildID:    version.GetVersion(),
+		ServerBuildTime:  version.GetBuildTime(),
+		ServerInstanceID: serverInstanceID[:],
+		ServerVersion:    version.Version,
+	}
+}
+
+func resolveUDPAddrs(sess *session.Session, stunServer string, ipv4Only bool) (stunAddrs, localAddrs []string) {
 	if !sess.IsQUICEnabled() {
 		return
 	}
@@ -804,8 +855,8 @@ func resolveUDPAddrs(sess *session.Session, stunServer string, ipv4Only bool) (s
 		}
 	}
 
-	if localIP := getLocalAddr(); localIP != "" {
-		localAddr = fmt.Sprintf("%s:%d", localIP, sess.GetQUICPort())
+	for _, ip := range getLocalAddrs(ipv4Only) {
+		localAddrs = append(localAddrs, net.JoinHostPort(ip, strconv.Itoa(sess.GetQUICPort())))
 	}
 	return
 }
@@ -837,11 +888,26 @@ func queryStunMappedIP(sessID, network, stunServer string) net.IP {
 	return mappedAddr.IP
 }
 
-// getLocalAddr は優先的なローカルIPアドレスを取得
-// LAN内接続時にクライアントが使用できるアドレスを返す
-func getLocalAddr() string {
-	// UDP接続を使ってローカルアドレスを特定（実際には接続しない）
-	conn, err := net.Dial("udp", "8.8.8.8:80")
+// getLocalAddrs はLAN内接続時にクライアントが使用できるローカルIPアドレスを
+// family別に取得する（STUNAddrsと同様、生きている分すべてを返す）。
+// ipv4Only指定時はIPv4のみ試す。
+func getLocalAddrs(ipv4Only bool) []string {
+	var addrs []string
+	if ip := dialLocalAddr("udp4", "8.8.8.8:80"); ip != "" {
+		addrs = append(addrs, ip)
+	}
+	if !ipv4Only {
+		if ip := dialLocalAddr("udp6", "[2001:4860:4860::8888]:80"); ip != "" {
+			addrs = append(addrs, ip)
+		}
+	}
+	return addrs
+}
+
+// dialLocalAddr は指定networkでUDP接続を張り（実際には接続しない）、
+// targetへの経路としてOSが選ぶローカルIPアドレスを返す。失敗時は空文字列。
+func dialLocalAddr(network, target string) string {
+	conn, err := net.Dial(network, target)
 	if err != nil {
 		return ""
 	}

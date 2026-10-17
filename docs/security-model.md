@@ -81,6 +81,47 @@ connection; the server dials the target on behalf of the client.
 - **Limits and audit.** At most 64 concurrent forwarded connections per client
   (excess is rejected); dial targets are always logged server-side.
 
+## Remote port forwarding (`-R`)
+
+`tezzer -R [bind:]port:host:hostport` makes tezzerd listen on the server's
+loopback and relay each connection to the client, which dials the target from
+its own machine.
+
+- **Same exposure as `ssh -R`.** The server-side listener binds only to
+  loopback (127.0.0.1 and ::1), but **any local user on the server host can
+  connect to it**. For a Chrome DevTools Protocol port that means full control
+  of the browser profile on the client machine (cookies, logged-in sessions).
+  Use `-R` only on hosts where you trust the other local users, as you would
+  with `ssh -R`. It is disabled together with `-L` by
+  `tezzerd --no-tcp-forwarding`.
+- **The server cannot choose the client's dial target.** The server only tells
+  the client which of its ports received a connection; the client dials the
+  target from its own `-R` definition and refuses ports it did not define.
+- **Device ID is not authentication.** Clients send a device ID so the server
+  can group clients of the same machine and refuse the same port from another
+  machine. Claiming another machine's ID requires K, and anyone holding K can
+  already run anything in the session, so spoofing adds no capability. The
+  full ID is never displayed (logs and `-list` show its first 8 characters).
+- **Device ID and privacy.** The ID is a hash of a random secret kept in
+  `~/.tezzer/device-id` (mode 0600) and the hostname; neither the secret nor
+  the hostname leaves the machine, and nothing hardware-derived is used.
+  It is sent only to servers you use `-R` with, inside the encrypted QUIC
+  handshake; the server keeps it in memory only (not on disk, not across
+  restarts) and does not accept IDs longer than 64 bytes. Because it is
+  stable, administrators of two servers you use `-R` with could tell that the
+  connections came from the same machine — but those servers already see your
+  IP address and SSH public key, which link you far more strongly. Delete the
+  file to get a new ID.
+- **Shared or cloned home directories.** Mixing in the hostname keeps machines
+  that share a home directory (NFS, roaming profiles, dotfile sync, a restore
+  onto another machine) from being treated as one device, which would relay
+  connections to the wrong machine. A clone that also keeps the hostname (a
+  whole-VM copy) still shares the ID; delete `~/.tezzer/device-id` on the
+  clone.
+- **Limits and audit.** At most 16 `-R` per client and 64 concurrent relayed
+  connections per port; the server logs each accepted connection and the
+  client it is relayed to.
+
 ## The QUIC listen port — pre-auth traffic exists
 
 The UDP/QUIC port accepts unauthenticated packets before the handshake completes
