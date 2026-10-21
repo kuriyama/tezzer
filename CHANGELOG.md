@@ -8,6 +8,24 @@ once it reaches a 1.0 release.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-21
+
+### Changed
+
+- **Incompatible with 0.2.0 and earlier releases:** the QUIC ALPN identifier
+  of release binaries changes from `github.com/kuriyama/tezzer/1` to
+  `tezzer/1`, the identifier the source has always declared (the release
+  build rewrote it by mistake). A client and a `tezzerd` from either side of
+  this change cannot connect — the handshake fails with `CRYPTO_ERROR 0x178`
+  (`no application protocol`) — so upgrade both ends together.
+
+### Fixed
+
+- Release binaries (GitHub Releases / Homebrew) now carry their version and
+  build time: `-version` showed `dev` and the commit time instead of the
+  release version and build time, because the build-time variables were not
+  set when building from the public module path.
+
 ## [0.2.0] - 2026-10-17
 
 ### Added

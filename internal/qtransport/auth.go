@@ -23,7 +23,7 @@ import (
 )
 
 // ALPN is the application protocol identifier of tezzer QUIC.
-const ALPN = "github.com/kuriyama/tezzer/1"
+const ALPN = "tezzer/1"
 
 const (
 	labelServerIdentity = "tezzer server identity"

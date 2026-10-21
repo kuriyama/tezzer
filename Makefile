@@ -19,7 +19,10 @@ GIT_DIRTY := $(shell git diff --quiet HEAD -- 2>/dev/null || echo -dirty)
 # -s -w: シンボルテーブルと DWARF デバッグ情報を除去（バイナリを約 1/3 削減）。
 # デバッグビルドが必要な場合は make build STRIP= で無効化できる。
 STRIP := -s -w
-LDFLAGS := $(STRIP) -X tezzer/internal/version.Version=$(VERSION) -X tezzer/internal/version.GitCommit=$(GIT_COMMIT)$(GIT_DIRTY) -X tezzer/internal/version.BuildTime=$(BUILD_TIME)
+# -X の対象パスは go.mod から取る。publish.sh が公開ツリーの module パスを書き換えるため、
+# 固定で書くと公開ツリーでは存在しないシンボル指定になり、go build は黙って無視する。
+MODULE := $(shell go list -m)
+LDFLAGS := $(STRIP) -X $(MODULE)/internal/version.Version=$(VERSION) -X $(MODULE)/internal/version.GitCommit=$(GIT_COMMIT)$(GIT_DIRTY) -X $(MODULE)/internal/version.BuildTime=$(BUILD_TIME)
 
 .PHONY: build dist test test-race vet fmt fmt-check ci ci-nightly e2e e2e-docker test-chaos deadcode dupl clean install
 
