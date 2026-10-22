@@ -8,6 +8,18 @@ once it reaches a 1.0 release.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-22
+
+### Changed
+
+- Building from source now requires Go 1.26 or newer, and release binaries
+  are built with Go 1.26. Go 1.25 no longer receives security fixes; this
+  picks up the standard-library fixes for GO-2026-6607 (crypto/tls) and
+  GO-2026-6809 (crypto/x509).
+- Dependencies updated: quic-go v0.64.1, golang.org/x/crypto v0.58.0,
+  golang.org/x/net v0.61.0, golang.org/x/sys v0.49.0, golang.org/x/term
+  v0.47.0, and creack/pty v1.1.24.
+
 ## [0.2.1] - 2026-10-21
 
 ### Changed

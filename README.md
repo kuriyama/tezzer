@@ -90,7 +90,7 @@ cd tezzer
 make build
 ```
 
-This produces `bin/tezzerd` (server) and `bin/tezzer` (client). Requires Go 1.25+.
+This produces `bin/tezzerd` (server) and `bin/tezzer` (client). Requires Go 1.26+.
 
 Optionally install them, along with the SSH wrapper:
 

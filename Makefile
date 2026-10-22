@@ -65,7 +65,7 @@ ifneq ($(shell command -v nfpm),)
 	$(call dist_pkg,arm64)
 else
 	@echo "nfpm が見つからないため deb/rpm 生成をスキップ" \
-		"(go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.46.3)"
+		"(go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.48.0)"
 endif
 	rm -rf dist/.nfpm dist/tezzer_linux_amd64 dist/tezzer_linux_arm64 dist/tezzer_darwin_amd64 dist/tezzer_darwin_arm64 dist/tezzer_freebsd_amd64 dist/tezzer_freebsd_arm64
 	cd dist && sha256sum tezzer* > SHA256SUMS

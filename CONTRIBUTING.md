@@ -10,7 +10,7 @@ you are expected to uphold it.
 
 ## Prerequisites
 
-- Go 1.25 or newer
+- Go 1.26 or newer
 - A POSIX environment (Linux or macOS). tezzer uses PTYs and Unix domain sockets.
 
 ## Build
