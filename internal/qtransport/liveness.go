@@ -76,7 +76,7 @@ func (c *quicClient) livenessTarget() (conn *quic.Conn, addr string, alts []stri
 		return nil, "", nil
 	}
 	c.migrateMu.Lock()
-	conn, addr = c.conn, c.connAddr
+	conn, addr = c.conn.Load(), c.connAddr
 	c.migrateMu.Unlock()
 	alts = otherFamilyCandidates(c.currentCandidates(), addr)
 	if conn == nil || len(alts) == 0 {

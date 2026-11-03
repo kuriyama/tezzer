@@ -65,11 +65,6 @@ type ResizeMsg struct {
 	Rows      int    `msgpack:"rows"`
 }
 
-type PingMsg struct {
-	Type  string `msgpack:"type"`
-	Nonce uint64 `msgpack:"nonce"`
-}
-
 type ListSessionsMsg struct {
 	Type string `msgpack:"type"`
 }
@@ -157,11 +152,6 @@ type ErrorMsg struct {
 	Message string `msgpack:"message"`
 }
 
-type PongMsg struct {
-	Type  string `msgpack:"type"`
-	Nonce uint64 `msgpack:"nonce"`
-}
-
 // OutputMsg carries the raw byte stream of PTY output.
 type OutputMsg struct {
 	Type      string `msgpack:"type"`
@@ -181,12 +171,11 @@ type NoteMsg struct {
 
 // ClientInfo describes one connected client.
 type ClientInfo struct {
-	ID             string   `msgpack:"id"`
-	Protocol       string   `msgpack:"protocol"`                   // "UDS", "TCP", "UDP"
-	RemoteAddr     string   `msgpack:"remote_addr,omitempty"`      // remote address (TCP/UDP)
-	QUICRemoteAddr string   `msgpack:"quic_remote_addr,omitempty"` // current QUIC remote address (may change with migration)
-	UDPClientID    uint16   `msgpack:"udp_client_id,omitempty"`    // QUIC client identifier (legacy field name)
-	UDPAddresses   []string `msgpack:"udp_addresses,omitempty"`    // list of UDP addresses (IP:port; legacy, unset by current servers)
+	ID             string `msgpack:"id"`
+	Protocol       string `msgpack:"protocol"`                   // "UDS", "TCP", "UDP"
+	RemoteAddr     string `msgpack:"remote_addr,omitempty"`      // remote address (TCP/UDP)
+	QUICRemoteAddr string `msgpack:"quic_remote_addr,omitempty"` // current QUIC remote address (may change with migration)
+	UDPClientID    uint16 `msgpack:"udp_client_id,omitempty"`    // QUIC client identifier (legacy field name)
 	// Send statistics (QUIC connections only).
 	SendBufferBytes int   `msgpack:"send_buffer_bytes,omitempty"` // bytes sent
 	LastSeen        int64 `msgpack:"last_seen,omitempty"`         // last send/receive time (Unix seconds)
@@ -218,8 +207,7 @@ type SessionInfo struct {
 	UDPPort     int          `msgpack:"udp_port,omitempty"` // session's UDP listening port
 	PTYClosed   bool         `msgpack:"pty_closed,omitempty"`
 	// Detach tracking.
-	LastDetachedAt int64  `msgpack:"last_detached_at,omitempty"` // when the client count last dropped to 0 (Unix seconds)
-	LastUDPAddr    string `msgpack:"last_udp_addr,omitempty"`    // last valid UDP source IP (legacy, unset by current servers)
+	LastDetachedAt int64 `msgpack:"last_detached_at,omitempty"` // when the client count last dropped to 0 (Unix seconds)
 	// Freshness: the session's last PTY output/input times (Unix seconds).
 	// Updated regardless of whether any client is attached (unlike
 	// ClientInfo.LastSeen).
@@ -286,6 +274,30 @@ func Encode(msg interface{}) ([]byte, error) {
 	return msgpack.Marshal(msg)
 }
 
+// newMsg maps a "type" field value to a constructor for its message struct.
+var newMsg = map[string]func() any{
+	"HELLO":            func() any { return new(HelloMsg) },
+	"CREATE_SESSION":   func() any { return new(CreateSessionMsg) },
+	"ATTACH_SESSION":   func() any { return new(AttachSessionMsg) },
+	"INPUT":            func() any { return new(InputMsg) },
+	"RESIZE":           func() any { return new(ResizeMsg) },
+	"LIST_SESSIONS":    func() any { return new(ListSessionsMsg) },
+	"GET_SESSION_INFO": func() any { return new(GetSessionInfoMsg) },
+	"KILL_SESSION":     func() any { return new(KillSessionMsg) },
+	"WAIT_SESSION":     func() any { return new(WaitSessionMsg) },
+	"UDP_CLIENT_INFO":  func() any { return new(UDPClientInfoMsg) },
+	"GET_SERVER_META":  func() any { return new(GetServerMetaMsg) },
+	"WELCOME":          func() any { return new(WelcomeMsg) },
+	"SESSION_CREATED":  func() any { return new(SessionCreatedMsg) },
+	"ERROR":            func() any { return new(ErrorMsg) },
+	"NOTE":             func() any { return new(NoteMsg) },
+	"SESSIONS_LIST":    func() any { return new(SessionsListMsg) },
+	"SESSION_INFO":     func() any { return new(SessionInfoMsg) },
+	"SESSION_KILLED":   func() any { return new(SessionKilledMsg) },
+	"SERVER_META":      func() any { return new(ServerMetaMsg) },
+	"OUTPUT":           func() any { return new(OutputMsg) },
+}
+
 // Decode decodes msgpack bytes into a message based on "type" field
 func Decode(data []byte) (interface{}, error) {
 	// First decode just the type field
@@ -293,144 +305,16 @@ func Decode(data []byte) (interface{}, error) {
 	if err := msgpack.Unmarshal(data, &base); err != nil {
 		return nil, err
 	}
-
-	// Then decode the full message based on type
-	switch base.Type {
-	case "HELLO":
-		var m HelloMsg
-		if err := msgpack.Unmarshal(data, &m); err != nil {
-			return nil, err
-		}
-		return &m, nil
-	case "CREATE_SESSION":
-		var m CreateSessionMsg
-		if err := msgpack.Unmarshal(data, &m); err != nil {
-			return nil, err
-		}
-		return &m, nil
-	case "ATTACH_SESSION":
-		var m AttachSessionMsg
-		if err := msgpack.Unmarshal(data, &m); err != nil {
-			return nil, err
-		}
-		return &m, nil
-	case "INPUT":
-		var m InputMsg
-		if err := msgpack.Unmarshal(data, &m); err != nil {
-			return nil, err
-		}
-		return &m, nil
-	case "RESIZE":
-		var m ResizeMsg
-		if err := msgpack.Unmarshal(data, &m); err != nil {
-			return nil, err
-		}
-		return &m, nil
-	case "PING":
-		var m PingMsg
-		if err := msgpack.Unmarshal(data, &m); err != nil {
-			return nil, err
-		}
-		return &m, nil
-	case "LIST_SESSIONS":
-		var m ListSessionsMsg
-		if err := msgpack.Unmarshal(data, &m); err != nil {
-			return nil, err
-		}
-		return &m, nil
-	case "GET_SESSION_INFO":
-		var m GetSessionInfoMsg
-		if err := msgpack.Unmarshal(data, &m); err != nil {
-			return nil, err
-		}
-		return &m, nil
-	case "KILL_SESSION":
-		var m KillSessionMsg
-		if err := msgpack.Unmarshal(data, &m); err != nil {
-			return nil, err
-		}
-		return &m, nil
-	case "WAIT_SESSION":
-		var m WaitSessionMsg
-		if err := msgpack.Unmarshal(data, &m); err != nil {
-			return nil, err
-		}
-		return &m, nil
-	case "UDP_CLIENT_INFO":
-		var m UDPClientInfoMsg
-		if err := msgpack.Unmarshal(data, &m); err != nil {
-			return nil, err
-		}
-		return &m, nil
-	case "GET_SERVER_META":
-		var m GetServerMetaMsg
-		if err := msgpack.Unmarshal(data, &m); err != nil {
-			return nil, err
-		}
-		return &m, nil
-	case "WELCOME":
-		var m WelcomeMsg
-		if err := msgpack.Unmarshal(data, &m); err != nil {
-			return nil, err
-		}
-		return &m, nil
-	case "SESSION_CREATED":
-		var m SessionCreatedMsg
-		if err := msgpack.Unmarshal(data, &m); err != nil {
-			return nil, err
-		}
-		return &m, nil
-	case "ERROR":
-		var m ErrorMsg
-		if err := msgpack.Unmarshal(data, &m); err != nil {
-			return nil, err
-		}
-		return &m, nil
-	case "PONG":
-		var m PongMsg
-		if err := msgpack.Unmarshal(data, &m); err != nil {
-			return nil, err
-		}
-		return &m, nil
-	case "NOTE":
-		var m NoteMsg
-		if err := msgpack.Unmarshal(data, &m); err != nil {
-			return nil, err
-		}
-		return &m, nil
-	case "SESSIONS_LIST":
-		var m SessionsListMsg
-		if err := msgpack.Unmarshal(data, &m); err != nil {
-			return nil, err
-		}
-		return &m, nil
-	case "SESSION_INFO":
-		var m SessionInfoMsg
-		if err := msgpack.Unmarshal(data, &m); err != nil {
-			return nil, err
-		}
-		return &m, nil
-	case "SESSION_KILLED":
-		var m SessionKilledMsg
-		if err := msgpack.Unmarshal(data, &m); err != nil {
-			return nil, err
-		}
-		return &m, nil
-	case "SERVER_META":
-		var m ServerMetaMsg
-		if err := msgpack.Unmarshal(data, &m); err != nil {
-			return nil, err
-		}
-		return &m, nil
-	case "OUTPUT":
-		var m OutputMsg
-		if err := msgpack.Unmarshal(data, &m); err != nil {
-			return nil, err
-		}
-		return &m, nil
-	default:
+	ctor, ok := newMsg[base.Type]
+	if !ok {
 		return nil, fmt.Errorf("unknown message type: %s", base.Type)
 	}
+	// Then decode the full message into the struct for that type
+	m := ctor()
+	if err := msgpack.Unmarshal(data, m); err != nil {
+		return nil, err
+	}
+	return m, nil
 }
 
 // Error codes
@@ -438,7 +322,6 @@ const (
 	ErrBadRequest      = "BAD_REQUEST"
 	ErrNoSuchSession   = "NO_SUCH_SESSION"
 	ErrInternal        = "INTERNAL"
-	ErrBusy            = "BUSY"
 	ErrUnauthorized    = "UNAUTHORIZED"      // authentication failure
 	ErrDuplicateName   = "DUPLICATE_NAME"    // an active session with the same name already exists
 	ErrTooManySessions = "TOO_MANY_SESSIONS" // active session count reached the --max-sessions limit

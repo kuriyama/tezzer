@@ -71,12 +71,7 @@ func (c *Client) handleServer() {
 		default:
 		}
 
-		// 接続を取得（ロックして即座に解放）
-		c.connMu.Lock()
-		conn := c.conn
-		c.connMu.Unlock()
-
-		frameData, err := netx.ReadFrame(conn)
+		frameData, err := netx.ReadFrame(c.conn)
 		if err != nil {
 			// doneが閉じている場合は、ユーザーが意図的に切断したのでメッセージ不要
 			select {
@@ -95,11 +90,7 @@ func (c *Client) handleServer() {
 			}
 
 			// QUIC 無効時はクライアント全体を異常終了
-			select {
-			case c.errCh <- fmt.Errorf("UDS read error: %w", err):
-			default:
-			}
-			c.doneOnce.Do(func() { close(c.done) })
+			c.finish(fmt.Errorf("UDS read error: %w", err))
 			return
 		}
 
@@ -137,11 +128,7 @@ func (c *Client) handleServer() {
 			if m.Code == "QUIC_TIMEOUT" {
 				errMsg = fmt.Errorf("%v\n(check that UDP between this host and the server is not blocked)", errMsg)
 			}
-			select {
-			case c.errCh <- errMsg:
-			default:
-			}
-			c.doneOnce.Do(func() { close(c.done) })
+			c.finish(errMsg)
 			return
 
 		case *proto.NoteMsg:
@@ -168,7 +155,7 @@ func (c *Client) handleServer() {
 					c.restoreTerminalModes()
 					fmt.Fprintf(os.Stderr, "\r\n[Tezzer] Session closed: %s\r\n", m.Msg)
 				}
-				c.doneOnce.Do(func() { close(c.done) })
+				c.finish(nil)
 				return
 			}
 

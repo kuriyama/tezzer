@@ -15,9 +15,12 @@ jobs:
       TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
     steps:
       - uses: actions/checkout@v7
+      # check-latest: 既定ではランナーにキャッシュ済みの Go を使い、最新パッチに遅れることがある
+      # （v0.2.2 は 1.26.10 公開後なのに 1.26.9 でビルドされた）。
       - uses: actions/setup-go@v6
         with:
           go-version: '1.26'
+          check-latest: true
       - run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.48.0
       - run: make dist DIST_VERSION=${GITHUB_REF_NAME#v}
       - uses: actions/attest@v4

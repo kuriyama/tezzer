@@ -62,10 +62,7 @@ func setupAgentPair(t *testing.T, agentForwardingEnabled bool, clientSockPath st
 	}
 	addr := srv.Addr().String()
 
-	cliT, err := NewClient(k, addr, 1, "sess1")
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
+	cliT := NewClient(k, addr, 1, "sess1")
 	t.Cleanup(func() { cliT.Close() })
 	cli := cliT.(*quicClient)
 	if clientSockPath != "" {
@@ -190,10 +187,7 @@ func TestAgent_ProviderHandoffOnDisconnect(t *testing.T) {
 	addr := srv.Addr().String()
 
 	// 1台目: provider として接続。
-	cli1T, err := NewClient(k, addr, 1, "sess1")
-	if err != nil {
-		t.Fatalf("NewClient(1): %v", err)
-	}
+	cli1T := NewClient(k, addr, 1, "sess1")
 	cli1 := cli1T.(*quicClient)
 	cli1.SetAgentSockPath(sockPath)
 	if err := cli1.Start(ctx); err != nil {
@@ -205,10 +199,7 @@ func TestAgent_ProviderHandoffOnDisconnect(t *testing.T) {
 	}
 
 	// 2台目: 同じセッションに別クライアントとして -A 付きで attach。
-	cli2T, err := NewClient(k, addr, 2, "sess1")
-	if err != nil {
-		t.Fatalf("NewClient(2): %v", err)
-	}
+	cli2T := NewClient(k, addr, 2, "sess1")
 	t.Cleanup(func() { cli2T.Close() })
 	cli2 := cli2T.(*quicClient)
 	cli2.SetAgentSockPath(sockPath)

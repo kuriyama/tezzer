@@ -211,9 +211,7 @@ func (c *quicClient) OpenForward(ctx context.Context, target string) (transport.
 	if !c.ForwardingSupported() {
 		return nil, errors.New("server does not advertise TCP forwarding (old server or --no-tcp-forwarding)")
 	}
-	c.migrateMu.Lock()
-	conn := c.conn
-	c.migrateMu.Unlock()
+	conn := c.conn.Load()
 	if conn == nil || conn.Context().Err() != nil {
 		return nil, errors.New("not connected")
 	}

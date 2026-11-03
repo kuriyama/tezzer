@@ -14,6 +14,8 @@ import (
 	"log"
 	"net"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -36,14 +38,19 @@ type Client struct {
 	sessionID   string
 	sessionName string // -name のセッション名（Ctrl-^ i 表示用。無名・不明なら空）
 	termFd      int
-	width       int
-	height      int
 	done        chan struct{}
-	doneOnce    sync.Once // doneチャネルを1回だけcloseするため
+	doneOnce    sync.Once // done を 1 回だけ close する（finish 経由）
+	// exitErr は終了理由（nil = 正常終了）。finish が done の close 前に 1 回だけ書くので、
+	// <-done の後なら無ロックで読める
+	exitErr error
 	// QUIC トランスポート（nil の場合は UDS のみ）。startQUICTransport（メイン goroutine）が
 	// 書き、handleServer/handleStdin など別 goroutine が読むため ctMu で保護する。
 	ct   transport.ClientTransport
 	ctMu sync.RWMutex
+	// quicClientID は QUIC の client 識別子。最初の startQUICTransport で作り、バックグラウンド
+	// 再試行でも使い回す（試行ごとに作るとサーバの配信先リストに使われない ID が積もる）。
+	// startQUICTransport は初回の後に再試行 goroutine から順に呼ばれるだけなので、ロックは不要。
+	quicClientID uint16
 
 	escapeByte    byte          // エスケープキーのバイト値
 	ipv4Only      bool          // IPv4のみ使用する場合true
@@ -78,7 +85,6 @@ type Client struct {
 	rttHistoryMu sync.Mutex
 	rttHistory   []float64
 
-	errCh                 chan error  // 異常終了通知用（バッファ1）
 	killing               atomic.Bool // Ctrl-^ q による kill 処理中（sessionGone をエラー扱いしない）
 	sessionClosedNotified atomic.Bool // SESSION_CLOSED 表示済みフラグ（UDS/QUIC どちらが先着しても一度だけ表示）
 	// セッションプロセスの終了コード（-1 = 未受信）。SESSION_CLOSED 通知
@@ -101,16 +107,17 @@ type Client struct {
 	logFile *os.File
 	fileLog *fileLogger
 
-	udsAddr string     // UDS接続先アドレス
-	connMu  sync.Mutex // conn更新時のロック
+	// udsWriteMu は UDS（conn）への書き込みを直列化する。conn 自体は作成時に決まり不変
+	// （読み取りは handleServer だけなのでロック不要）。送信は sendUDS を通す
+	udsWriteMu sync.Mutex
 
 	// 初期ステータスメッセージ（接続直後に表示）
 	initialStatusMsg string
 
 	// ESC batching用（カーソルキー等の複数バイト入力をまとめる）
-	escBatchActive bool
-	escBatchBuf    []byte
-	escBatchStart  time.Time
+	// escBatchBuf が非空 = ESC batching 中
+	escBatchBuf   []byte
+	escBatchStart time.Time
 
 	// 通常入力batching用（ペースト時にまとめて送信）
 	inputBatchBuf   []byte
@@ -168,11 +175,22 @@ func (c *Client) transport() transport.ClientTransport {
 	return c.ct
 }
 
-// setTransport は QUIC トランスポートを設定する。
-func (c *Client) setTransport(t transport.ClientTransport) {
+// setTransport は QUIC トランスポートを設定する。終了処理が始まっていたら（done 済み）
+// 設定せずに t を閉じて false を返す。バックグラウンド再試行の確立が終了と重なったとき、
+// 終了処理が transport なしと判断した後に設定されると、誰にも閉じられずサーバに意図した
+// 終了が伝わらない（-R の listener が休眠扱いで残る）ため。
+func (c *Client) setTransport(t transport.ClientTransport) bool {
 	c.ctMu.Lock()
+	select {
+	case <-c.done:
+		c.ctMu.Unlock()
+		_ = t.Close()
+		return false
+	default:
+	}
 	c.ct = t
 	c.ctMu.Unlock()
+	return true
 }
 
 const (
@@ -256,14 +274,22 @@ func (c *Client) showStatus() {
 	}
 	fwdInfo := ""
 	if len(c.forwards) > 0 {
-		fwdInfo = fmt.Sprintf(" | fwd:%d/%d", c.fwdActive.Load(), len(c.forwards))
+		ports := make([]string, len(c.forwards))
+		for i, sp := range c.forwards {
+			_, ports[i], _ = net.SplitHostPort(sp.listenAddr)
+		}
+		fwdInfo = fmt.Sprintf(" | fwd:%d/%d%s", c.fwdActive.Load(), len(c.forwards), portsLabel(ports))
 	}
 	if len(c.rforwards) > 0 {
 		active := 0
 		if rf, ok := c.transport().(transport.RemoteForwardClient); ok {
 			active = rf.RemoteForwardActive()
 		}
-		fwdInfo += fmt.Sprintf(" | rfwd:%d/%d", active, len(c.rforwards))
+		ports := make([]string, len(c.rforwards))
+		for i, sp := range c.rforwards {
+			ports[i] = strconv.Itoa(int(sp.port))
+		}
+		fwdInfo += fmt.Sprintf(" | rfwd:%d/%d%s", active, len(c.rforwards), portsLabel(ports))
 	}
 	scrInfo := ""
 	if c.statusRedraw {
@@ -288,6 +314,59 @@ func nameLabel(name string) string {
 	return "name:" + name + " "
 }
 
+// maxStatusPorts は Ctrl-^ i の fwd/rfwd に並べるポート番号の最大数（残りは "+N" で件数のみ）。
+const maxStatusPorts = 3
+
+// portsLabel は Ctrl-^ i に出す "[8080,5432,3000+2]" を返す（指定順、空なら ""）。
+func portsLabel(ports []string) string {
+	if len(ports) == 0 {
+		return ""
+	}
+	shown := ports
+	more := ""
+	if len(ports) > maxStatusPorts {
+		shown = ports[:maxStatusPorts]
+		more = fmt.Sprintf("+%d", len(ports)-maxStatusPorts)
+	}
+	return "[" + strings.Join(shown, ",") + more + "]"
+}
+
+// fitStatusWidth はステータス行を端末幅 width 桁に収める（超える分は切って末尾を "~"）。
+// 1 行目に書いた行が折り返すと、消去時（1 行目のみクリア）に 2 行目へ残骸が残るため。
+// width <= 0（取得失敗）なら切らない。
+func fitStatusWidth(msg string, width int) string {
+	if width <= 0 {
+		return msg
+	}
+	total := 0
+	for _, r := range msg {
+		total += statusRuneWidth(r)
+	}
+	if total <= width {
+		return msg
+	}
+	cols := 0
+	for i, r := range msg {
+		w := statusRuneWidth(r)
+		if cols+w > width-1 { // 末尾の "~" の 1 桁を残す
+			return msg[:i] + "~"
+		}
+		cols += w
+	}
+	return msg // 到達しない（total > width なら途中で切れる）
+}
+
+// statusRuneWidth はステータス行での 1 文字の桁数の見積もり。スパークラインのブロック
+// 文字（U+2581〜U+2588）は East Asian Width が Ambiguous で、CJK 環境の端末設定によっては
+// 2 桁で描かれるので、安全側に 2 桁と数える（1 桁の端末では少し早めに切れるだけ）。
+// ステータス行はほかに ASCII のみの想定で、全角文字は数えない。
+func statusRuneWidth(r rune) int {
+	if r >= 0x2581 && r <= 0x2588 {
+		return 2
+	}
+	return 1
+}
+
 func (c *Client) showHelp() {
 	escKey := escapeKeyDisplay(c.escapeByte)
 	help := fmt.Sprintf("[Tezzer] %s+ .Detach qQuit rRedraw fForce iStatus sStats dDebug hHelp", escKey)
@@ -301,31 +380,11 @@ func (c *Client) killSession() {
 	// kill 中フラグを先に立てる（QUIC sessionGone がエラー扱いされないように）
 	c.killing.Store(true)
 
-	killMsg := proto.KillSessionMsg{
-		Type:      "KILL_SESSION",
-		SessionID: c.sessionID,
-	}
-	killData, err := proto.Encode(killMsg)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "\r\nError encoding kill message: %v\r\n", err)
-		c.forceExit()
-		return
-	}
-
-	c.connMu.Lock()
-	conn := c.conn
-	c.connMu.Unlock()
-
-	if conn == nil {
-		fmt.Fprintf(os.Stderr, "\r\nSession %s: connection not available\r\n", c.sessionID)
-		c.forceExit()
-		return
-	}
-
-	conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-	if err := netx.WriteFrame(conn, killData); err != nil {
-		fmt.Fprintf(os.Stderr, "\r\nFailed to send kill: %v\r\n", err)
-		c.forceExit()
+	c.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	if err := c.sendUDS(proto.KillSessionMsg{Type: "KILL_SESSION", SessionID: c.sessionID}); err != nil {
+		// セッションは残っているので正常終了にしない（スクリプトから成功に見えないように）
+		c.finish(fmt.Errorf("failed to send kill (session %s is still running): %w", c.sessionID, err))
+		c.conn.Close()
 		return
 	}
 
@@ -334,20 +393,19 @@ func (c *Client) killSession() {
 	c.forceExit()
 }
 
-// forceExit は強制的にクライアントを終了する（killSession用ヘルパー）
-func (c *Client) forceExit() {
-	// 終了処理
-	select {
-	case c.errCh <- errDetached:
-	default:
-	}
-	c.doneOnce.Do(func() { close(c.done) })
+// finish はクライアントを終了させる（done を閉じ、全 goroutine と run のループを止める）。
+// 最初の呼び出しの理由だけが残る。err == nil は正常終了（detach・セッション終了等）。
+func (c *Client) finish(err error) {
+	c.doneOnce.Do(func() {
+		c.exitErr = err
+		close(c.done)
+	})
+}
 
-	c.connMu.Lock()
-	if c.conn != nil {
-		c.conn.Close()
-	}
-	c.connMu.Unlock()
+// forceExit は正常終了として終わらせ、UDS も閉じる（killSession用ヘルパー）
+func (c *Client) forceExit() {
+	c.finish(nil)
+	c.conn.Close()
 }
 
 // resetScrollRegion はスクロール領域をリセットし、画面をリフレッシュする
@@ -597,9 +655,6 @@ func (c *Client) sendResize(width, height int) error {
 	if c.readOnly {
 		return nil
 	}
-	c.width = width
-	c.height = height
-
 	// QUIC トランスポートがある場合はそちらで送信
 	if ct := c.transport(); ct != nil {
 		if err := ct.SendResize(width, height); err != nil {
@@ -612,25 +667,22 @@ func (c *Client) sendResize(width, height int) error {
 		return nil
 	}
 
-	// TCP経由で送信
-	resizeMsg := proto.ResizeMsg{
-		Type:      "RESIZE",
-		SessionID: c.sessionID,
-		Cols:      width,
-		Rows:      height,
-	}
-	resizeData, err := proto.Encode(resizeMsg)
-	if err != nil {
-		return fmt.Errorf("encode resize error: %w", err)
-	}
-
-	c.connMu.Lock()
-	defer c.connMu.Unlock()
-
-	if err := netx.WriteFrame(c.conn, resizeData); err != nil {
-		return fmt.Errorf("write resize error: %w", err)
+	// QUIC 確立前は UDS 経由で送信
+	if err := c.sendUDS(proto.ResizeMsg{Type: "RESIZE", SessionID: c.sessionID, Cols: width, Rows: height}); err != nil {
+		return fmt.Errorf("send resize: %w", err)
 	}
 	return nil
+}
+
+// sendUDS はメッセージを UDS（制御チャネル）へ 1 フレームとして送る。
+func (c *Client) sendUDS(msg any) error {
+	data, err := proto.Encode(msg)
+	if err != nil {
+		return fmt.Errorf("encode: %w", err)
+	}
+	c.udsWriteMu.Lock()
+	defer c.udsWriteMu.Unlock()
+	return netx.WriteFrame(c.conn, data)
 }
 
 // restoreTerminalFlags はターミナルフラグを復元する（ONLCR等）

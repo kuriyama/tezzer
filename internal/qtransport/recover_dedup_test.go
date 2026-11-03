@@ -31,10 +31,7 @@ func TestQUICTransport_ConcurrentRecoverDedup(t *testing.T) {
 	}
 	addr := srv.(interface{ Addr() net.Addr }).Addr().String()
 
-	cli, err := NewClient(k, addr, 7, "")
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
+	cli := NewClient(k, addr, 7, "")
 	defer cli.Close()
 	if err := cli.Start(ctx); err != nil {
 		t.Fatalf("client Start: %v", err)
@@ -42,7 +39,7 @@ func TestQUICTransport_ConcurrentRecoverDedup(t *testing.T) {
 	qc := cli.(*quicClient)
 
 	// 接続を殺してから recover を一斉に多数起動する。
-	qc.conn.CloseWithError(0, "dead")
+	qc.conn.Load().CloseWithError(0, "dead")
 	deadline := time.Now().Add(3 * time.Second)
 	for !qc.connDead() && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)

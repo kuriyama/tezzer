@@ -43,10 +43,7 @@ func TestQUICTransport_RecoverOnDeadConn(t *testing.T) {
 	}
 	addr := srv.(interface{ Addr() net.Addr }).Addr().String()
 
-	cli, err := NewClient(k, addr, 7, "")
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
+	cli := NewClient(k, addr, 7, "")
 	defer cli.Close()
 	if err := cli.Start(ctx); err != nil {
 		t.Fatalf("client Start: %v", err)
@@ -70,7 +67,7 @@ func TestQUICTransport_RecoverOnDeadConn(t *testing.T) {
 	roundTrip("before")
 
 	// 接続を強制終了（idle timeout で死んだ状態を模擬）。
-	qc.conn.CloseWithError(0, "simulated idle death")
+	qc.conn.Load().CloseWithError(0, "simulated idle death")
 	deadline := time.Now().Add(3 * time.Second)
 	for !qc.connDead() && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
@@ -95,11 +92,11 @@ func TestQUICTransport_RecoverOnDeadConn(t *testing.T) {
 	// 長スリープ復帰（サーバー側 idle timeout 見込み）では、接続が生きて見えても
 	// migration を試さず直接 reconnect する（Probe の 4 秒待ちを避ける）。
 	qc.migrateMu.Lock()
-	before := qc.conn
+	before := qc.conn.Load()
 	qc.migrateMu.Unlock()
 	qc.recoverWith("test long sleep", false)
 	qc.migrateMu.Lock()
-	after, held := qc.conn, len(qc.pathTransports)
+	after, held := qc.conn.Load(), len(qc.pathTransports)
 	qc.migrateMu.Unlock()
 	if after == before || held != 0 {
 		t.Fatalf("recoverWith(tryMigrate=false) did not reconnect (conn replaced=%v, paths held=%d)", after != before, held)

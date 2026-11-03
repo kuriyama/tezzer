@@ -295,9 +295,9 @@ func (m *Manager) RestoreHandover(r io.Reader) (int, error) {
 			_ = pc.Close()
 			return 0, fmt.Errorf("restore shared transport: %w", err)
 		}
-		if err := m.adoptSharedTransport(sst, st.SharedPort, st.SharedKey); err != nil {
-			return 0, fmt.Errorf("adopt shared transport: %w", err)
-		}
+		// 受け付けはセッションの復元後（再起動直前の CONNECTION_CLOSE ですぐ再接続が来るので、
+		// 先に受け付けると未登録のセッションに NO_SUCH_SESSION を返してクライアントを終わらせうる）
+		m.prepareSharedTransport(sst, st.SharedPort, st.SharedKey)
 	}
 
 	restored := 0
@@ -307,6 +307,11 @@ func (m *Manager) RestoreHandover(r io.Reader) (int, error) {
 			continue
 		}
 		restored++
+	}
+	if st.SharedQuicFd >= 0 {
+		if err := m.startSharedTransport(); err != nil {
+			return restored, fmt.Errorf("adopt shared transport: %w", err)
+		}
 	}
 	return restored, nil
 }
@@ -351,7 +356,6 @@ func (m *Manager) restoreSession(hs *handoverSession) error {
 		done:              make(chan struct{}),
 		quicReadyCh:       make(chan struct{}),
 		exitCode:          -1,
-		debug:             IsDebugEnabled(),
 	}
 	s.termModes.Scan(hs.TermModes)
 	if hs.LastDetachedNS != 0 {
@@ -394,7 +398,6 @@ func (m *Manager) restoreSession(hs *handoverSession) error {
 	if m.IsSharedTransportEnabled() {
 		s.st = m.sharedTransport
 		s.usesSharedTransport = true
-		s.quicEnabled = true
 		s.quicPort = m.GetSharedPort()
 		s.quicKey = m.GetSharedKey()
 	} else if hs.QuicFd >= 0 {

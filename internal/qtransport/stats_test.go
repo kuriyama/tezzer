@@ -42,10 +42,7 @@ func TestQUICTransport_Stats(t *testing.T) {
 	}
 	addr := srv.(interface{ Addr() net.Addr }).Addr().String()
 
-	cli, err := NewClient(k, addr, 12, "")
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
+	cli := NewClient(k, addr, 12, "")
 	defer cli.Close()
 	if err := cli.Start(ctx); err != nil {
 		t.Fatalf("client Start: %v", err)
@@ -74,6 +71,21 @@ func TestQUICTransport_Stats(t *testing.T) {
 	if s.RecoveryCount != 0 {
 		t.Fatalf("RecoveryCount should be 0 before migration, got %d", s.RecoveryCount)
 	}
+
+	// reconnect / migration が migrateMu を握っている間も Stats() は待たない
+	// （Ctrl-^ i の表示が stdin 処理ごと止まらないこと）。
+	qc.migrateMu.Lock()
+	done := make(chan transport.Stats, 1)
+	go func() { done <- cli.Stats() }()
+	select {
+	case s := <-done:
+		if s.RTT == 0 {
+			t.Errorf("Stats RTT = 0 while migrateMu held, want the current conn's RTT")
+		}
+	case <-time.After(time.Second):
+		t.Errorf("Stats blocked while migrateMu was held")
+	}
+	qc.migrateMu.Unlock()
 
 	// migration 後に回復統計が更新される。
 	if err := qc.migrate("stats-test"); err != nil {

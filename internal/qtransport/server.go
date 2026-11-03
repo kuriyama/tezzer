@@ -27,13 +27,19 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
+// serverClient は handleConn でだけ生成され、conn/out/ctrl は生成時に必ず設定されて以後
+// 変わらない（nil チェックは不要）。
 type serverClient struct {
-	id     transport.ClientID
-	conn   *quic.Conn
-	out    *quic.SendStream
-	outMu  sync.Mutex
-	ctrl   *quic.Stream // control bidi（server→client の制御フレーム送信に使う）
-	ctrlMu sync.Mutex
+	id    transport.ClientID
+	conn  *quic.Conn
+	out   *quic.SendStream
+	outMu sync.Mutex
+	// catchingUp は再同期（追い付き分の送信）中。outMu で保護。この間 SendOutput はライブ分を
+	// 書かず、handleConn が最後に outMu を持ったままリングから拾い直して書き切る（ライブ分が
+	// 追い付き分に割り込むと、クライアントが offset <= lastOffset を捨てて追い付き分が欠ける）。
+	catchingUp bool
+	ctrl       *quic.Stream // control bidi（server→client の制御フレーム送信に使う）
+	ctrlMu     sync.Mutex
 
 	// 入力の重複排除（ストリーム + DATAGRAM 二重送信の一度だけ適用）。
 	// inMu は dedup 状態と input チャネルへの送信順序の両方を守る
@@ -83,9 +89,9 @@ type quicServer struct {
 	mu      sync.Mutex
 	clients map[transport.ClientID]*serverClient
 
-	onConnect    func(transport.ClientID)
-	onDisconnect func(transport.ClientID)
-	onResync     func(transport.ClientID, uint64) ([]transport.OutputChunk, error)
+	onConnect func(transport.ClientID)
+	onExit    func(transport.ClientID)
+	onResync  func(transport.ClientID, uint64) ([]transport.OutputChunk, error)
 
 	// クライアント接続時に通知するサーバ情報（SetServerMeta で設定）
 	metaBuildID    string
@@ -154,9 +160,7 @@ func (s *quicServer) DisconnectAllClients(reason string) {
 	s.mu.Lock()
 	conns := make(map[*quic.Conn]bool)
 	for _, sc := range s.clients {
-		if sc.conn != nil {
-			conns[sc.conn] = true
-		}
+		conns[sc.conn] = true
 	}
 	s.mu.Unlock()
 	for conn := range conns {
@@ -233,6 +237,8 @@ func (s *quicServer) handleConn(conn *quic.Conn) {
 	connectedAt := time.Now()
 
 	s.mu.Lock()
+	// 再同期するなら追い付き中として登録する（古い接続を差し替えるため登録自体は遅らせない）
+	sc.catchingUp = s.onResync != nil
 	_, replacing := s.clients[cid]
 	s.clients[cid] = sc
 	if m.AgentForward {
@@ -270,23 +276,40 @@ func (s *quicServer) handleConn(conn *quic.Conn) {
 	// セッション層はバッチ（raw バイト上限つき）で返すため、空が返るまで繰り返し引く
 	// （cold 層全量を一括で解凍・保持しない。メモリスパイク防止）。
 	if onResync != nil {
+		// 追い付き中に飛ばしたライブ分は、PTY reader がリングへ追記してから SendOutput するので
+		// 最後の引き直しに必ず含まれる。引き直しと catchingUp の解除を outMu の下で行うので、
+		// その後のライブ分は追い付き分より後ろに並ぶ（重複はクライアントが offset で捨てる）。
 		next := m.LastOffset + 1
-	resync:
-		for {
-			chunks, err := onResync(cid, next)
-			if err != nil || len(chunks) == 0 {
-				break
-			}
-			for _, ch := range chunks {
-				// writeOutput 経由にすることで、再同期の Write がブロックした場合も
-				// stallWatchdog から観測できる（outMu 越しに SendOutput = PTY reader
-				// まで詰まらせるのは同じため）。
-				if _, werr := sc.writeOutput(ch.Offset, ch.Data); werr != nil {
-					break resync
+		resync := func(locked bool) bool {
+			for {
+				chunks, err := onResync(cid, next)
+				if err != nil || len(chunks) == 0 {
+					return true
 				}
-				next = ch.Offset + 1
+				for _, ch := range chunks {
+					// writeOutput 経由にすることで、再同期の Write がブロックした場合も
+					// stallWatchdog から観測できる。
+					var werr error
+					if locked {
+						_, werr = sc.writeOutputLocked(ch.Offset, ch.Data)
+					} else {
+						_, werr = sc.writeOutput(ch.Offset, ch.Data)
+					}
+					if werr != nil {
+						return false
+					}
+					next = ch.Offset + 1
+				}
 			}
 		}
+		// 大半はロック外で送る（PTY reader を追い付きの間ずっと止めない）
+		ok := resync(false)
+		sc.outMu.Lock()
+		if ok {
+			resync(true)
+		}
+		sc.catchingUp = false
+		sc.outMu.Unlock()
 	}
 
 	go s.readControl(sc, ctrl)
@@ -313,11 +336,15 @@ func (s *quicServer) handleConn(conn *quic.Conn) {
 			}
 		}
 	}
-	onDisconnect := s.onDisconnect
 	rfwdGone := s.rfwdGone
+	onExit := s.onExit
 	s.mu.Unlock()
+	clientExit := closedByClientExit(conn)
 	if stillMine && sc.remoteForward && rfwdGone != nil {
-		rfwdGone(cid, closedByClientExit(conn))
+		rfwdGone(cid, clientExit)
+	}
+	if stillMine && clientExit && onExit != nil {
+		onExit(cid)
 	}
 	note := ""
 	if !stillMine {
@@ -326,9 +353,6 @@ func (s *quicServer) handleConn(conn *quic.Conn) {
 	log.Printf("qtransport: client %d (session %s) disconnected from %s after %v: %v%s",
 		cid.Num, cid.Session, conn.RemoteAddr(), time.Since(connectedAt).Round(time.Second),
 		context.Cause(conn.Context()), note)
-	if stillMine && onDisconnect != nil {
-		onDisconnect(cid)
-	}
 }
 
 // readControl は control ストリームの後続フレーム（Resize 等）を読む。
@@ -466,12 +490,17 @@ const connCodeClientExit quic.ApplicationErrorCode = 3
 // ようにする。完了時、このエピソードで stall 計上済みならリセットして復帰をログする。
 func (sc *serverClient) writeOutput(offset uint64, data []byte) (time.Duration, error) {
 	sc.outMu.Lock()
+	defer sc.outMu.Unlock()
+	return sc.writeOutputLocked(offset, data)
+}
+
+// writeOutputLocked は writeOutput の本体。outMu を保持して呼ぶ。
+func (sc *serverClient) writeOutputLocked(offset uint64, data []byte) (time.Duration, error) {
 	t0 := time.Now()
 	sc.writeStartNano.Store(t0.UnixNano())
 	err := writeOutputFrame(sc.out, offset, data)
 	dur := time.Since(t0)
 	sc.writeStartNano.Store(0)
-	sc.outMu.Unlock()
 	if sc.stallWarned.Swap(false) {
 		sc.lastStallWarnNano.Store(0)
 		log.Printf("qtransport: client %d (session %s) output resumed after %v stall (err=%v)",
@@ -488,7 +517,14 @@ func (s *quicServer) SendOutput(offset uint64, data []byte, clients []transport.
 		if sc == nil {
 			continue
 		}
-		dur, err := sc.writeOutput(offset, data)
+		sc.outMu.Lock()
+		if sc.catchingUp {
+			// 再同期中: handleConn が最後にリングから拾って書く
+			sc.outMu.Unlock()
+			continue
+		}
+		dur, err := sc.writeOutputLocked(offset, data)
+		sc.outMu.Unlock()
 		if err != nil {
 			// 1 クライアントの失敗で他を止めない（切断は handleConn 側で検知）。
 			continue
@@ -548,9 +584,7 @@ func (s *quicServer) stallWatchdog() {
 			if stalled >= criticalThreshold {
 				log.Printf("qtransport: client %d (session %s) output stalled %v (critical); disconnecting",
 					sc.id.Num, sc.id.Session, stalled.Truncate(time.Millisecond))
-				if sc.conn != nil {
-					_ = sc.conn.CloseWithError(connCodeStallDisconnect, "output stalled: disconnecting slow client")
-				}
+				_ = sc.conn.CloseWithError(connCodeStallDisconnect, "output stalled: disconnecting slow client")
 				continue
 			}
 			if sc.stallWarned.CompareAndSwap(false, true) {
@@ -560,10 +594,8 @@ func (s *quicServer) stallWatchdog() {
 			}
 			sc.lastStallWarnNano.Store(now.UnixNano())
 			addr := "?"
-			if sc.conn != nil {
-				if a := sc.conn.RemoteAddr(); a != nil {
-					addr = a.String()
-				}
+			if a := sc.conn.RemoteAddr(); a != nil {
+				addr = a.String()
 			}
 			msg := fmt.Sprintf("output stalled %ds by client %d (%s) not reading",
 				int(stalled/time.Second), sc.id.Num, addr)
@@ -600,10 +632,8 @@ func (s *quicServer) ClientSendStats() []transport.ClientSendStat {
 			}
 		}
 		var quicRemoteAddr string
-		if sc.conn != nil {
-			if addr := sc.conn.RemoteAddr(); addr != nil {
-				quicRemoteAddr = addr.String()
-			}
+		if addr := sc.conn.RemoteAddr(); addr != nil {
+			quicRemoteAddr = addr.String()
 		}
 		// 進行中の stall（warning 水位超えのみ。通常の in-flight Write は µs 単位で
 		// ノイズになるため報告しない）
@@ -633,9 +663,6 @@ func (s *quicServer) ClientSendStats() []transport.ClientSendStat {
 
 // writeCtrl はクライアントの control bidi ストリームへ制御フレームを書く（server→client）。
 func (s *quicServer) writeCtrl(sc *serverClient, m *ctrlMsg) error {
-	if sc.ctrl == nil {
-		return nil
-	}
 	sc.ctrlMu.Lock()
 	defer sc.ctrlMu.Unlock()
 	return writeFrame(sc.ctrl, m)
@@ -682,9 +709,9 @@ func (s *quicServer) OnClientConnect(fn func(transport.ClientID)) {
 	s.onConnect = fn
 	s.mu.Unlock()
 }
-func (s *quicServer) OnClientDisconnect(fn func(transport.ClientID)) {
+func (s *quicServer) OnClientExit(fn func(transport.ClientID)) {
 	s.mu.Lock()
-	s.onDisconnect = fn
+	s.onExit = fn
 	s.mu.Unlock()
 }
 func (s *quicServer) OnResyncNeeded(fn func(transport.ClientID, uint64) ([]transport.OutputChunk, error)) {
@@ -702,8 +729,6 @@ func (s *quicServer) ActiveClients() []transport.ClientID {
 	}
 	return ids
 }
-
-func (s *quicServer) Stats() transport.Stats { return transport.Stats{} }
 
 func (s *quicServer) Close() error {
 	if s.cancel != nil {

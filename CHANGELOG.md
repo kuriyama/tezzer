@@ -8,14 +8,91 @@ once it reaches a 1.0 release.
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-11-03
+
+### Added
+
+- `tezzer -list-forwards` lists the port forwards of every tezzer client
+  running on this machine: PID, server, session, `-L`/`-R`, target, and
+  whether each `-L` bound (`-json` for machine-readable output). Each client
+  with forwards records them in `~/.tezzer/run/<pid>.json` while it runs; the
+  command reads that registry and never contacts a server, so it also covers
+  `-N` clients, which have no status line. `-R` entries show only what the
+  client requested; the server-side state remains in `tezzer -list`.
+  `tezzer-ssh` passes the ssh destination so the SERVER column names the host.
+- `Ctrl-^ i` now shows the forwarded ports after the `fwd` and `rfwd` counts,
+  in the order given (the first three, then a count), e.g.
+  `fwd:1/5[8080,5432,3000+2]`.
+
+### Changed
+
+- Port-forwarding listeners (`-L` and `-R`) no longer use Multipath TCP.
+  Go 1.24+ enables MPTCP on TCP listeners by default; tezzer now sets
+  `godebug multipathtcp=0`. CVE-2026-98432, a use-after-free in the kernel's
+  IPv4 TCP handshake, has a published remote exploit that relies on an MPTCP
+  listener. These listeners are loopback-only, so MPTCP brought no benefit.
+  This does not fix the kernel bug; update the host kernel.
+- Dependencies updated: golang.org/x/net v0.62.0 (fixes GO-2026-6866 and
+  GO-2026-6860 in the html package, which tezzer does not use).
+
+### Fixed
+
+- Status lines longer than the terminal width are truncated with `~`. They
+  used to wrap onto the second row, which was not cleared when the status
+  line disappeared. The RTT sparkline's block characters (`▁`..`█`) are
+  counted as two columns, since CJK terminals may draw these
+  ambiguous-width characters double width.
+- After a reconnect (for example on waking from a long sleep), output
+  produced while the client was away is no longer partly lost when the
+  session is still writing. New output could overtake the catch-up, and the
+  client then discarded the rest of it without notice. Attaching to a session
+  that is still producing output had the same problem with the earlier
+  output.
+- When the server has to drop output for a client on the Unix socket (one
+  that cannot use QUIC), the client is now told so; the notice used to be
+  dropped as well. A window resize made right after attaching is no longer
+  undone by the redraw nudge that follows the backlog.
+- Typing or pasting while the network path has silently gone dead no longer
+  freezes keyboard handling (including `Ctrl-^ .`) until the connection
+  times out. Input that cannot be sent within 5 seconds is dropped, as other
+  input that fails to send already was.
+- `Ctrl-^ i` no longer freezes keyboard input while a reconnect is in
+  progress (for up to about 20 seconds).
+- Exiting while a reconnect is failing no longer leaves the terminal in raw
+  mode for up to about 10 seconds.
+- The client no longer leaves `[QUIC] closed` in reverse video on the top
+  line of the terminal after it exits. `Ctrl-^ .` prints
+  `Detached from session.` again; the client usually exited before printing it.
+- If `Ctrl-^ q` cannot send the kill request, the client now exits with an
+  error saying the session is still running; it used to exit 0. Pressing the
+  escape key twice while the connection is down no longer ends the client.
+- When the session's program exits on its own just before a kill arrives,
+  its exit status is kept instead of being reported as 0.
+- While QUIC keeps failing on attach, the background retry reuses the same
+  client ID. It used to register a new one with the server every 15 seconds.
+- After a zero-downtime restart with `--udp-port`, the server restores every
+  session before it accepts reconnects, so a quick reconnect can no longer be
+  told `NO_SUCH_SESSION`.
+- `tezzerd` no longer keeps a killed session's output buffer in memory after
+  `Ctrl-^ q`, and no longer leaves the shell running when a session is killed
+  while it is still starting.
+- A client attached to a session that another client kills with
+  `tezzer -kill` now prints `Session closed: session killed` and exits 0,
+  as `Ctrl-^ q` does. It used to exit 1 with
+  `error: NO_SUCH_SESSION: session closed` or 137 (the killed shell's
+  status), depending on which notification arrived first. `tezzer -wait`
+  also returns 0 for a killed session.
+
 ## [0.2.2] - 2026-10-22
 
 ### Changed
 
 - Building from source now requires Go 1.26 or newer, and release binaries
   are built with Go 1.26. Go 1.25 no longer receives security fixes; this
-  picks up the standard-library fixes for GO-2026-6607 (crypto/tls) and
-  GO-2026-6809 (crypto/x509).
+  picks up the standard-library fix for GO-2026-6607 (crypto/tls). The 0.2.2
+  release binaries were built with Go 1.26.9, which does not yet include the
+  fix for GO-2026-6809 (crypto/x509); tezzer pins peer keys rather than
+  verifying certificate chains, so it is not affected.
 - Dependencies updated: quic-go v0.64.1, golang.org/x/crypto v0.58.0,
   golang.org/x/net v0.61.0, golang.org/x/sys v0.49.0, golang.org/x/term
   v0.47.0, and creack/pty v1.1.24.

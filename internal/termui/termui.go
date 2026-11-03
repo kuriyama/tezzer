@@ -32,6 +32,7 @@ type StatusManager struct {
 	timer     *time.Timer
 	displayFn func(msg string) // 表示用コールバック
 	clearFn   func()           // 表示クリア用コールバック
+	closed    bool             // Close 後は描かない（端末を戻した後の画面に残さないため）
 }
 
 // NewStatusManager returns a StatusManager that draws with displayFn and clears
@@ -44,19 +45,25 @@ func NewStatusManager(displayFn func(msg string), clearFn func()) *StatusManager
 }
 
 // Close stops the StatusManager, cancelling any pending auto-clear timer.
+// Later calls to Set are ignored.
 func (sm *StatusManager) Close() {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	sm.closed = true
 	if sm.timer != nil {
 		sm.timer.Stop()
 	}
 }
 
-// Set displays msg and clears it automatically after 3 seconds.
+// Set displays msg and clears it automatically after 3 seconds. It does
+// nothing after Close.
 func (sm *StatusManager) Set(msg string) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
+	if sm.closed {
+		return
+	}
 	if sm.timer != nil {
 		sm.timer.Stop()
 	}
@@ -67,7 +74,7 @@ func (sm *StatusManager) Set(msg string) {
 	sm.timer = time.AfterFunc(3*time.Second, func() {
 		sm.mu.Lock()
 		defer sm.mu.Unlock()
-		if sm.clearFn != nil {
+		if !sm.closed && sm.clearFn != nil {
 			sm.clearFn()
 		}
 	})

@@ -102,10 +102,7 @@ func setupLivenessPair(t *testing.T) (qc *quicClient, relay *blackholeRelay, por
 	port = srv.(interface{ Addr() net.Addr }).Addr().(*net.UDPAddr).Port
 
 	relay = newBlackholeRelay(t, net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
-	cli, err := NewClient(k, relay.Addr(), 1, "")
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
+	cli := NewClient(k, relay.Addr(), 1, "")
 	t.Cleanup(func() { _ = cli.Close() })
 	if err := cli.Start(ctx); err != nil {
 		t.Fatalf("client Start: %v", err)

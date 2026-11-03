@@ -31,10 +31,7 @@ func TestQUICTransport_ServerMetaAndSessionGone(t *testing.T) {
 	}
 	addr := srv.(interface{ Addr() net.Addr }).Addr().String()
 
-	cli, err := NewClient(k, addr, 7, "s1")
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
+	cli := NewClient(k, addr, 7, "s1")
 	defer cli.Close()
 
 	metaCh := make(chan [3]string, 1)

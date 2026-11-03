@@ -10,8 +10,8 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
-	"github.com/kuriyama/tezzer/internal/netx"
 	"github.com/kuriyama/tezzer/internal/proto"
 	"github.com/kuriyama/tezzer/internal/qtransport"
 	"github.com/kuriyama/tezzer/internal/stun"
@@ -97,27 +97,23 @@ func buildQUICCandidateAddrs(quicInfo *QUICInfo, clientSTUNAddrs []string) []str
 }
 
 // startQUICTransport は QUIC トランスポートを確立し、コールバック・候補リフレッシャーを配線する。
-func (c *Client) startQUICTransport(udsAddr string, quicInfo *QUICInfo) error {
-	// 接続試行する候補アドレスのリストを決定（優先順位順）
-	var candidateAddrs []string
-
-	// クライアント識別子を生成（16-bit ランダム値）。0 は「QUIC 未使用」の番兵として
-	// 各所（UDS 配信抑制・-info 表示）が解釈するため避ける。0 のままだと QUIC 接続済み
-	// でも UDS 併送が止まらず、WAN 帯域が二重になる。
-	var clientID uint16
-	for clientID == 0 {
+func (c *Client) startQUICTransport(quicInfo *QUICInfo) error {
+	// クライアント識別子を生成（16-bit ランダム値。再試行では前回の値を使い回す）。0 は
+	// 「QUIC 未使用」の番兵として各所（UDS 配信抑制・-info 表示）が解釈するため避ける。
+	// 0 のままだと QUIC 接続済みでも UDS 併送が止まらず、WAN 帯域が二重になる。
+	for c.quicClientID == 0 {
 		var clientIDBytes [2]byte
 		if _, err := rand.Read(clientIDBytes[:]); err != nil {
 			return fmt.Errorf("failed to generate client ID: %w", err)
 		}
-		clientID = binary.LittleEndian.Uint16(clientIDBytes[:])
+		c.quicClientID = binary.LittleEndian.Uint16(clientIDBytes[:])
 	}
+	clientID := c.quicClientID
 
-	// クライアント側もSTUNで自分の公開アドレス候補を取得（リモート接続判定 =
-	// 候補アドレス生成にクライアントローカルで使うだけで、サーバへは送らない）
-	var clientSTUNAddrs []string
+	// 接続試行する候補アドレスのリスト（優先順位順）。クライアント側の STUN 結果は
+	// リモート接続判定に使うだけで、サーバへは送らない
+	candidateAddrs, clientSTUNAddrs := c.resolveCandidates(quicInfo, false)
 	if len(quicInfo.STUNAddrs) > 0 {
-		clientSTUNAddrs = c.getClientSTUNAddrs(quicInfo.STUNServer)
 		if len(clientSTUNAddrs) > 0 {
 			c.setStatusMessage(fmt.Sprintf("client STUN address: %s", strings.Join(clientSTUNAddrs, ", ")))
 		} else {
@@ -129,8 +125,6 @@ func (c *Client) startQUICTransport(udsAddr string, quicInfo *QUICInfo) error {
 	if err := c.sendQUICClientInfo(clientID); err != nil {
 		c.setStatusMessage(fmt.Sprintf("warning: failed to send client ID info: %v", err))
 	}
-
-	candidateAddrs = buildQUICCandidateAddrs(quicInfo, clientSTUNAddrs)
 
 	// 候補アドレスを常時ログ＆通知（debug 不要で「どのアドレス/ポートを叩いたか」を診断できる）
 	// ファイルログへは setStatusMessage（addLogMessage）経由で書かれる
@@ -152,10 +146,7 @@ func (c *Client) startQUICTransport(udsAddr string, quicInfo *QUICInfo) error {
 		return fmt.Errorf("no QUIC candidate addresses")
 	}
 
-	ct, err := qtransport.NewClient(quicInfo.Key, candidateAddrs[0], clientID, c.sessionID)
-	if err != nil {
-		return fmt.Errorf("failed to create QUIC transport: %w", err)
-	}
+	ct := qtransport.NewClient(quicInfo.Key, candidateAddrs[0], clientID, c.sessionID)
 	if c.agentSockPath != "" {
 		if as, ok := ct.(transport.AgentForwardClient); ok {
 			as.SetAgentSockPath(c.agentSockPath)
@@ -198,10 +189,7 @@ func (c *Client) startQUICTransport(udsAddr string, quicInfo *QUICInfo) error {
 	ct.OnSessionNotFound(func(reason string, exitCode int) {
 		if c.killing.Load() {
 			// killSession() の結果として届いた sessionGone は正常終了扱い
-			select {
-			case c.errCh <- errDetached:
-			default:
-			}
+			c.finish(nil)
 			return
 		}
 		if strings.HasPrefix(reason, "SESSION_CLOSED:") {
@@ -215,27 +203,16 @@ func (c *Client) startQUICTransport(udsAddr string, quicInfo *QUICInfo) error {
 				c.restoreTerminalModes()
 				fmt.Fprintf(os.Stderr, "\r\n[Tezzer] Session closed: %s\r\n", msg)
 			}
-			select {
-			case c.errCh <- errDetached:
-			default:
-			}
+			c.finish(nil)
 			return
 		}
-		select {
-		case c.errCh <- fmt.Errorf("%s", reason):
-		default:
-		}
+		c.finish(errors.New(reason))
 	})
 
 	// 全候補失敗時の候補リフレッシャーを登録する。
 	// reconnect がすべて失敗した場合のみ呼ばれる（通常 reconnect にはコスト増なし）。
-	quicInfoCopy := quicInfo // クロージャにコピーを渡す
 	ct.SetCandidatesRefresher(func() []string {
-		var clientSTUN []string
-		if len(quicInfoCopy.STUNAddrs) > 0 {
-			clientSTUN = c.getClientSTUNAddrs(quicInfoCopy.STUNServer)
-		}
-		fresh := buildQUICCandidateAddrs(quicInfoCopy, clientSTUN)
+		fresh, _ := c.resolveCandidates(quicInfo, false)
 		if len(fresh) > 0 {
 			c.addLogMessage(fmt.Sprintf("QUIC: refreshed candidates: %s", strings.Join(fresh, ", ")))
 		}
@@ -252,7 +229,9 @@ func (c *Client) startQUICTransport(udsAddr string, quicInfo *QUICInfo) error {
 		return fmt.Errorf("failed to connect: %w", err)
 	}
 
-	c.setTransport(ct)
+	if !c.setTransport(ct) {
+		return fmt.Errorf("client is exiting")
+	}
 	c.startCandidateRefreshLoop(quicInfo)
 	return nil
 }
@@ -291,7 +270,7 @@ func quicSetupHint(msg string, port int) string {
 // retryQUICTransport は QUIC 初回確立に失敗した場合に、UDS が生きている間
 // バックグラウンドで再試行する。成功したら出力ポンプを起動して昇格する。
 // firstErr は初回確立の失敗（ログの重複抑制の起点）。
-func (c *Client) retryQUICTransport(udsAddr string, quicInfo *QUICInfo, firstErr error) {
+func (c *Client) retryQUICTransport(quicInfo *QUICInfo, firstErr error) {
 	lastErr := c.logQUICSetupFailure(firstErr, "", quicInfo.Port)
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
@@ -303,7 +282,7 @@ func (c *Client) retryQUICTransport(udsAddr string, quicInfo *QUICInfo, firstErr
 			if c.transport() != nil {
 				return // 既に確立済み（別経路で昇格した等）
 			}
-			if err := c.startQUICTransport(udsAddr, quicInfo); err != nil {
+			if err := c.startQUICTransport(quicInfo); err != nil {
 				lastErr = c.logQUICSetupFailure(err, lastErr, quicInfo.Port)
 				continue
 			}
@@ -318,33 +297,34 @@ func (c *Client) retryQUICTransport(udsAddr string, quicInfo *QUICInfo, firstErr
 // 接続した場合のフォールバック。
 const defaultSTUNServer = "stun.l.google.com:19302"
 
-// getClientSTUNAddrs はクライアント側のSTUNアドレス候補を family ごとに取得する
-// （リモート接続判定 = 接続候補生成のため。ipv4Only なら v4 のみ問い合わせる）。
-// stunServer はサーバが SESSION_CREATED で伝えた --stun-server の値（空なら既定）。
-func (c *Client) getClientSTUNAddrs(stunServer string) []string {
-	if stunServer == "" {
-		stunServer = defaultSTUNServer
-	}
-	var addrs []string
-	if addr, err := c.getClientSTUNAddr("udp4", stunServer); err == nil {
-		addrs = append(addrs, addr.String())
-	}
-	if !c.ipv4Only {
-		if addr, err := c.getClientSTUNAddr("udp6", stunServer); err == nil {
-			addrs = append(addrs, addr.String())
+// resolveCandidates はクライアント側の STUN を問い合わせて自分の公開アドレス
+// （clientSTUN）を得て、QUIC の接続候補（cands）を組み立てる。初回確立・全候補失敗時の
+// リフレッシュ・バックグラウンド更新の 3 経路で共通。
+//
+// サーバが STUN アドレスを広告していなければリモート判定に使えないので問い合わせない。
+// ipv4Only なら v4 のみ。probeRoute が true なら、ローカル経路のない family への
+// 問い合わせを省く（バックグラウンド更新用。経路判定は公開 DNS 宛の経路で見るため、
+// デフォルトルートのない閉じたネットワークでは誤って省きうるので、接続時には使わない）。
+// サーバが stun_server を伝えてこない旧サーバなら defaultSTUNServer を使う。
+func (c *Client) resolveCandidates(info *QUICInfo, probeRoute bool) (cands, clientSTUN []string) {
+	if len(info.STUNAddrs) > 0 {
+		server := info.STUNServer
+		if server == "" {
+			server = defaultSTUNServer
+		}
+		for _, network := range []string{"udp4", "udp6"} {
+			if network == "udp6" && c.ipv4Only {
+				continue
+			}
+			if probeRoute && !hasLocalRoute(network, probeTargets[network]) {
+				continue
+			}
+			if addr, err := stun.MappedAddr(network, server, stun.DefaultTimeout); err == nil {
+				clientSTUN = append(clientSTUN, addr.String())
+			}
 		}
 	}
-	return addrs
-}
-
-// getClientSTUNAddr はクライアント側のSTUNアドレスを指定 family（"udp4"/"udp6"）で取得する。
-// 旧実装はここで NAT タイプ判別（DetectNATType）も行っていたが、クエリごとに別ソケットを
-// 使うため port 比較が成立せずほぼ常に Symmetric と誤報告しており、結果も表示にしか
-// 使っていなかったため撤去した（正しい同一ソケット判別は stun.Probe / tezzerd -check-nat）。
-func (c *Client) getClientSTUNAddr(network, stunServer string) (*net.UDPAddr, error) {
-	stunClient := stun.NewClient(stunServer)
-	stunClient.Network = network
-	return stunClient.GetMappedAddr()
+	return buildQUICCandidateAddrs(info, clientSTUN), clientSTUN
 }
 
 // serverIsOnSameHost はサーバーの LocalAddrs のいずれかがクライアント自身の
@@ -375,18 +355,7 @@ func serverIsOnSameHost(serverLocalAddrs []string) bool {
 // sendQUICClientInfo はクライアントの clientID をサーバーに UDS 経由で通知する
 // （出力ファンアウト対象への登録。wire のメッセージ型名は互換のため UDP_CLIENT_INFO のまま）。
 func (c *Client) sendQUICClientInfo(clientID uint16) error {
-	msg := proto.UDPClientInfoMsg{
-		Type:      "UDP_CLIENT_INFO",
-		SessionID: c.sessionID,
-		ClientID:  clientID,
-	}
-	data, err := proto.Encode(msg)
-	if err != nil {
-		return fmt.Errorf("failed to encode client ID info: %w", err)
-	}
-	c.connMu.Lock()
-	defer c.connMu.Unlock()
-	return netx.WriteFrame(c.conn, data)
+	return c.sendUDS(proto.UDPClientInfoMsg{Type: "UDP_CLIENT_INFO", SessionID: c.sessionID, ClientID: clientID})
 }
 
 // requestServerMeta はサーバーのメタ情報を要求する（送信のみ）。
@@ -394,15 +363,5 @@ func (c *Client) sendQUICClientInfo(clientID uint16) error {
 // ここで応答を読んではいけない: 同じ UDS conn を handleServer が常時 ReadFrame
 // しており、2 goroutine から読むとフレーム境界が壊れる。
 func (c *Client) requestServerMeta() error {
-	msg := proto.GetServerMetaMsg{
-		Type:      "GET_SERVER_META",
-		SessionID: c.sessionID,
-	}
-	data, err := proto.Encode(msg)
-	if err != nil {
-		return fmt.Errorf("failed to encode get server meta: %w", err)
-	}
-	c.connMu.Lock()
-	defer c.connMu.Unlock()
-	return netx.WriteFrame(c.conn, data)
+	return c.sendUDS(proto.GetServerMetaMsg{Type: "GET_SERVER_META", SessionID: c.sessionID})
 }

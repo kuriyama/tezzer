@@ -60,10 +60,7 @@ func setupRFwdPair(t *testing.T, forwardingEnabled bool, targets map[uint16]stri
 	if err := srv.Start(ctx); err != nil {
 		t.Fatalf("server Start: %v", err)
 	}
-	ct, err := NewClient(k, srv.Addr().String(), 1, "sess")
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
+	ct := NewClient(k, srv.Addr().String(), 1, "sess")
 	p.cli = ct.(*quicClient)
 	p.cli.SetRemoteForwards("0123456789abcdef0123456789abcdef", targets)
 	t.Cleanup(func() { p.cli.Close() })
@@ -154,7 +151,7 @@ func TestRemoteForward_GoneNotExplicitOnLoss(t *testing.T) {
 	p := setupRFwdPair(t, true, map[uint16]string{9222: "127.0.0.1:1"})
 	ev := waitHello(t, p)
 	// reconnect と同じコード（0）で閉じる = 意図した終了ではない。
-	_ = p.cli.conn.CloseWithError(0, "lost")
+	_ = p.cli.conn.Load().CloseWithError(0, "lost")
 	select {
 	case g := <-p.gones:
 		if g.id != ev.id || g.explicit {

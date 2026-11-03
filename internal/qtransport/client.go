@@ -6,9 +6,11 @@ package qtransport
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -81,8 +83,12 @@ type quicClient struct {
 	// 登録中の conn ごと destroy するため、conn を差し替えるまで閉じられない。migrateMu で保護
 	pathTransports []*quic.Transport
 
-	tr       *quic.Transport
-	conn     *quic.Conn
+	tr *quic.Transport
+	// conn は現在の QUIC 接続。差し替え（Start・reconnect・failover の adoptConn）は
+	// migrateMu の下で行い、読むだけの側（Stats・死活判定・OpenForward）はロックを取らずに
+	// Load する。migrateMu は reconnect の dial・setup（最大 20 秒程度）の間も握られるので、
+	// Stats がロックを待つと Ctrl-^ i を押した stdin の処理ごと止まってしまう。
+	conn     atomic.Pointer[quic.Conn]
 	connAddr string           // conn の dial 先候補（"host:port"）。migrateMu で保護
 	ctrl     *quic.Stream     // control bidi（Hello/Resize 送信）
 	in       *quic.SendStream // 入力 uni
@@ -94,9 +100,12 @@ type quicClient struct {
 	// switchToNewPath（migration の path 切替）と data race するため、migration が
 	// 起きうるタイミングで呼んではいけない）
 	inDatagramsOK bool
-	ctrlMu        sync.Mutex
-	inMu          sync.Mutex // in / inConn / inOffset / inDatagramsOK を保護
-	migrateMu     sync.Mutex
+	// inStalled は前回の入力 Write が inputWriteTimeout で打ち切られた（経路が詰まっている）。
+	// 立っている間は短い期限で試し、成功したら下ろす（入力ストリームの差し替えでも下ろす）。
+	inStalled bool
+	ctrlMu    sync.Mutex
+	inMu      sync.Mutex // in / inConn / inOffset / inDatagramsOK / inStalled を保護
+	migrateMu sync.Mutex
 
 	out    chan transport.OutputChunk
 	ctx    context.Context
@@ -142,7 +151,7 @@ type quicClient struct {
 // NewClient creates a QUIC client transport that connects to serverAddr.
 // sessionID identifies the session for routing on a shared transport
 // (carried in the Hello).
-func NewClient(k []byte, serverAddr string, clientID uint16, sessionID string) (transport.ClientTransport, error) {
+func NewClient(k []byte, serverAddr string, clientID uint16, sessionID string) transport.ClientTransport {
 	c := &quicClient{
 		k:          k,
 		serverAddr: serverAddr,
@@ -151,7 +160,7 @@ func NewClient(k []byte, serverAddr string, clientID uint16, sessionID string) (
 		out:        make(chan transport.OutputChunk, 256),
 	}
 	c.state.Store(int32(transport.StateConnecting))
-	return c, nil
+	return c
 }
 
 // Start は接続を確立する。SetRoamingCandidates が Start 前に呼ばれていれば
@@ -178,7 +187,7 @@ func (c *quicClient) Start(ctx context.Context) error {
 	}
 	c.tr = winner.tr
 	conn := winner.conn
-	c.conn = conn
+	c.conn.Store(conn)
 	c.connAddr = winner.addr
 
 	// control bidi を開いて Hello を送る。
@@ -290,9 +299,7 @@ func (c *quicClient) watchdog() {
 
 // connDead は現在の QUIC 接続が終了している（idle timeout 等で死んだ）かを返す。
 func (c *quicClient) connDead() bool {
-	c.migrateMu.Lock()
-	conn := c.conn
-	c.migrateMu.Unlock()
+	conn := c.conn.Load()
 	return conn != nil && conn.Context().Err() != nil
 }
 
@@ -423,6 +430,11 @@ func (c *quicClient) reconnect(reason string) error {
 	}
 
 	winner, failures := dialParallel(c.ctx, candidates, tlsConf)
+	if winner == nil && c.ctx.Err() != nil {
+		// Close 済み。失敗は cancel によるものなので候補を取り直さない（STUN は cancel を
+		// 見ずに最大 5 秒 × family 待つので、migrateMu を待つ Close が終了を止めてしまう）。
+		return c.ctx.Err()
+	}
 
 	// 全候補失敗時: 候補リフレッシュ関数が登録されていれば再探索して再試行する。
 	// スリープ復帰後にネットワーク環境が変わった場合（リモート↔LAN）に対応。
@@ -486,15 +498,15 @@ func (c *quicClient) adoptConn(winner *dialResult) error {
 	}
 
 	// 旧 conn/transport を退役（旧 pumpOutput は stream エラーで自然終了）。
-	if c.conn != nil {
-		_ = c.conn.CloseWithError(0, "reconnect")
+	if old := c.conn.Load(); old != nil {
+		_ = old.CloseWithError(0, "reconnect")
 	}
 	c.retireTransport(c.tr)
 	for _, tr := range c.pathTransports {
 		c.retireTransport(tr)
 	}
 	c.pathTransports = nil
-	c.conn = winner.conn
+	c.conn.Store(winner.conn)
 	c.connAddr = winner.addr
 	c.tr = winner.tr
 	c.ctrlMu.Lock()
@@ -506,6 +518,7 @@ func (c *quicClient) adoptConn(winner *dialResult) error {
 	// Dial 直後（この conn に migration が起きる前）に一度だけ読んでキャッシュする。
 	c.inDatagramsOK = winner.conn.ConnectionState().SupportsDatagrams.Remote
 	c.inOffset = 0 // 新しい入力ストリームなので offset を振り直す（server 側 dedup も接続単位）
+	c.inStalled = false
 	c.inMu.Unlock()
 
 	go c.pumpOutput(winner.conn)
@@ -534,7 +547,8 @@ func (c *quicClient) migrate(reason string) error {
 		return err
 	}
 
-	path, err := c.conn.AddPath(tr)
+	conn := c.conn.Load()
+	path, err := conn.AddPath(tr)
 	if err != nil {
 		_ = closeTransport(tr)
 		return err
@@ -542,7 +556,7 @@ func (c *quicClient) migrate(reason string) error {
 	// Probe を送った時点で tr にも conn が登録されるため、失敗しても tr は閉じずに
 	// 保持する（閉じると、まだ生きている conn まで destroy してしまう）。
 	fail := func(err error) error {
-		closePath(c.conn, path)
+		closePath(conn, path)
 		c.pathTransports = append(c.pathTransports, tr)
 		return err
 	}
@@ -645,6 +659,14 @@ func (c *quicClient) pumpOutput(conn *quic.Conn) {
 	}
 }
 
+// 入力 Write の期限。生きた経路の貼り付けは送出に合わせて少しずつ進むので、これだけ
+// 進まなければ経路が詰まっているとみなす。詰まった後（inStalled）は打鍵ごとに長く
+// 待たないよう短い期限で試す。書けなかった分は捨てる（送信失敗と同じ扱い）。
+const (
+	inputWriteTimeout        = 5 * time.Second
+	inputWriteTimeoutStalled = 100 * time.Millisecond
+)
+
 func (c *quicClient) SendInput(data []byte) error {
 	// offset とストリーム書き込みの整合を保つため、Write まで inMu 下で行う
 	// （実際の呼び出し元は handleStdin の単一 goroutine なので競合はほぼない）。
@@ -653,10 +675,20 @@ func (c *quicClient) SendInput(data []byte) error {
 	conn := c.inConn
 	datagramsOK := c.inDatagramsOK
 	offset := c.inOffset
-	_, err := in.Write(data)
-	if err == nil {
-		c.inOffset += uint64(len(data))
+	// 期限を付ける。quic-go の Write は未送出が約 1 パケットを超えると送出されるまでブロック
+	// するので、経路が黙って切れている間（検知まで最大 idle timeout）に打鍵や貼り付けが
+	// 溜まると stdin の処理ごと止まり、Ctrl-^ . の detach も効かなくなる。
+	timeout := inputWriteTimeout
+	if c.inStalled {
+		timeout = inputWriteTimeoutStalled
 	}
+	_ = in.SetWriteDeadline(time.Now().Add(timeout))
+	n, err := in.Write(data)
+	_ = in.SetWriteDeadline(time.Time{})
+	// 書けた分だけ進める（期限切れでも途中まではストリームに載っており、サーバの dedup は
+	// ストリーム上の位置で数えるので、datagram の offset をそれと揃える）
+	c.inOffset += uint64(n)
+	c.inStalled = errors.Is(err, os.ErrDeadlineExceeded)
 	c.inMu.Unlock()
 	if err != nil {
 		// 接続死（スリープ復帰直後など）を打鍵で踏んだら即復帰を起動する
@@ -699,9 +731,17 @@ func (c *quicClient) State() transport.ConnectionState {
 }
 
 func (c *quicClient) setState(s transport.ConnectionState, msg string) {
-	old := transport.ConnectionState(c.state.Swap(int32(s)))
-	if old == s {
-		return
+	var old transport.ConnectionState
+	for {
+		old = transport.ConnectionState(c.state.Load())
+		// Close 後は動いていた reconnect / failover が状態を戻さないようにする
+		// （終了後に "reconnecting" 等を通知しない）
+		if old == s || old == transport.StateClosed {
+			return
+		}
+		if c.state.CompareAndSwap(int32(old), int32(s)) {
+			break
+		}
 	}
 	c.cbMu.Lock()
 	fn := c.onStateChange
@@ -882,10 +922,8 @@ func (c *quicClient) Stats() transport.Stats {
 		LastRecoveryMs: float64(c.lastRecoveryMs.Load()),
 		RecoveryCount:  c.recoveryCount.Load(),
 	}
-	c.migrateMu.Lock()
-	conn := c.conn
-	c.migrateMu.Unlock()
-	if conn != nil {
+	// ロックなしで読む（reconnect が migrateMu を握っている間も Ctrl-^ i を待たせない）
+	if conn := c.conn.Load(); conn != nil {
 		cs := conn.ConnectionStats()
 		st.RTT = float64(cs.SmoothedRTT.Microseconds()) / 1000.0
 		st.BytesSent = cs.BytesSent
@@ -902,11 +940,13 @@ func (c *quicClient) Close() error {
 		c.cancel()
 	}
 	c.setState(transport.StateClosed, "closed")
-	if c.conn != nil {
-		// 意図した終了であることをサーバへ伝える（-R の listener を休眠させずに手放させる）。
-		_ = c.conn.CloseWithError(connCodeClientExit, "done")
-	}
+	// c.conn は reconnect / failover（adoptConn）が migrateMu の下で差し替えるので、
+	// 同じロックの下で読む（差し替え前の接続にだけ終了を伝えて新しい接続を残さない）。
 	c.migrateMu.Lock()
+	if conn := c.conn.Load(); conn != nil {
+		// 意図した終了であることをサーバへ伝える（-R の listener を休眠させずに手放させる）。
+		_ = conn.CloseWithError(connCodeClientExit, "done")
+	}
 	if c.tr != nil {
 		_ = closeTransport(c.tr)
 	}

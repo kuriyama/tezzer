@@ -25,9 +25,6 @@
       "protocol": "UDP",
       "remote_addr": "198.51.100.2:40000",
       "udp_client_id": 1234,
-      "udp_addresses": [
-        "198.51.100.2:40000"
-      ],
       "output_sent_bytes": 4096,
       "slow_output_writes": 3,
       "max_output_write_ms": 120,

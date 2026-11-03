@@ -13,6 +13,7 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: '1.26'
+          check-latest: true
       - run: make ci
   ci-nightly:
     if: github.event_name == 'schedule'
@@ -22,4 +23,5 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: '1.26'
+          check-latest: true
       - run: make ci-nightly

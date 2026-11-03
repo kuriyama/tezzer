@@ -50,10 +50,7 @@ func TestQUICTransport_ResyncBacklog(t *testing.T) {
 	}
 	addr := srv.(interface{ Addr() net.Addr }).Addr().String()
 
-	cli, err := NewClient(k, addr, 55, "")
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
+	cli := NewClient(k, addr, 55, "")
 	defer cli.Close()
 	if err := cli.Start(ctx); err != nil {
 		t.Fatalf("client Start: %v", err)

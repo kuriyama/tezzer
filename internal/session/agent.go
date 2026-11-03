@@ -67,7 +67,7 @@ func (s *Session) handleAgentConn(uconn *net.UnixConn) {
 	defer cancel()
 	fc, err := af.OpenAgentStream(ctx, s.ID)
 	if err != nil {
-		if s.debug {
+		if IsDebugEnabled() {
 			log.Printf("session %s: agent forward: %v", s.ID, err)
 		}
 		return

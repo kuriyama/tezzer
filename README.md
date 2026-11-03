@@ -184,7 +184,9 @@ Port forwards ride the same QUIC connection as the terminal: a network change
 or sleep that the connection survives (migration) keeps even in-flight TCP
 connections alive; after a full reconnect the tunnel definition still works for
 new connections. Forwarding can be disabled server-wide with
-`tezzerd --no-tcp-forwarding`. `tezzer-ssh` passes `-L` through:
+`tezzerd --no-tcp-forwarding`. `Ctrl-^ i` shows `fwd:<active>/<defined>`
+followed by the local ports (the first three, then a count, e.g.
+`[8080,5432,3000+2]`). `tezzer-ssh` passes `-L` through:
 `tezzer-ssh myserver run --name work -L 8080:localhost:3000 -- zsh`.
 
 To add a tunnel to a session you are already attached to, open one from another
@@ -209,7 +211,7 @@ retries every 30 seconds. Connections in flight do not survive a reconnect or a
 `tezzerd` restart (CDP clients need to reconnect), but new ones work as soon as
 a client is back. Server-wide `-R` state appears at the end of `tezzer -list`
 (and under `remote_forwards` in `-list -json`); `Ctrl-^ i` shows
-`rfwd:<active>/<defined>`. As with `ssh -R`, any local user on the server can
+`rfwd:<active>/<defined>[<ports>]`. As with `ssh -R`, any local user on the server can
 connect to a forwarded port. `--no-tcp-forwarding` disables `-R` too.
 
 **Exit status is propagated like ssh.** When the session's command exits while
@@ -225,6 +227,15 @@ interactive session, detach (`Ctrl-^ .`) and resume without it — reattaching
 is cheap, the session keeps running. Tunnels you expect to add and remove
 individually are best opened with `-N` in the first place, so their lifetime
 is independent of your interactive attachments.
+
+**`tezzer -list-forwards` lists the tunnels of every tezzer client on this
+machine** (PID, server, session, `-L`/`-R`, target, and whether each `-L`
+bound). It reads a local registry (`~/.tezzer/run/<pid>.json`, written by each
+client with forwards and removed when it exits) and never contacts a server, so
+it works across servers and for `-N` clients that have no status line. `-R`
+entries only show what the client requested; the server-side state (listening,
+waiting, which machine holds the port) is in `tezzer -list`. Add `-json` for
+machine-readable output.
 
 ### `tezzer-ssh` wrapper
 

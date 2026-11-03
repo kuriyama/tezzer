@@ -7,20 +7,6 @@ import (
 	"time"
 )
 
-// TestNewClient はクライアント作成をテストします。
-func TestNewClient(t *testing.T) {
-	client := NewClient("stun.l.google.com:19302")
-	if client == nil {
-		t.Fatal("NewClient returned nil")
-	}
-	if client.ServerAddr != "stun.l.google.com:19302" {
-		t.Errorf("unexpected server addr: %s", client.ServerAddr)
-	}
-	if client.Timeout != 5*time.Second {
-		t.Errorf("unexpected timeout: %v", client.Timeout)
-	}
-}
-
 // TestMakeBindingRequest はBinding Requestの作成をテストします。
 func TestMakeBindingRequest(t *testing.T) {
 	txID := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C}
@@ -91,16 +77,13 @@ func TestParseXorMappedAddress(t *testing.T) {
 	}
 }
 
-// TestGetMappedAddr はSTUNサーバーとの実際のUDP往復（Client.GetMappedAddr）を
+// TestMappedAddr はSTUNサーバーとの実際のUDP往復（MappedAddr）を
 // テストします。外部ネットワークには依存せず、ループバック上に立てた最小の
 // STUNサーバー（startLoopbackStunServer）を使うため、隔離環境でも常に実行される。
-func TestGetMappedAddr(t *testing.T) {
+func TestMappedAddr(t *testing.T) {
 	server := startLoopbackStunServer(t)
 
-	client := NewClient(server)
-	client.Timeout = 2 * time.Second
-
-	addr, err := client.GetMappedAddr()
+	addr, err := MappedAddr("udp", server, 2*time.Second)
 	if err != nil {
 		t.Fatalf("failed to get mapped addr from %s: %v", server, err)
 	}
@@ -113,18 +96,14 @@ func TestGetMappedAddr(t *testing.T) {
 	}
 }
 
-// TestClientNetworkOverride は Client.Network を明示指定した場合に、
+// TestMappedAddrNetwork は network に family を指定した場合に、
 // その family でダイヤルされることを確認する（v4/v6 個別STUN問い合わせの土台）。
-func TestClientNetworkOverride(t *testing.T) {
+func TestMappedAddrNetwork(t *testing.T) {
 	server := startLoopbackStunServer(t)
 
-	client := NewClient(server)
-	client.Network = "udp4"
-	client.Timeout = 2 * time.Second
-
-	addr, err := client.GetMappedAddr()
+	addr, err := MappedAddr("udp4", server, 2*time.Second)
 	if err != nil {
-		t.Fatalf("GetMappedAddr with Network=udp4 failed: %v", err)
+		t.Fatalf("MappedAddr(udp4) failed: %v", err)
 	}
 	if addr.IP.To4() == nil {
 		t.Errorf("expected an IPv4 address, got %v", addr.IP)

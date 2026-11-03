@@ -106,10 +106,13 @@ func parseForwardSpec(spec string) (forwardSpec, error) {
 
 // startForwardListeners は -L の listener 群を起動する。
 // bind 失敗は ssh 同様に警告して継続する（他の forward とセッションは生かす）。
-func (c *Client) startForwardListeners() {
-	for _, sp := range c.forwards {
+// 戻り値は c.forwards と同順の bind エラー（成功は nil。-list-forwards の表示用）。
+func (c *Client) startForwardListeners() []error {
+	errs := make([]error, len(c.forwards))
+	for i, sp := range c.forwards {
 		ln, err := net.Listen("tcp", sp.listenAddr)
 		if err != nil {
+			errs[i] = err
 			c.forwardWarn(fmt.Sprintf("-L %s: %v", sp, err))
 			continue
 		}
@@ -122,6 +125,7 @@ func (c *Client) startForwardListeners() {
 		}(ln)
 		go c.acceptForwardLoop(sp, ln)
 	}
+	return errs
 }
 
 func (c *Client) acceptForwardLoop(sp forwardSpec, ln net.Listener) {

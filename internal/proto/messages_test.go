@@ -1,6 +1,7 @@
 package proto
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -187,5 +188,23 @@ func TestDecodeInvalidData(t *testing.T) {
 	_, err := Decode([]byte("invalid msgpack data"))
 	if err == nil {
 		t.Fatal("expected error for invalid data")
+	}
+}
+
+// TestDecodeAllTypes は newMsg の全エントリについて、type だけのメッセージが
+// 対応する構造体へデコードされることを確かめる（表の書き間違い検出）。
+func TestDecodeAllTypes(t *testing.T) {
+	for typ, ctor := range newMsg {
+		data, err := Encode(map[string]string{"type": typ})
+		if err != nil {
+			t.Fatalf("Encode(%s): %v", typ, err)
+		}
+		got, err := Decode(data)
+		if err != nil {
+			t.Fatalf("Decode(%s): %v", typ, err)
+		}
+		if want := ctor(); reflect.TypeOf(got) != reflect.TypeOf(want) {
+			t.Errorf("Decode(%s) = %T, want %T", typ, got, want)
+		}
 	}
 }

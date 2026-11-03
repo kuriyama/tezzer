@@ -81,10 +81,7 @@ func TestPTYoverQUIC(t *testing.T) {
 	}()
 
 	// --- クライアント ---
-	cli, err := NewClient(k, addr, 7777, "")
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
+	cli := NewClient(k, addr, 7777, "")
 	defer cli.Close()
 	if err := cli.Start(ctx); err != nil {
 		t.Fatalf("client Start: %v", err)

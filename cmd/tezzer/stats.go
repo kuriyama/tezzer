@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"golang.org/x/term"
 )
 
 type clientStatsJSON struct {
@@ -72,14 +74,18 @@ func (c *Client) writeStatsFile() {
 		}
 	}
 
+	// 端末サイズはその場で取得する（writeStatsFile は別 goroutine で動くため、
+	// sendResize 側で記録した値を読むとデータ競合になる）。端末でなければ 0x0
+	cols, rows, _ := term.GetSize(c.termFd)
+
 	stats := clientStatsJSON{
 		Timestamp: time.Now().Format(time.RFC3339),
 		SessionID: c.sessionID,
 		Client: clientInfoJSON{
 			BuildID:      version.GetVersion(),
 			BuiltAt:      version.GetBuildTime(),
-			TerminalCols: c.width,
-			TerminalRows: c.height,
+			TerminalCols: cols,
+			TerminalRows: rows,
 			DebugOutput:  c.isDebugEnabled(),
 		},
 	}

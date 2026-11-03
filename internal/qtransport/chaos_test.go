@@ -85,10 +85,7 @@ func runChaosModerateLoss(t *testing.T, seed uint64) {
 	defer relay.Close()
 
 	const clientID = uint16(9001)
-	cli, err := NewClient(k, relay.Addr(), clientID, "")
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
+	cli := NewClient(k, relay.Addr(), clientID, "")
 	defer cli.Close()
 	if err := cli.Start(ctx); err != nil {
 		t.Fatalf("client Start: %v", err)

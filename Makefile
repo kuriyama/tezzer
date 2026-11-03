@@ -24,7 +24,7 @@ STRIP := -s -w
 MODULE := $(shell go list -m)
 LDFLAGS := $(STRIP) -X $(MODULE)/internal/version.Version=$(VERSION) -X $(MODULE)/internal/version.GitCommit=$(GIT_COMMIT)$(GIT_DIRTY) -X $(MODULE)/internal/version.BuildTime=$(BUILD_TIME)
 
-.PHONY: build dist test test-race vet fmt fmt-check ci ci-nightly e2e e2e-docker test-chaos deadcode dupl clean install
+.PHONY: build dist test test-race vet fmt fmt-check ci ci-nightly e2e e2e-docker test-chaos deadcode dupl vulncheck clean install
 
 build:
 	go build -ldflags "$(LDFLAGS)" -o bin/tezzerd ./cmd/tezzerd
@@ -120,8 +120,9 @@ ci: fmt-check vet
 
 # ci-nightly は定期実行向けの重いチェック: race 付き全テスト（-short を外すので
 # sleep_spike/pty_integration も実行される）+ カオステスト。いずれも外部ネットワーク
-# 不要で、実時間依存は数秒〜十数秒程度に収まる。
-ci-nightly: fmt-check vet
+# 不要で、実時間依存は数秒〜十数秒程度に収まる。加えて vulncheck で既知脆弱性を
+# 定期的に検出する（これだけは vuln.go.dev へのネットワークが要る）。
+ci-nightly: fmt-check vet vulncheck
 	go test -race ./...
 	go test -tags chaos -race -count=1 ./internal/qtransport/
 
@@ -143,6 +144,15 @@ deadcode:
 # ネットワーク（初回のみ）が要るため CI には組み込まず手動実行。
 dupl:
 	go run github.com/mibk/dupl@v1.1.0 -t 50 $(shell find . -name "*.go" -not -name "*_test.go" -not -path "./.git/*")
+
+# vulncheck は golang.org/x/vuln/cmd/govulncheck による既知脆弱性の手動チェック。
+# Go Vulnerability Database（vuln.go.dev）と照合し、依存モジュールに加えてビルドに使う
+# Go 標準ライブラリも対象にする。実際に呼び出している脆弱な関数だけを報告する。
+# deadcode と同じく go run のバージョン指定実行で go.mod を汚さない。
+# 実行ごとに DB の取得でネットワークが要るため、毎プッシュの ci には入れず
+# ci-nightly でのみ実行する（新しい脆弱性が公開されたら nightly が失敗して気付ける）。
+vulncheck:
+	go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
 clean:
 	rm -rf bin/ dist/

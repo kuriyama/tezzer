@@ -62,10 +62,7 @@ func setupForwardPair(t *testing.T, forwardingEnabled bool) transport.TCPForward
 	}
 	addr := srv.(interface{ Addr() net.Addr }).Addr().String()
 
-	cli, err := NewClient(k, addr, 1, "")
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
+	cli := NewClient(k, addr, 1, "")
 	t.Cleanup(func() { cli.Close() })
 	if err := cli.Start(ctx); err != nil {
 		t.Fatalf("client Start: %v", err)

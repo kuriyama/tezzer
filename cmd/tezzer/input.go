@@ -7,7 +7,6 @@ package main
 
 import (
 	"fmt"
-	"github.com/kuriyama/tezzer/internal/netx"
 	"github.com/kuriyama/tezzer/internal/proto"
 	"io"
 	"log"
@@ -29,21 +28,9 @@ func (c *Client) sendInputBytes(data []byte) error {
 		return ct.SendInput(data)
 	}
 
-	// TCP経由で送信
-	inputMsg := proto.InputMsg{
-		Type:      "INPUT",
-		SessionID: c.sessionID,
-		Data:      data,
-	}
-	inputData, err := proto.Encode(inputMsg)
-	if err != nil {
-		return fmt.Errorf("encode input error: %w", err)
-	}
-	c.connMu.Lock()
-	err = netx.WriteFrame(c.conn, inputData)
-	c.connMu.Unlock()
-	if err != nil {
-		return fmt.Errorf("write input error: %w", err)
+	// QUIC 確立前は UDS 経由で送信
+	if err := c.sendUDS(proto.InputMsg{Type: "INPUT", SessionID: c.sessionID, Data: data}); err != nil {
+		return fmt.Errorf("send input: %w", err)
 	}
 	return nil
 }
@@ -74,7 +61,7 @@ func (c *Client) noteSendResult(kind string, n int, err error) {
 
 // flushEscBatch はESC batchingバッファをフラッシュして送信する
 func (c *Client) flushEscBatch(reason string) {
-	if !c.escBatchActive || len(c.escBatchBuf) == 0 {
+	if len(c.escBatchBuf) == 0 {
 		return
 	}
 
@@ -90,7 +77,6 @@ func (c *Client) flushEscBatch(reason string) {
 	c.noteSendResult("ESC batch", len(c.escBatchBuf), c.sendInputBytes(c.escBatchBuf))
 
 	// 状態リセット
-	c.escBatchActive = false
 	c.escBatchBuf = nil
 }
 
@@ -259,7 +245,7 @@ func (c *Client) handleStdin() {
 	// バッチ状態に基づいてタイマーを更新する（バッチがなければ停止）
 	recheckFlushTimer := func() {
 		var d time.Duration
-		if c.escBatchActive {
+		if len(c.escBatchBuf) > 0 {
 			d = 6*time.Millisecond - time.Since(c.escBatchStart)
 		} else if len(c.inputBatchBuf) > 0 {
 			d = 2*time.Millisecond - time.Since(c.inputBatchStart)
@@ -308,7 +294,7 @@ func (c *Client) handleStdin() {
 	for {
 		select {
 		case <-flushTimer.C:
-			if c.escBatchActive {
+			if len(c.escBatchBuf) > 0 {
 				c.flushEscBatch("timeout")
 			}
 			if len(c.inputBatchBuf) > 0 {
@@ -325,7 +311,7 @@ func (c *Client) handleStdin() {
 				if err != io.EOF {
 					log.Printf("stdin read error: %v\n", err)
 				}
-				c.doneOnce.Do(func() { close(c.done) })
+				c.finish(nil)
 				return
 			}
 
@@ -339,15 +325,11 @@ func (c *Client) handleStdin() {
 						c.escapePressed = false
 						if b == '.' {
 							// エスケープキー + . でデタッチ（正常終了）
+							// メッセージは finish より前に出す（finish 後は main が即座に終了しうる）
 							c.restoreTerminalModes()
-							select {
-							case c.errCh <- errDetached:
-							default:
-							}
-							c.doneOnce.Do(func() { close(c.done) })
-							time.Sleep(10 * time.Millisecond)
-							c.conn.Close()
 							fmt.Fprintf(os.Stderr, "\r\nDetached from session.\r\n")
+							c.finish(nil)
+							c.conn.Close() // 読み取り中の handleServer を抜けさせる
 							return
 						}
 						if b == 'i' {
@@ -391,12 +373,9 @@ func (c *Client) handleStdin() {
 							continue
 						}
 						if b == c.escapeByte {
-							// エスケープキー + エスケープキー でエスケープキーそのものを送信
-							if err := c.sendInputBytes([]byte{b}); err != nil {
-								log.Printf("send input error: %v", err)
-								c.doneOnce.Do(func() { close(c.done) })
-								return
-							}
+							// エスケープキー + エスケープキー でエスケープキーそのものを送信。
+							// 失敗は通常の打鍵と同じく記録して続行する（復帰中に押しても落とさない）
+							c.noteSendResult("Escape key", 1, c.sendInputBytes([]byte{b}))
 							continue
 						}
 						// その他のエスケープシーケンスは無視
@@ -411,7 +390,7 @@ func (c *Client) handleStdin() {
 					// ESC batching ロジック
 					if b == 0x1b { // ESC
 						// 既存のバッファがあれば先にフラッシュ
-						if c.escBatchActive {
+						if len(c.escBatchBuf) > 0 {
 							c.flushEscBatch("new-esc")
 						}
 						// inputBatch が残っていれば先にフラッシュ（送信順序保証）
@@ -420,13 +399,12 @@ func (c *Client) handleStdin() {
 							c.flushInputBatch("pre-esc")
 						}
 						// 新しいESC batchingを開始
-						c.escBatchActive = true
 						c.escBatchBuf = []byte{0x1b}
 						c.escBatchStart = time.Now()
 						continue
 					}
 
-					if c.escBatchActive {
+					if len(c.escBatchBuf) > 0 {
 						// ESC batching中
 						c.escBatchBuf = append(c.escBatchBuf, b)
 

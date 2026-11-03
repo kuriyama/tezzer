@@ -34,10 +34,7 @@ func TestQUICTransport_EndToEnd(t *testing.T) {
 	addr := srv.(interface{ Addr() net.Addr }).Addr().String()
 
 	const clientID = uint16(4242)
-	cli, err := NewClient(k, addr, clientID, "")
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
+	cli := NewClient(k, addr, clientID, "")
 	defer cli.Close()
 	if err := cli.Start(ctx); err != nil {
 		t.Fatalf("client Start: %v", err)

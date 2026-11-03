@@ -16,18 +16,17 @@ import (
 )
 
 type sessionClientJSON struct {
-	ID                  string   `json:"id"`
-	Protocol            string   `json:"protocol"`
-	RemoteAddr          string   `json:"remote_addr,omitempty"`
-	QUICRemoteAddr      string   `json:"quic_remote_addr,omitempty"`
-	UDPClientID         uint16   `json:"udp_client_id,omitempty"`
-	UDPAddresses        []string `json:"udp_addresses,omitempty"`
-	OutputSentBytes     int      `json:"output_sent_bytes,omitempty"`
-	SlowOutputWrites    uint64   `json:"slow_output_writes,omitempty"`
-	MaxOutputWriteMs    uint64   `json:"max_output_write_ms,omitempty"`
-	OutputStallEpisodes uint64   `json:"output_stall_episodes,omitempty"`
-	OutputStallMs       uint64   `json:"output_stall_ms,omitempty"`
-	LastSeenAt          string   `json:"last_seen_at,omitempty"`
+	ID                  string `json:"id"`
+	Protocol            string `json:"protocol"`
+	RemoteAddr          string `json:"remote_addr,omitempty"`
+	QUICRemoteAddr      string `json:"quic_remote_addr,omitempty"`
+	UDPClientID         uint16 `json:"udp_client_id,omitempty"`
+	OutputSentBytes     int    `json:"output_sent_bytes,omitempty"`
+	SlowOutputWrites    uint64 `json:"slow_output_writes,omitempty"`
+	MaxOutputWriteMs    uint64 `json:"max_output_write_ms,omitempty"`
+	OutputStallEpisodes uint64 `json:"output_stall_episodes,omitempty"`
+	OutputStallMs       uint64 `json:"output_stall_ms,omitempty"`
+	LastSeenAt          string `json:"last_seen_at,omitempty"`
 	// TCP ポートフォワード（-L）統計
 	ForwardsActive         int    `json:"forwards_active,omitempty"`
 	ForwardsOpened         uint64 `json:"forwards_opened,omitempty"`
@@ -108,7 +107,6 @@ func toSessionJSON(s proto.SessionInfo, loc *time.Location) sessionJSON {
 			RemoteAddr:             c.RemoteAddr,
 			QUICRemoteAddr:         c.QUICRemoteAddr,
 			UDPClientID:            c.UDPClientID,
-			UDPAddresses:           c.UDPAddresses,
 			OutputSentBytes:        c.SendBufferBytes,
 			SlowOutputWrites:       c.SlowOutputWrites,
 			MaxOutputWriteMs:       c.MaxOutputWriteMs,

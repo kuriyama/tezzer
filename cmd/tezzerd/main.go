@@ -8,6 +8,7 @@ import (
 	"github.com/kuriyama/tezzer/internal/proto"
 	"github.com/kuriyama/tezzer/internal/session"
 	"github.com/kuriyama/tezzer/internal/stun"
+	"github.com/kuriyama/tezzer/internal/transport"
 	"github.com/kuriyama/tezzer/internal/version"
 	"io"
 	"log"
@@ -17,20 +18,11 @@ import (
 	"os/signal"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/vmihailenco/msgpack/v5"
 )
-
-// デバッグ出力のグローバル制御（atomic操作用、0=OFF, 1=ON）
-var debugEnabled int32
-
-// isDebugEnabled はデバッグ出力が有効かどうかを返す
-func isDebugEnabled() bool {
-	return atomic.LoadInt32(&debugEnabled) == 1
-}
 
 func main() {
 	listenUnix := flag.String("listen-unix", "", "Unix Domain Socket path (default: $XDG_RUNTIME_DIR/tezzer.sock or ~/.tezzer/tezzer.sock)")
@@ -55,12 +47,8 @@ func main() {
 		os.Exit(runCheckNAT(*stunServer, *stunServer2, *ipv4Only))
 	}
 
-	// デバッグフラグの初期値（環境変数から）
-	debugInit := os.Getenv("TEZZER_DEBUG") != ""
-	if debugInit {
-		atomic.StoreInt32(&debugEnabled, 1)
-	}
-	session.SetDebugEnabled(debugInit)
+	// デバッグフラグの初期値（環境変数から）。フラグ本体は session パッケージが持つ
+	session.SetDebugEnabled(os.Getenv("TEZZER_DEBUG") != "")
 
 	mgr := session.NewManager()
 	if *noTCPForwarding {
@@ -99,7 +87,7 @@ func main() {
 	// （固定ポートを port-forward した運用向け）。未指定なら各セッションが per-session で QUIC を起動。
 	// 無停止再起動で共有 transport を引き継いだ場合は不要（ソケットごと復元済み）。
 	if *udpPort > 0 && !mgr.IsSharedTransportEnabled() {
-		if err := mgr.InitSharedTransport(*udpPort, *ipv4Only); err != nil {
+		if err := mgr.InitSharedTransport(*udpPort); err != nil {
 			log.Fatalf("failed to initialize shared QUIC transport: %v", err)
 		}
 	}
@@ -162,16 +150,8 @@ func main() {
 				}
 			} else if sig == syscall.SIGUSR1 {
 				// デバッグ出力をトグル
-				old := atomic.LoadInt32(&debugEnabled)
-				var newVal int32
-				if old == 0 {
-					newVal = 1
-				}
-				atomic.StoreInt32(&debugEnabled, newVal)
-				enabled := newVal == 1
+				enabled := !session.IsDebugEnabled()
 				session.SetDebugEnabled(enabled)
-				// 全セッションのデバッグフラグも更新
-				mgr.SetDebugForAllSessions(enabled)
 				status := "OFF"
 				if enabled {
 					status = "ON"
@@ -212,7 +192,7 @@ func main() {
 			}
 		}
 
-		go handleConnection(conn, mgr, *stunServer, *ipv4Only, *udpPort)
+		go handleConnection(conn, mgr, *stunServer, *ipv4Only)
 	}
 }
 
@@ -231,7 +211,20 @@ func (c *udsConn) WriteFrame(payload []byte) error {
 	return netx.WriteFrame(c.Conn, payload)
 }
 
-func handleConnection(rawConn net.Conn, mgr *session.Manager, stunServer string, ipv4Only bool, fixedUDPPort int) {
+// WriteMsg は msg を msgpack にして 1 フレーム送る。失敗は what を添えてログに出し、
+// エラーを返す（呼び出し側は接続を諦めるかどうかだけ判断すればよい）。
+func (c *udsConn) WriteMsg(msg any, what string) error {
+	data, err := msgpack.Marshal(msg)
+	if err == nil {
+		err = c.WriteFrame(data)
+	}
+	if err != nil {
+		log.Printf("write %s error: %v", what, err)
+	}
+	return err
+}
+
+func handleConnection(rawConn net.Conn, mgr *session.Manager, stunServer string, ipv4Only bool) {
 	conn := &udsConn{Conn: rawConn}
 	defer conn.Close()
 
@@ -277,20 +270,7 @@ func handleConnection(rawConn net.Conn, mgr *session.Manager, stunServer string,
 
 	log.Printf("client hello: %s (%dx%d)", helloMsg.ClientName, helloMsg.Cols, helloMsg.Rows)
 
-	// Send WELCOME
-	welcomeMsg := proto.WelcomeMsg{
-		Type:       "WELCOME",
-		ServerName: "tezzerd",
-	}
-
-	welcomeData, err := msgpack.Marshal(welcomeMsg)
-	if err != nil {
-		log.Printf("marshal welcome error: %v", err)
-		return
-	}
-
-	if err := conn.WriteFrame(welcomeData); err != nil {
-		log.Printf("write welcome error: %v", err)
+	if conn.WriteMsg(proto.WelcomeMsg{Type: "WELCOME", ServerName: "tezzerd"}, "welcome") != nil {
 		return
 	}
 
@@ -314,29 +294,21 @@ func handleConnection(rawConn net.Conn, mgr *session.Manager, stunServer string,
 	case *proto.ListSessionsMsg:
 		// セッション一覧を返す
 		sessions := mgr.GetAllSessions()
-		if isDebugEnabled() {
+		if session.IsDebugEnabled() {
 			log.Printf("LIST_SESSIONS: total sessions=%d", len(sessions))
 		}
 		sessInfos := make([]proto.SessionInfo, len(sessions))
 		for i, s := range sessions {
-			if isDebugEnabled() {
+			if session.IsDebugEnabled() {
 				log.Printf("LIST_SESSIONS: session %s has %d clients", s.ID, s.GetClientCount())
 			}
 			sessInfos[i] = sessionProtoInfo(s)
 		}
-		listMsg := proto.SessionsListMsg{
+		conn.WriteMsg(proto.SessionsListMsg{
 			Type:           "SESSIONS_LIST",
 			Sessions:       sessInfos,
 			RemoteForwards: mgr.RemoteForwards(),
-		}
-		listData, err := msgpack.Marshal(listMsg)
-		if err != nil {
-			log.Printf("marshal sessions list error: %v", err)
-			return
-		}
-		if err := conn.WriteFrame(listData); err != nil {
-			log.Printf("write sessions list error: %v", err)
-		}
+		}, "sessions list")
 		return
 
 	case *proto.GetSessionInfoMsg:
@@ -347,18 +319,7 @@ func handleConnection(rawConn net.Conn, mgr *session.Manager, stunServer string,
 			return
 		}
 
-		infoMsg := proto.SessionInfoMsg{
-			Type:    "SESSION_INFO",
-			Session: sessionProtoInfo(sess),
-		}
-		infoData, err := msgpack.Marshal(infoMsg)
-		if err != nil {
-			log.Printf("marshal session info error: %v", err)
-			return
-		}
-		if err := conn.WriteFrame(infoData); err != nil {
-			log.Printf("write session info error: %v", err)
-		}
+		conn.WriteMsg(proto.SessionInfoMsg{Type: "SESSION_INFO", Session: sessionProtoInfo(sess)}, "session info")
 		return
 
 	case *proto.KillSessionMsg:
@@ -368,14 +329,7 @@ func handleConnection(rawConn net.Conn, mgr *session.Manager, stunServer string,
 
 	case *proto.GetServerMetaMsg:
 		// セッションに attach せずサーバー情報だけを返す（tezzer -server-version）
-		metaData, err := msgpack.Marshal(serverMetaMsg(mgr))
-		if err != nil {
-			log.Printf("marshal server meta error: %v", err)
-			return
-		}
-		if err := conn.WriteFrame(metaData); err != nil {
-			log.Printf("write server meta error: %v", err)
-		}
+		conn.WriteMsg(serverMetaMsg(mgr), "server meta")
 		return
 
 	case *proto.WaitSessionMsg:
@@ -395,7 +349,7 @@ func handleConnection(rawConn net.Conn, mgr *session.Manager, stunServer string,
 			cmd = session.LoginShell()
 		}
 		log.Printf("creating session: cmd=%s args=%v name=%q", cmd, m.Args, m.Name)
-		sess, err = mgr.CreateSession(m.Name, cmd, m.Args, m.Env, m.Cwd, m.Rows, m.Cols, ipv4Only, fixedUDPPort, m.AgentForward)
+		sess, err = mgr.CreateSession(m.Name, cmd, m.Args, m.Env, m.Cwd, m.Rows, m.Cols, m.AgentForward)
 		if err != nil {
 			log.Printf("create session error: %v", err)
 			if errors.Is(err, session.ErrDuplicateName) {
@@ -419,27 +373,7 @@ func handleConnection(rawConn net.Conn, mgr *session.Manager, stunServer string,
 			sess.UseLoginShell()
 		}
 
-		stunAddrs, localAddrs := resolveUDPAddrs(sess, stunServer, ipv4Only)
-
-		createdMsg := proto.SessionCreatedMsg{
-			Type:       "SESSION_CREATED",
-			SessionID:  sess.ID,
-			Name:       sess.Name,
-			UDPEnabled: sess.IsQUICEnabled(),
-			UDPPort:    sess.GetQUICPort(),
-			UDPKey:     sess.GetQUICKey(),
-			STUNAddrs:  stunAddrs,
-			LocalAddrs: localAddrs,
-			STUNServer: stunServer,
-		}
-
-		createdData, err := msgpack.Marshal(createdMsg)
-		if err != nil {
-			log.Printf("marshal session created error: %v", err)
-			return
-		}
-		if err := conn.WriteFrame(createdData); err != nil {
-			log.Printf("write session created error: %v", err)
+		if conn.WriteMsg(sessionCreatedMsg(sess, stunServer, ipv4Only), "session created") != nil {
 			return
 		}
 
@@ -493,29 +427,10 @@ func handleConnection(rawConn net.Conn, mgr *session.Manager, stunServer string,
 		client = sess.AttachClient(m.FromSeq, protocol, remoteAddr, m.ClientID)
 
 		// Send SESSION_CREATED (attach成功の通知として)
-		stunAddrs, localAddrs := resolveUDPAddrs(sess, stunServer, ipv4Only)
-
-		attachedMsg := proto.SessionCreatedMsg{
-			Type:       "SESSION_CREATED",
-			SessionID:  sess.ID,
-			Name:       sess.Name,
-			UDPEnabled: sess.IsQUICEnabled(),
-			UDPPort:    sess.GetQUICPort(),
-			UDPKey:     sess.GetQUICKey(),
-			STUNAddrs:  stunAddrs,
-			LocalAddrs: localAddrs,
-			STUNServer: stunServer,
-			PTYClosed:  sess.IsPTYClosed(),
-			TermModes:  sess.TermModeRestore(),
-		}
-
-		attachedData, err := msgpack.Marshal(attachedMsg)
-		if err != nil {
-			log.Printf("marshal session attached error: %v", err)
-			return
-		}
-		if err := conn.WriteFrame(attachedData); err != nil {
-			log.Printf("write session attached error: %v", err)
+		attachedMsg := sessionCreatedMsg(sess, stunServer, ipv4Only)
+		attachedMsg.PTYClosed = sess.IsPTYClosed()
+		attachedMsg.TermModes = sess.TermModeRestore()
+		if conn.WriteMsg(attachedMsg, "session attached") != nil {
 			return
 		}
 
@@ -546,27 +461,11 @@ func handleConnection(rawConn net.Conn, mgr *session.Manager, stunServer string,
 		}
 	}()
 
-	// クライアント識別用の表示名を準備
-	clientDisplay := ""
-	remoteAddrObj := conn.RemoteAddr()
-	if remoteAddrObj != nil {
-		addrStr := remoteAddrObj.String()
-		// Unix Socketの場合は "@" や空文字になることがある
-		if addrStr != "" && addrStr != "@" {
-			clientDisplay = addrStr
-		}
-	}
+	// クライアント識別用の表示名（UDS の RemoteAddr は "@" や空なので UID で示す）
+	clientDisplay := fmt.Sprintf("unix-socket(UID:%d)", peerUID)
 
-	// Unix Socketまたはアドレス取得失敗の場合
-	if clientDisplay == "" {
-		if peerUID, err := netx.GetPeerUID(rawConn); err == nil {
-			clientDisplay = fmt.Sprintf("unix-socket(UID:%d)", peerUID)
-		} else {
-			clientDisplay = "unix-socket"
-		}
-	}
-
-	// Read input, resize, ping messages
+	// Read input, resize and other client messages
+readLoop:
 	for {
 		frameData, err := netx.ReadFrame(conn)
 		if err != nil {
@@ -604,38 +503,19 @@ func handleConnection(rawConn net.Conn, mgr *session.Manager, stunServer string,
 				log.Printf("session %s: failed to register QUIC client: %v", m.SessionID, err)
 			}
 
-		case *proto.PingMsg:
-			pongMsg := proto.PongMsg{
-				Type:  "PONG",
-				Nonce: m.Nonce,
-			}
-			pongData, err := msgpack.Marshal(pongMsg)
-			if err != nil {
-				log.Printf("marshal pong error: %v", err)
-				continue
-			}
-			if err := conn.WriteFrame(pongData); err != nil {
-				log.Printf("write pong error: %v", err)
-				break
-			}
-
 		case *proto.GetServerMetaMsg:
 			// サーバーのメタ情報を返す
-			metaData, err := msgpack.Marshal(serverMetaMsg(mgr))
-			if err != nil {
-				log.Printf("marshal server meta error: %v", err)
-				continue
-			}
-			if err := conn.WriteFrame(metaData); err != nil {
-				log.Printf("write server meta error: %v", err)
-				break
+			if conn.WriteMsg(serverMetaMsg(mgr), "server meta") != nil {
+				break readLoop
 			}
 
 		case *proto.KillSessionMsg:
 			// セッションを終了する（セッションループ内からの処理）
 			log.Printf("session %s: kill request received from client", m.SessionID)
 			killSessionAndRespond(conn, mgr, m.SessionID)
-			return
+			// return だと下の DetachClient・<-writerDone を通らず、writer goroutine が
+			// client.Done を待ち続けてセッションごと残る
+			break readLoop
 
 		default:
 			log.Printf("unexpected message type: %T", msg)
@@ -654,22 +534,30 @@ func handleConnection(rawConn net.Conn, mgr *session.Manager, stunServer string,
 }
 
 func sendError(conn *udsConn, code, message string) {
-	errMsg := proto.ErrorMsg{
-		Type:    "ERROR",
-		Code:    code,
-		Message: message,
+	conn.WriteMsg(proto.ErrorMsg{Type: "ERROR", Code: code, Message: message}, "error")
+}
+
+// sessionCreatedMsg は CREATE/ATTACH 共通の SESSION_CREATED 応答（QUIC 接続情報つき）を組み立てる。
+func sessionCreatedMsg(sess *session.Session, stunServer string, ipv4Only bool) proto.SessionCreatedMsg {
+	stunAddrs, localAddrs := resolveUDPAddrs(sess, stunServer, ipv4Only)
+	return proto.SessionCreatedMsg{
+		Type:       "SESSION_CREATED",
+		SessionID:  sess.ID,
+		Name:       sess.Name,
+		UDPEnabled: sess.IsQUICEnabled(),
+		UDPPort:    sess.GetQUICPort(),
+		UDPKey:     sess.GetQUICKey(),
+		STUNAddrs:  stunAddrs,
+		LocalAddrs: localAddrs,
+		STUNServer: stunServer,
 	}
-	errData, _ := msgpack.Marshal(errMsg)
-	conn.WriteFrame(errData)
 }
 
 // sessionProtoInfo は Session から proto.SessionInfo を組み立てる（LIST_SESSIONS・
-// GET_SESSION_INFO で共通）。旧実装では LIST_SESSIONS 側だけ OutputBufferBytes 等の
-// リングバッファ統計が、GET_SESSION_INFO 側だけ LastDetachedAt/LastUDPAddr が
-// 欠けているという非対称性があったが、統合により解消した。
+// GET_SESSION_INFO で共通）。
 func sessionProtoInfo(s *session.Session) proto.SessionInfo {
 	clientInfos := s.GetClientInfos()
-	protoClientInfos := clientInfosWithStats(clientInfos, s.GetClientSendBufferStats())
+	protoClientInfos := clientInfosWithStats(clientInfos, s.GetClientSendStats())
 
 	var lastDetachedAt int64
 	if t := s.GetLastDetachedAt(); !t.IsZero() {
@@ -723,10 +611,10 @@ func sessionProtoInfo(s *session.Session) proto.SessionInfo {
 // LIST_SESSIONS・GET_SESSION_INFO で共通（旧実装では LIST_SESSIONS 側だけ
 // SendBufferBytes/SlowOutputWrites/MaxOutputWriteMs が未設定という非対称性が
 // あったが、統合により解消した）。
-func clientInfosWithStats(clientInfos []session.ClientInfo, sendStats []session.ClientSendBufferStats) []proto.ClientInfo {
-	sendStatsMap := make(map[uint16]session.ClientSendBufferStats, len(sendStats))
+func clientInfosWithStats(clientInfos []session.ClientInfo, sendStats []transport.ClientSendStat) []proto.ClientInfo {
+	sendStatsMap := make(map[uint16]transport.ClientSendStat, len(sendStats))
 	for _, st := range sendStats {
-		sendStatsMap[st.ClientID] = st
+		sendStatsMap[st.Client.Num] = st
 	}
 	result := make([]proto.ClientInfo, len(clientInfos))
 	for i, ci := range clientInfos {
@@ -738,10 +626,8 @@ func clientInfosWithStats(clientInfos []session.ClientInfo, sendStats []session.
 			UDPClientID: ci.QUICClientID,
 		}
 		if st, ok := sendStatsMap[ci.QUICClientID]; ok {
-			result[i].SendBufferBytes = st.TotalBytes
-			if !st.LastSeen.IsZero() {
-				result[i].LastSeen = st.LastSeen.Unix()
-			}
+			result[i].SendBufferBytes = int(st.BytesSent)
+			result[i].LastSeen = st.LastSendUnix
 			result[i].QUICRemoteAddr = st.QUICRemoteAddr
 			result[i].SlowOutputWrites = st.SlowWrites
 			result[i].MaxOutputWriteMs = st.MaxWriteMs
@@ -764,18 +650,7 @@ func killSessionAndRespond(conn *udsConn, mgr *session.Manager, sessionID string
 		sendError(conn, proto.ErrNoSuchSession, err.Error())
 		return
 	}
-	killedMsg := proto.SessionKilledMsg{
-		Type:      "SESSION_KILLED",
-		SessionID: sessionID,
-	}
-	killedData, err := msgpack.Marshal(killedMsg)
-	if err != nil {
-		log.Printf("marshal session killed error: %v", err)
-		return
-	}
-	if err := conn.WriteFrame(killedData); err != nil {
-		log.Printf("write session killed error: %v", err)
-	}
+	conn.WriteMsg(proto.SessionKilledMsg{Type: "SESSION_KILLED", SessionID: sessionID}, "session killed")
 	log.Printf("session %s killed by client request", sessionID)
 }
 
@@ -814,14 +689,7 @@ func waitSessionAndRespond(conn *udsConn, mgr *session.Manager, sessionID string
 	if code := sess.ExitCode(); code >= 0 {
 		noteMsg.ExitCode = &code
 	}
-	noteData, err := msgpack.Marshal(noteMsg)
-	if err != nil {
-		log.Printf("marshal wait notification error: %v", err)
-		return
-	}
-	if err := conn.WriteFrame(noteData); err != nil {
-		log.Printf("write wait notification error: %v", err)
-	}
+	conn.WriteMsg(noteMsg, "wait notification")
 }
 
 // resolveUDPAddrs はセッションのSTUNアドレス候補・ローカルアドレス候補
@@ -874,9 +742,7 @@ func queryStunMappedIP(sessID, network, stunServer string) net.IP {
 	if ip, ok := stunMappedIPs.get(key); ok {
 		return ip // ip=nil は失敗のネガティブキャッシュヒット
 	}
-	stunClient := stun.NewClient(stunServer)
-	stunClient.Network = network
-	mappedAddr, err := stunClient.GetMappedAddr()
+	mappedAddr, err := stun.MappedAddr(network, stunServer, stun.DefaultTimeout)
 	if err != nil {
 		log.Printf("session %s: STUN query (%s) failed (continuing without it, next retry in %v): %v",
 			sessID, network, stunCacheFailureTTL, err)

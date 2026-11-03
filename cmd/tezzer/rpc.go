@@ -1,7 +1,7 @@
 package main
 
 // rpc.go: UDS 上の 1 リクエスト 1 レスポンス往復の共通化。
-// 管理コマンド（-list/-info/-kill）とセッション確立（CREATE/ATTACH）は全て
+// 管理コマンド（adminCall）とハンドシェイク・セッション確立（HELLO/CREATE/ATTACH）は全て
 // 「Encode → WriteFrame → ReadFrame → Decode → 型アサート（ErrorMsg フォールバック）」
 // という同じ骨格なので、ここに集約する。
 
@@ -49,7 +49,7 @@ func dialAndHandshake(addr string, cols, rows int) (net.Conn, error) {
 		return nil, err
 	}
 
-	helloData, err := proto.Encode(proto.HelloMsg{
+	welcome, err := roundTrip[proto.WelcomeMsg](conn, proto.HelloMsg{
 		Type:       "HELLO",
 		V:          1,
 		ClientName: "tezzer",
@@ -58,34 +58,19 @@ func dialAndHandshake(addr string, cols, rows int) (net.Conn, error) {
 	})
 	if err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("failed to encode hello: %w", err)
-	}
-	if err := netx.WriteFrame(conn, helloData); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("failed to write hello: %w", err)
-	}
-
-	frameData, err := netx.ReadFrame(conn)
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("failed to read welcome: %w", err)
-	}
-	msg, err := proto.Decode(frameData)
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("failed to decode welcome: %w", err)
-	}
-	welcome, ok := msg.(*proto.WelcomeMsg)
-	if !ok {
-		conn.Close()
-		return nil, fmt.Errorf("expected WELCOME, got %T", msg)
+		return nil, fmt.Errorf("handshake: %w", err)
 	}
 	log.Printf("connected to %s", welcome.ServerName)
-
 	return conn, nil
 }
 
-// connectToServer は管理コマンド用のサーバー接続（端末サイズは不問）
-func connectToServer(addr string) (net.Conn, error) {
-	return dialAndHandshake(addr, 80, 24)
+// adminCall は管理コマンド用に接続・ハンドシェイクし、req を 1 往復して閉じる
+// （端末サイズは不問なので 80x24 を名乗る）。
+func adminCall[T any](addr string, req any) (*T, error) {
+	conn, err := dialAndHandshake(addr, 80, 24)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	return roundTrip[T](conn, req)
 }

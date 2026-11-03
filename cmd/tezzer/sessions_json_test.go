@@ -55,8 +55,8 @@ func testSessionsJSONFixture() []proto.SessionInfo {
 				{ID: "c1", Protocol: "UDS"},
 				{
 					ID: "c2", Protocol: "UDP",
-					RemoteAddr:  "198.51.100.2:40000",
-					UDPClientID: 1234, UDPAddresses: []string{"198.51.100.2:40000"},
+					RemoteAddr:       "198.51.100.2:40000",
+					UDPClientID:      1234,
 					SendBufferBytes:  4096,
 					SlowOutputWrites: 3, MaxOutputWriteMs: 120,
 					LastSeen:       lastSeen,

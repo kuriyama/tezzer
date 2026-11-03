@@ -39,10 +39,9 @@ func TestFormatSessionsList_Golden(t *testing.T) {
 			Cols:        80,
 			CreatedAt:   created,
 			ClientCount: 2,
-			LastUDPAddr: "203.0.113.1:7021",
 			Clients: []proto.ClientInfo{
 				{ID: "c1", Protocol: "UDS"},
-				{ID: "c2", Protocol: "UDP", RemoteAddr: "198.51.100.2:40000", UDPClientID: 1234, UDPAddresses: []string{"198.51.100.2:40000"}},
+				{ID: "c2", Protocol: "UDP", RemoteAddr: "198.51.100.2:40000", UDPClientID: 1234},
 			},
 		},
 		{

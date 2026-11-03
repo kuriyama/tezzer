@@ -1,13 +1,15 @@
 package main
 
 // admin.go: 管理コマンド（-list / -info / -wait / -kill / -server-version）の実装と表示整形。
-// サーバとの往復は rpc.go の roundTrip / connectToServer を使う。
+// サーバとの往復は rpc.go の adminCall を使う。
 
 import (
+	"errors"
 	"fmt"
 	"github.com/kuriyama/tezzer/internal/proto"
 	"io"
 	"log"
+	"net"
 	"strings"
 	"time"
 )
@@ -29,24 +31,10 @@ func formatAgo(d time.Duration) string {
 	}
 }
 
-// fetchSessions はサーバから SESSIONS_LIST を取得する
+// fetchSessionsList はサーバから SESSIONS_LIST を取得する
 // （-list / -resume / -name の共通処理）。
 func fetchSessionsList(addr string) (*proto.SessionsListMsg, error) {
-	conn, err := connectToServer(addr)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-
-	return roundTrip[proto.SessionsListMsg](conn, proto.ListSessionsMsg{Type: "LIST_SESSIONS"})
-}
-
-func fetchSessions(addr string) ([]proto.SessionInfo, error) {
-	resp, err := fetchSessionsList(addr)
-	if err != nil {
-		return nil, err
-	}
-	return resp.Sessions, nil
+	return adminCall[proto.SessionsListMsg](addr, proto.ListSessionsMsg{Type: "LIST_SESSIONS"})
 }
 
 func listSessions(addr string, jsonOut bool) error {
@@ -98,12 +86,12 @@ func formatRemoteForwards(rfs []proto.RemoteForwardInfo, loc *time.Location) str
 // エラーではない）。PTY 終了済みセッションは名前を保持しない扱い（サーバ側の一意性
 // チェックと同じ規則）。-name の attach-or-create 判定に使う。
 func findSessionByName(addr, name string) (*proto.SessionInfo, error) {
-	sessions, err := fetchSessions(addr)
+	resp, err := fetchSessionsList(addr)
 	if err != nil {
 		return nil, err
 	}
-	for i := range sessions {
-		s := &sessions[i]
+	for i := range resp.Sessions {
+		s := &resp.Sessions[i]
 		if s.Name == name && !s.PTYClosed {
 			return s, nil
 		}
@@ -178,20 +166,7 @@ func formatSessionsList(sessions []proto.SessionInfo, loc *time.Location) string
 
 		// クライアント接続情報を表示（インデント付き）
 		for _, c := range s.Clients {
-			clientInfo := fmt.Sprintf("  - %s (%s)", c.Protocol, c.ID)
-			if c.RemoteAddr != "" {
-				clientInfo += fmt.Sprintf(" from %s", c.RemoteAddr)
-			}
-			if c.QUICRemoteAddr != "" {
-				clientInfo += fmt.Sprintf(" quic=%s", c.QUICRemoteAddr)
-			}
-			if c.UDPClientID != 0 {
-				clientInfo += fmt.Sprintf(" [QUIC ClientID=%d", c.UDPClientID)
-				if len(c.UDPAddresses) > 0 {
-					clientInfo += fmt.Sprintf(" Addrs=%v", c.UDPAddresses)
-				}
-				clientInfo += "]"
-			}
+			clientInfo := formatClientLine(c)
 			if c.LastSeen > 0 {
 				clientInfo += fmt.Sprintf(" last=%s", formatAgo(time.Since(time.Unix(c.LastSeen, 0))))
 			}
@@ -201,14 +176,23 @@ func formatSessionsList(sessions []proto.SessionInfo, loc *time.Location) string
 	return b.String()
 }
 
-func showSessionInfo(addr, sessionID string, jsonOut bool) error {
-	conn, err := connectToServer(addr)
-	if err != nil {
-		return err
+// formatClientLine はクライアント 1 件の要約行（-list / -info 共通。先頭に "  - "）を返す。
+func formatClientLine(c proto.ClientInfo) string {
+	line := fmt.Sprintf("  - %s (%s)", c.Protocol, c.ID)
+	if c.RemoteAddr != "" {
+		line += fmt.Sprintf(" from %s", c.RemoteAddr)
 	}
-	defer conn.Close()
+	if c.QUICRemoteAddr != "" {
+		line += fmt.Sprintf(" quic=%s", c.QUICRemoteAddr)
+	}
+	if c.UDPClientID != 0 {
+		line += fmt.Sprintf(" [QUIC ClientID=%d]", c.UDPClientID)
+	}
+	return line
+}
 
-	resp, err := roundTrip[proto.SessionInfoMsg](conn, proto.GetSessionInfoMsg{
+func showSessionInfo(addr, sessionID string, jsonOut bool) error {
+	resp, err := adminCall[proto.SessionInfoMsg](addr, proto.GetSessionInfoMsg{
 		Type:      "GET_SESSION_INFO",
 		SessionID: sessionID,
 	})
@@ -281,22 +265,7 @@ func showSessionInfo(addr, sessionID string, jsonOut bool) error {
 	if len(s.Clients) > 0 {
 		fmt.Printf("\nConnected clients:\n")
 		for _, c := range s.Clients {
-			clientInfo := fmt.Sprintf("  - %s (%s)", c.Protocol, c.ID)
-			if c.RemoteAddr != "" {
-				clientInfo += fmt.Sprintf(" from %s", c.RemoteAddr)
-			}
-			if c.QUICRemoteAddr != "" {
-				clientInfo += fmt.Sprintf(" quic=%s", c.QUICRemoteAddr)
-			}
-			// QUIC 接続情報を表示
-			if c.UDPClientID != 0 {
-				clientInfo += fmt.Sprintf(" [QUIC ClientID=%d", c.UDPClientID)
-				if len(c.UDPAddresses) > 0 {
-					clientInfo += fmt.Sprintf(" Addrs=%v", c.UDPAddresses)
-				}
-				clientInfo += "]"
-			}
-			fmt.Printf("%s\n", clientInfo)
+			fmt.Println(formatClientLine(c))
 			// 送信統計を表示
 			if c.SendBufferBytes > 0 {
 				fmt.Printf("      Output sent: %d bytes\n", c.SendBufferBytes)
@@ -337,13 +306,7 @@ func showSessionInfo(addr, sessionID string, jsonOut bool) error {
 // ReadFrame がセッション終了までブロックする。exit code が不明な場合
 // （セッションが kill された等）は attach 時の慣行に合わせて 0 を返す。
 func waitSession(addr, sessionID string) (int, error) {
-	conn, err := connectToServer(addr)
-	if err != nil {
-		return 0, err
-	}
-	defer conn.Close()
-
-	note, err := roundTrip[proto.NoteMsg](conn, proto.WaitSessionMsg{
+	note, err := adminCall[proto.NoteMsg](addr, proto.WaitSessionMsg{
 		Type:      "WAIT_SESSION",
 		SessionID: sessionID,
 	})
@@ -360,13 +323,7 @@ func waitSession(addr, sessionID string) (int, error) {
 }
 
 func killSession(addr, sessionID string) error {
-	conn, err := connectToServer(addr)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	killedMsg, err := roundTrip[proto.SessionKilledMsg](conn, proto.KillSessionMsg{
+	killedMsg, err := adminCall[proto.SessionKilledMsg](addr, proto.KillSessionMsg{
 		Type:      "KILL_SESSION",
 		SessionID: sessionID,
 	})
@@ -379,15 +336,15 @@ func killSession(addr, sessionID string) error {
 
 // getLatestSessionID は最新のセッションIDを取得
 func getLatestSessionID(addr string) (string, error) {
-	sessions, err := fetchSessions(addr)
+	resp, err := fetchSessionsList(addr)
 	if err != nil {
 		return "", err
 	}
 
 	// 最新のアクティブなセッション（PTY終了済みを除く、CreatedAtが最も新しいもの）を選択
 	var latestSession *proto.SessionInfo
-	for i := range sessions {
-		s := &sessions[i]
+	for i := range resp.Sessions {
+		s := &resp.Sessions[i]
 		// PTY終了済みセッションはスキップ
 		if s.PTYClosed {
 			continue
@@ -410,16 +367,15 @@ func getLatestSessionID(addr string) (string, error) {
 func showServerVersion(addr string) error {
 	// dialAndHandshake の "connected to tezzerd" ログは出力を汚すので捨てる（tezzer-ssh が取り込む）
 	log.SetOutput(io.Discard)
-	conn, err := connectToServer(addr)
-	if err != nil {
-		return fmt.Errorf("failed to connect to tezzerd (is it running?): %w", err)
-	}
-	defer conn.Close()
-	meta, err := roundTrip[proto.ServerMetaMsg](conn, proto.GetServerMetaMsg{Type: "GET_SERVER_META"})
+	meta, err := adminCall[proto.ServerMetaMsg](addr, proto.GetServerMetaMsg{Type: "GET_SERVER_META"})
 	if err != nil {
 		// attach 前の GET_SERVER_META に対応していない旧サーバは BAD_REQUEST を返す
 		if strings.Contains(err.Error(), proto.ErrBadRequest) {
 			return fmt.Errorf("tezzerd is too old to report its version (%v)", err)
+		}
+		var opErr *net.OpError
+		if errors.As(err, &opErr) && opErr.Op == "dial" {
+			return fmt.Errorf("failed to connect to tezzerd (is it running?): %w", err)
 		}
 		return err
 	}

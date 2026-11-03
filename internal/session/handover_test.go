@@ -79,7 +79,7 @@ func drainOutput(t *testing.T, ch <-chan []byte, d time.Duration) []byte {
 func TestHandover_RoundTrip(t *testing.T) {
 	mgr := NewManager()
 
-	sess, err := mgr.CreateSession("handover-rt", "/bin/cat", nil, nil, "", 24, 80, false, 0, false)
+	sess, err := mgr.CreateSession("handover-rt", "/bin/cat", nil, nil, "", 24, 80, false)
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -184,10 +184,7 @@ func TestHandover_RoundTrip(t *testing.T) {
 	}
 
 	// QUIC トランスポートも fd 越しに生きていることを、実クライアントの接続で確認する。
-	cli, err := qtransport.NewClient(oldKey, "127.0.0.1:"+strconv.Itoa(oldPort), 4242, "")
-	if err != nil {
-		t.Fatalf("qtransport.NewClient: %v", err)
-	}
+	cli := qtransport.NewClient(oldKey, "127.0.0.1:"+strconv.Itoa(oldPort), 4242, "")
 	defer cli.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -201,7 +198,7 @@ func TestHandover_RoundTrip(t *testing.T) {
 // という契約を固定する回帰テスト。
 func TestHandover_VersionMismatchRejected(t *testing.T) {
 	mgr := NewManager()
-	sess, err := mgr.CreateSession("", "/bin/cat", nil, nil, "", 24, 80, false, 0, false)
+	sess, err := mgr.CreateSession("", "/bin/cat", nil, nil, "", 24, 80, false)
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}

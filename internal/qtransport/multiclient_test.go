@@ -31,10 +31,7 @@ func TestQUICTransport_MultiClientIsolation(t *testing.T) {
 	addr := srv.(interface{ Addr() net.Addr }).Addr().String()
 
 	connect := func(id uint16) ClientTransportWithClose {
-		c, err := NewClient(k, addr, id, "")
-		if err != nil {
-			t.Fatalf("NewClient(%d): %v", id, err)
-		}
+		c := NewClient(k, addr, id, "")
 		if err := c.Start(ctx); err != nil {
 			t.Fatalf("client %d Start: %v", id, err)
 		}
@@ -119,18 +116,12 @@ func TestQUICTransport_SameNumDifferentSession(t *testing.T) {
 	addr := srv.(interface{ Addr() net.Addr }).Addr().String()
 
 	// 同じ Num=7、別セッション "A" / "B"。
-	ca, err := NewClient(k, addr, 7, "A")
-	if err != nil {
-		t.Fatalf("NewClient A: %v", err)
-	}
+	ca := NewClient(k, addr, 7, "A")
 	defer ca.Close()
 	if err := ca.Start(ctx); err != nil {
 		t.Fatalf("client A Start: %v", err)
 	}
-	cb, err := NewClient(k, addr, 7, "B")
-	if err != nil {
-		t.Fatalf("NewClient B: %v", err)
-	}
+	cb := NewClient(k, addr, 7, "B")
 	defer cb.Close()
 	if err := cb.Start(ctx); err != nil {
 		t.Fatalf("client B Start: %v", err)

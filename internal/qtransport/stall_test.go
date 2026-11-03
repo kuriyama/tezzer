@@ -46,10 +46,7 @@ func TestQUICTransport_StallWarnsOtherClients(t *testing.T) {
 	addr := srv.(interface{ Addr() net.Addr }).Addr().String()
 
 	// 健全なクライアント（Num 7）: 出力を読み続け、status 通知を受け取る側。
-	healthy, err := NewClient(k, addr, 7, "s1")
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
+	healthy := NewClient(k, addr, 7, "s1")
 	defer healthy.Close()
 	statusCh := make(chan string, 16)
 	healthy.OnStatusMessage(func(msg string) {

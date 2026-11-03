@@ -97,7 +97,7 @@ func (m *Manager) RemoteForwards() []proto.RemoteForwardInfo {
 // deployments. It does nothing when fixedPort <= 0 (each session then owns a
 // per-session transport). In shared mode one socket multiplexes every
 // session, so several sessions can ride a single port-forwarded fixed port.
-func (m *Manager) InitSharedTransport(fixedPort int, ipv4Only bool) error {
+func (m *Manager) InitSharedTransport(fixedPort int) error {
 	if fixedPort <= 0 {
 		return nil
 	}
@@ -122,25 +122,39 @@ func (m *Manager) InitSharedTransport(fixedPort int, ipv4Only bool) error {
 	return m.adoptSharedTransport(st, addr.Port, key)
 }
 
-// adoptSharedTransport は共有 QUIC トランスポートの配線・起動を行う
-// （InitSharedTransport と無停止再起動の復元経路で共通）。失敗時は st を閉じる。
+// adoptSharedTransport は共有 QUIC トランスポートの配線・起動を行う（InitSharedTransport 用）。
+// 失敗時は st を閉じる。
 func (m *Manager) adoptSharedTransport(st transport.ServerTransport, port int, key []byte) error {
+	m.prepareSharedTransport(st, port, key)
+	return m.startSharedTransport()
+}
+
+// prepareSharedTransport は共有 transport のコールバックを配線して manager に持たせる（まだ
+// 受け付けない）。無停止再起動の復元では、この後に全セッションを復元してから
+// startSharedTransport する（先に受け付けると、即座に来る再接続に NO_SUCH_SESSION を返しうる）。
+func (m *Manager) prepareSharedTransport(st transport.ServerTransport, port int, key []byte) {
 	st.OnResyncNeeded(m.sharedResync)
 	st.OnClientConnect(m.sharedOnConnect)
+	st.OnClientExit(m.sharedOnExit)
 	st.SetServerMeta(version.GetVersion(), version.GetBuildTime(), m.serverInstanceID[:])
 	m.applyTransportPolicy(st)
+	m.sharedTransport = st
+	m.sharedPort = port
+	m.sharedKey = key
+}
 
+// startSharedTransport は prepareSharedTransport した共有 transport の受け付けを始める。
+// 失敗時は transport を閉じて共有モードを解除する。
+func (m *Manager) startSharedTransport() error {
+	st := m.sharedTransport
 	ctx, cancel := context.WithCancel(context.Background())
 	if err := st.Start(ctx); err != nil {
 		cancel()
 		_ = st.Close()
+		m.sharedTransport = nil
 		return fmt.Errorf("failed to start shared QUIC transport: %w", err)
 	}
-
-	m.sharedTransport = st
 	m.sharedCancel = cancel
-	m.sharedPort = port
-	m.sharedKey = key
 
 	go m.routeSharedInput()
 	go m.routeSharedResize()
@@ -185,6 +199,13 @@ func (m *Manager) sharedOnConnect(client transport.ClientID) {
 	}
 	// Gate 2: QUIC が実際に接続した時点でセッションに通知（DA 漏洩防止）
 	sess.OnQUICClientConnected()
+}
+
+// sharedOnExit は意図して終了したクライアントを、そのセッションの出力ファンアウト先から外す。
+func (m *Manager) sharedOnExit(client transport.ClientID) {
+	if sess := m.sessionByID(client.Session); sess != nil {
+		sess.UnregisterQUICClient(client.Num)
+	}
 }
 
 // routeSharedInput は共有 transport の入力を Client.Session で PTY へ振り分ける。
@@ -358,7 +379,7 @@ func (m *Manager) FindByName(name string) *Session {
 // session; a non-empty name is guaranteed unique among active sessions
 // (ErrDuplicateName otherwise). agentForward requests SSH agent forwarding
 // (-A); it only has meaning at creation time (docs/dev/agent-forwarding.md).
-func (m *Manager) CreateSession(name, cmd string, args []string, env map[string]string, cwd string, rows, cols int, ipv4Only bool, fixedUDPPort int, agentForward bool) (*Session, error) {
+func (m *Manager) CreateSession(name, cmd string, args []string, env map[string]string, cwd string, rows, cols int, agentForward bool) (*Session, error) {
 	// PTY/transport を起動する前の事前チェック（無駄な起動を避ける）
 	if name != "" && m.FindByName(name) != nil {
 		return nil, fmt.Errorf("%w: %s", ErrDuplicateName, name)
@@ -373,9 +394,8 @@ func (m *Manager) CreateSession(name, cmd string, args []string, env map[string]
 
 	id := generateSessionID()
 
-	// full-QUIC 化に伴い共有モードは当面未対応。各セッションが per-session で
-	// qtransport を起動する（NewSession 内）。
-	session, err := NewSession(id, cmd, args, env, cwd, rows, cols, ipv4Only, fixedUDPPort, agentForward, m)
+	// QUIC トランスポートは NewSession 内で用意する（共有モードなら共有 transport を参照）。
+	session, err := NewSession(id, cmd, args, env, cwd, rows, cols, agentForward, m)
 	if err != nil {
 		return nil, err
 	}
@@ -417,34 +437,24 @@ func (m *Manager) GetSession(id string) (*Session, error) {
 	return session, nil
 }
 
-// DeleteSession deletes a session
+// DeleteSession kills (see Session.Kill) and removes a session.
 func (m *Manager) DeleteSession(id string) error {
+	// map から外すだけを m.mu 下で行う。Kill（SessionGone の送信を含む）と dropSession
+	// （SendStatus）はネットワークへ書くので、死んだクライアント相手に詰まっても
+	// セッション検索（入力の振り分け・attach・一覧）全体を止めないようロック外で呼ぶ。
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	session, ok := m.sessions[id]
+	if ok {
+		delete(m.sessions, id)
+	}
+	m.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("session not found: %s", id)
 	}
 
-	session.Close()
-	delete(m.sessions, id)
+	session.Kill()
 	m.rfwd.dropSession(id)
-
 	return nil
-}
-
-// ListSessions returns all session IDs
-func (m *Manager) ListSessions() []string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	ids := make([]string, 0, len(m.sessions))
-	for id := range m.sessions {
-		ids = append(ids, id)
-	}
-
-	return ids
 }
 
 // GetAllSessions returns all sessions sorted by CreatedAt (oldest first)
@@ -463,16 +473,6 @@ func (m *Manager) GetAllSessions() []*Session {
 	})
 
 	return sessions
-}
-
-// SetDebugForAllSessions toggles debug output for every session at runtime.
-func (m *Manager) SetDebugForAllSessions(enabled bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	for _, session := range m.sessions {
-		session.SetDebug(enabled)
-	}
 }
 
 // Close cleans up the manager's resources.

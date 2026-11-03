@@ -14,7 +14,7 @@ package main
 //     STUN 問い合わせ自体をスキップする。IPv4-only/IPv6-only ホストで、存在しない
 //     family へ延々と無駄な STUN 往復を送り続けないようにするため。
 //   - 低頻度の実チェック: 経路があるfamilyだけ、既存の STUN 問い合わせ
-//     （getClientSTUNAddr）を candidateRefreshInterval おきに回し、
+//     （resolveCandidates）を candidateRefreshInterval おきに回し、
 //     候補リストを SetRoamingCandidates で更新する。
 
 import (
@@ -75,19 +75,7 @@ func (c *Client) refreshCandidatesOnce(quicInfo *QUICInfo) {
 		return
 	}
 
-	var clientSTUN []string
-	if hasLocalRoute("udp4", probeTargets["udp4"]) {
-		if addr, err := c.getClientSTUNAddr("udp4", quicInfo.STUNServer); err == nil {
-			clientSTUN = append(clientSTUN, addr.String())
-		}
-	}
-	if !c.ipv4Only && hasLocalRoute("udp6", probeTargets["udp6"]) {
-		if addr, err := c.getClientSTUNAddr("udp6", quicInfo.STUNServer); err == nil {
-			clientSTUN = append(clientSTUN, addr.String())
-		}
-	}
-
-	fresh := buildQUICCandidateAddrs(quicInfo, clientSTUN)
+	fresh, _ := c.resolveCandidates(quicInfo, true)
 	if len(fresh) == 0 {
 		return
 	}

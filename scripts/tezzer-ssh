@@ -231,6 +231,8 @@ echo "SSH socket forwarding established." >&2
 
 # Step 3: tezzerクライアントを起動
 export TEZZER_SOCKET="$LOCAL_SOCKET"
+# tezzer -list-forwards の SERVER 欄用（ソケットパスは tezzer-ssh-<pid>.sock で区別できないため）
+export TEZZER_SSH_TARGET="$SSH_TARGET"
 
 case "$SUBCOMMAND" in
     version)

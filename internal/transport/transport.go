@@ -128,7 +128,10 @@ type ServerTransport interface {
 	Resize() <-chan Resize
 
 	OnClientConnect(fn func(client ClientID))
-	OnClientDisconnect(fn func(client ClientID))
+	// OnClientExit is called when a client closed its connection on purpose
+	// (detach, Ctrl-C, session end). It is not called on network loss: such a
+	// client keeps its ClientID and comes back through reconnect.
+	OnClientExit(fn func(client ClientID))
 
 	// OnResyncNeeded is called when a client requests output from fromOffset
 	// onwards (after a reconnect or a long sleep, to fill in what it is
@@ -168,8 +171,6 @@ type ServerTransport interface {
 	// Example: output gaps that resync cannot fill after a reconnect
 	// (prompting a redraw).
 	SendStatus(client ClientID, msg string) error
-
-	Stats() Stats
 }
 
 // ClientSendStat is per-client output-send health (backpressure

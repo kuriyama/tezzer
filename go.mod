@@ -2,6 +2,9 @@ module github.com/kuriyama/tezzer
 
 go 1.26.0
 
+// -L/-R の loopback TCP listener で MPTCP を使わない（Go 1.24+ は listener で既定有効）
+godebug multipathtcp=0
+
 require (
 	github.com/creack/pty v1.1.24
 	github.com/quic-go/quic-go v0.64.1
@@ -13,5 +16,5 @@ require (
 
 require (
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
-	golang.org/x/net v0.61.0 // indirect
+	golang.org/x/net v0.62.0 // indirect
 )

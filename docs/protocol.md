@@ -42,10 +42,10 @@ Client                          Server
 ### Messages
 
 Client → server: `HELLO`, `CREATE_SESSION`, `ATTACH_SESSION`, `INPUT`, `RESIZE`,
-`PING`, `LIST_SESSIONS`, `GET_SESSION_INFO`, `KILL_SESSION`, `GET_SERVER_META`,
+`LIST_SESSIONS`, `GET_SESSION_INFO`, `KILL_SESSION`, `GET_SERVER_META`,
 `UDP_CLIENT_INFO`.
 
-Server → client: `WELCOME`, `SESSION_CREATED`, `OUTPUT`, `PONG`, `NOTE`,
+Server → client: `WELCOME`, `SESSION_CREATED`, `OUTPUT`, `NOTE`,
 `ERROR`, `SERVER_META`, `SESSIONS_LIST`, `SESSION_INFO`, `SESSION_KILLED`.
 
 Selected fields:
@@ -109,7 +109,7 @@ Control frames are `[u32be length][MessagePack]`, max 1 MiB. Frame types:
 | 1 | Hello | C→S | bind connection to `(session_id, client_id)`; carries `last_offset` for resync |
 | 2 | Resize | C→S | terminal resize |
 | 3 | ServerMeta | S→C | build ID/time, instance ID, feature bits (bit 0 = tcp-forwarding, bit 1 = agent-forwarding, bit 2 = liveness ping, bit 3 = remote-forwarding) |
-| 4 | SessionGone | S→C | session no longer exists (restart/kill); when the session's process exited, carries its exit code (`ec`, optional; signal death is 128+signal), which the client adopts as its own exit status like ssh |
+| 4 | SessionGone | S→C | session no longer exists (restart/kill); when the session's process exited, carries its exit code (`ec`, optional; signal death is 128+signal; 0 when the session was killed), which the client adopts as its own exit status like ssh |
 | 5 | Status | S→C | status message for the user |
 | 6 | Log | S→C | log message |
 | 7 | FwdOpen | C→S | first frame of a forward stream: `msg` = dial target `"host:port"` |

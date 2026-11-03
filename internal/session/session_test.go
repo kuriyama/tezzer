@@ -3,9 +3,13 @@ package session
 import (
 	"errors"
 	"os"
+	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/kuriyama/tezzer/internal/proto"
 )
 
 // TestManagerCreateAndGetSession はセッションの作成と取得をテスト
@@ -13,7 +17,7 @@ func TestManagerCreateAndGetSession(t *testing.T) {
 	mgr := NewManager()
 
 	// セッション作成
-	sess, err := mgr.CreateSession("", "/bin/echo", []string{"hello"}, nil, "", 24, 80, false, 0, false)
+	sess, err := mgr.CreateSession("", "/bin/echo", []string{"hello"}, nil, "", 24, 80, false)
 	if err != nil {
 		t.Fatalf("failed to create session: %v", err)
 	}
@@ -63,7 +67,7 @@ func TestManagerDeleteSession(t *testing.T) {
 	mgr := NewManager()
 
 	// セッション作成
-	sess, err := mgr.CreateSession("", "/bin/sleep", []string{"10"}, nil, "", 24, 80, false, 0, false)
+	sess, err := mgr.CreateSession("", "/bin/sleep", []string{"10"}, nil, "", 24, 80, false)
 	if err != nil {
 		t.Fatalf("failed to create session: %v", err)
 	}
@@ -88,28 +92,28 @@ func TestManagerListSessions(t *testing.T) {
 	mgr := NewManager()
 
 	// 初期状態では空
-	if len(mgr.ListSessions()) != 0 {
+	if len(mgr.GetAllSessions()) != 0 {
 		t.Error("expected empty session list initially")
 	}
 
 	// 3つのセッションを作成
-	sess1, _ := mgr.CreateSession("", "/bin/sleep", []string{"10"}, nil, "", 24, 80, false, 0, false)
+	sess1, _ := mgr.CreateSession("", "/bin/sleep", []string{"10"}, nil, "", 24, 80, false)
 	defer sess1.Close()
-	sess2, _ := mgr.CreateSession("", "/bin/sleep", []string{"10"}, nil, "", 24, 80, false, 0, false)
+	sess2, _ := mgr.CreateSession("", "/bin/sleep", []string{"10"}, nil, "", 24, 80, false)
 	defer sess2.Close()
-	sess3, _ := mgr.CreateSession("", "/bin/sleep", []string{"10"}, nil, "", 24, 80, false, 0, false)
+	sess3, _ := mgr.CreateSession("", "/bin/sleep", []string{"10"}, nil, "", 24, 80, false)
 	defer sess3.Close()
 
 	// 一覧を取得
-	ids := mgr.ListSessions()
-	if len(ids) != 3 {
-		t.Errorf("expected 3 sessions, got %d", len(ids))
+	sessions := mgr.GetAllSessions()
+	if len(sessions) != 3 {
+		t.Errorf("expected 3 sessions, got %d", len(sessions))
 	}
 
 	// すべてのIDが含まれることを確認
 	found := make(map[string]bool)
-	for _, id := range ids {
-		found[id] = true
+	for _, s := range sessions {
+		found[s.ID] = true
 	}
 	if !found[sess1.ID] || !found[sess2.ID] || !found[sess3.ID] {
 		t.Error("not all session IDs found in list")
@@ -120,7 +124,7 @@ func TestManagerListSessions(t *testing.T) {
 func TestManagerDuplicateSessionName(t *testing.T) {
 	mgr := NewManager()
 
-	sess1, err := mgr.CreateSession("work", "/bin/sleep", []string{"10"}, nil, "", 24, 80, false, 0, false)
+	sess1, err := mgr.CreateSession("work", "/bin/sleep", []string{"10"}, nil, "", 24, 80, false)
 	if err != nil {
 		t.Fatalf("failed to create named session: %v", err)
 	}
@@ -135,12 +139,12 @@ func TestManagerDuplicateSessionName(t *testing.T) {
 	}
 
 	// 同名は拒否される
-	if _, err := mgr.CreateSession("work", "/bin/sleep", []string{"10"}, nil, "", 24, 80, false, 0, false); !errors.Is(err, ErrDuplicateName) {
+	if _, err := mgr.CreateSession("work", "/bin/sleep", []string{"10"}, nil, "", 24, 80, false); !errors.Is(err, ErrDuplicateName) {
 		t.Errorf("expected ErrDuplicateName, got %v", err)
 	}
 
 	// 別名は作成できる
-	sess2, err := mgr.CreateSession("other", "/bin/sleep", []string{"10"}, nil, "", 24, 80, false, 0, false)
+	sess2, err := mgr.CreateSession("other", "/bin/sleep", []string{"10"}, nil, "", 24, 80, false)
 	if err != nil {
 		t.Fatalf("failed to create session with different name: %v", err)
 	}
@@ -151,7 +155,7 @@ func TestManagerDuplicateSessionName(t *testing.T) {
 func TestSessionAttachDetachClient(t *testing.T) {
 	mgr := NewManager()
 
-	sess, err := mgr.CreateSession("", "/bin/cat", []string{}, nil, "", 24, 80, false, 0, false)
+	sess, err := mgr.CreateSession("", "/bin/cat", []string{}, nil, "", 24, 80, false)
 	if err != nil {
 		t.Fatalf("failed to create session: %v", err)
 	}
@@ -209,7 +213,7 @@ func TestSessionAttachDetachClient(t *testing.T) {
 func TestSessionResize(t *testing.T) {
 	mgr := NewManager()
 
-	sess, err := mgr.CreateSession("", "/bin/cat", []string{}, nil, "", 24, 80, false, 0, false)
+	sess, err := mgr.CreateSession("", "/bin/cat", []string{}, nil, "", 24, 80, false)
 	if err != nil {
 		t.Fatalf("failed to create session: %v", err)
 	}
@@ -240,7 +244,7 @@ func TestSessionWriteInput(t *testing.T) {
 	mgr := NewManager()
 
 	// catコマンドでエコーバックをテスト
-	sess, err := mgr.CreateSession("", "/bin/cat", []string{}, nil, "", 24, 80, false, 0, false)
+	sess, err := mgr.CreateSession("", "/bin/cat", []string{}, nil, "", 24, 80, false)
 	if err != nil {
 		t.Fatalf("failed to create session: %v", err)
 	}
@@ -282,7 +286,7 @@ func TestSessionWriteInput(t *testing.T) {
 func TestSessionClose(t *testing.T) {
 	mgr := NewManager()
 
-	sess, err := mgr.CreateSession("", "/bin/sleep", []string{"10"}, nil, "", 24, 80, false, 0, false)
+	sess, err := mgr.CreateSession("", "/bin/sleep", []string{"10"}, nil, "", 24, 80, false)
 	if err != nil {
 		t.Fatalf("failed to create session: %v", err)
 	}
@@ -314,7 +318,7 @@ func TestSessionClose(t *testing.T) {
 func TestSessionUDPEnabled(t *testing.T) {
 	mgr := NewManager()
 
-	sess, err := mgr.CreateSession("", "/bin/cat", []string{}, nil, "", 24, 80, false, 0, false)
+	sess, err := mgr.CreateSession("", "/bin/cat", []string{}, nil, "", 24, 80, false)
 	if err != nil {
 		t.Fatalf("failed to create session: %v", err)
 	}
@@ -347,7 +351,7 @@ func TestSessionIDUniqueness(t *testing.T) {
 	sessions := make([]*Session, 0, 100)
 
 	for i := 0; i < 100; i++ {
-		sess, err := mgr.CreateSession("", "/bin/sleep", []string{"60"}, nil, "", 24, 80, false, 0, false)
+		sess, err := mgr.CreateSession("", "/bin/sleep", []string{"60"}, nil, "", 24, 80, false)
 		if err != nil {
 			t.Fatalf("failed to create session %d: %v", i, err)
 		}
@@ -373,7 +377,7 @@ func TestSessionWithCustomEnv(t *testing.T) {
 		"TEST_VAR": "test_value",
 	}
 
-	sess, err := mgr.CreateSession("", "/bin/sh", []string{"-c", "echo $TEST_VAR"}, env, "", 24, 80, false, 0, false)
+	sess, err := mgr.CreateSession("", "/bin/sh", []string{"-c", "echo $TEST_VAR"}, env, "", 24, 80, false)
 	if err != nil {
 		t.Fatalf("failed to create session: %v", err)
 	}
@@ -406,7 +410,7 @@ func TestSessionWithCustomEnv(t *testing.T) {
 func TestAgentForwarding_EnvAndSocket(t *testing.T) {
 	mgr := NewManager()
 
-	sess, err := mgr.CreateSession("", "/bin/sh", []string{"-c", "echo $SSH_AUTH_SOCK"}, nil, "", 24, 80, false, 0, true)
+	sess, err := mgr.CreateSession("", "/bin/sh", []string{"-c", "echo $SSH_AUTH_SOCK"}, nil, "", 24, 80, true)
 	if err != nil {
 		t.Fatalf("failed to create session: %v", err)
 	}
@@ -455,7 +459,7 @@ func TestAgentForwarding_DisabledByServer(t *testing.T) {
 	mgr := NewManager()
 	mgr.SetAgentForwarding(false)
 
-	sess, err := mgr.CreateSession("", "/bin/sleep", []string{"10"}, nil, "", 24, 80, false, 0, true)
+	sess, err := mgr.CreateSession("", "/bin/sleep", []string{"10"}, nil, "", 24, 80, true)
 	if err != nil {
 		t.Fatalf("failed to create session: %v", err)
 	}
@@ -473,7 +477,7 @@ func TestAgentForwarding_DisabledByServer(t *testing.T) {
 func TestSessionMultipleClientsReceiveOutput(t *testing.T) {
 	mgr := NewManager()
 
-	sess, err := mgr.CreateSession("", "/bin/echo", []string{"broadcast test"}, nil, "", 24, 80, false, 0, false)
+	sess, err := mgr.CreateSession("", "/bin/echo", []string{"broadcast test"}, nil, "", 24, 80, false)
 	if err != nil {
 		t.Fatalf("failed to create session: %v", err)
 	}
@@ -541,7 +545,7 @@ func waitExitCode(t *testing.T, sess *Session, timeout time.Duration) int {
 // TestSessionExitCode はプロセスの終了コードが記録されることをテスト
 func TestSessionExitCode(t *testing.T) {
 	mgr := NewManager()
-	sess, err := mgr.CreateSession("", "/bin/sh", []string{"-c", "exit 7"}, nil, "", 24, 80, false, 0, false)
+	sess, err := mgr.CreateSession("", "/bin/sh", []string{"-c", "exit 7"}, nil, "", 24, 80, false)
 	if err != nil {
 		t.Fatalf("failed to create session: %v", err)
 	}
@@ -561,7 +565,7 @@ func TestSessionExitCode(t *testing.T) {
 // TestSessionExitCodeSignal はシグナル死が 128+signal に換算されることをテスト
 func TestSessionExitCodeSignal(t *testing.T) {
 	mgr := NewManager()
-	sess, err := mgr.CreateSession("", "/bin/sh", []string{"-c", "kill -TERM $$"}, nil, "", 24, 80, false, 0, false)
+	sess, err := mgr.CreateSession("", "/bin/sh", []string{"-c", "kill -TERM $$"}, nil, "", 24, 80, false)
 	if err != nil {
 		t.Fatalf("failed to create session: %v", err)
 	}
@@ -581,7 +585,7 @@ func TestSessionExitCodeSignal(t *testing.T) {
 // handlePTYOutput が s.mu を待ち、アプリは出力が捌けず入力を読まない、で固まっていた。
 func TestWriteInputLargeWithEcho(t *testing.T) {
 	mgr := NewManager()
-	sess, err := mgr.CreateSession("", "/bin/cat", []string{}, nil, "", 24, 80, false, 0, false)
+	sess, err := mgr.CreateSession("", "/bin/cat", []string{}, nil, "", 24, 80, false)
 	if err != nil {
 		t.Fatalf("failed to create session: %v", err)
 	}
@@ -674,19 +678,19 @@ func TestManagerMaxSessions(t *testing.T) {
 	mgr := NewManager()
 	mgr.SetMaxSessions(1)
 
-	first, err := mgr.CreateSession("", "/bin/sh", nil, nil, "", 24, 80, false, 0, false)
+	first, err := mgr.CreateSession("", "/bin/sh", nil, nil, "", 24, 80, false)
 	if err != nil {
 		t.Fatalf("first create should succeed: %v", err)
 	}
 	defer first.Close()
 
-	if _, err := mgr.CreateSession("", "/bin/sh", nil, nil, "", 24, 80, false, 0, false); !errors.Is(err, ErrTooManySessions) {
+	if _, err := mgr.CreateSession("", "/bin/sh", nil, nil, "", 24, 80, false); !errors.Is(err, ErrTooManySessions) {
 		t.Fatalf("second create should fail with ErrTooManySessions, got %v", err)
 	}
 
 	// PTY 終了済みセッションは上限に数えない（Close で ptyClosed が立つ）
 	first.Close()
-	third, err := mgr.CreateSession("", "/bin/sh", nil, nil, "", 24, 80, false, 0, false)
+	third, err := mgr.CreateSession("", "/bin/sh", nil, nil, "", 24, 80, false)
 	if err != nil {
 		t.Fatalf("create after closing should succeed: %v", err)
 	}
@@ -698,7 +702,7 @@ func TestManagerMaxSessions(t *testing.T) {
 // クライアントは何も表示されないまま止まっていた（systemd の PATH に zellij がない報告）。
 func TestCreateSessionCommandNotFound(t *testing.T) {
 	mgr := NewManager()
-	sess, err := mgr.CreateSession("", "tezzer-no-such-command-xyz", nil, nil, "", 24, 80, false, 0, false)
+	sess, err := mgr.CreateSession("", "tezzer-no-such-command-xyz", nil, nil, "", 24, 80, false)
 	if err == nil {
 		sess.Close()
 		t.Fatal("CreateSession with a missing command succeeded, want error")
@@ -712,7 +716,7 @@ func TestCreateSessionCommandNotFound(t *testing.T) {
 // 再現シーケンスとして取れることを確認する（zellij 等は起動時に 1 回だけ有効化する）。
 func TestTermModeRestore(t *testing.T) {
 	mgr := NewManager()
-	sess, err := mgr.CreateSession("", "/bin/sh", []string{"-c", `printf '\033[?1049h\033[?1000;1002;1006h\033[?2004h'; sleep 5`}, nil, "", 24, 80, false, 0, false)
+	sess, err := mgr.CreateSession("", "/bin/sh", []string{"-c", `printf '\033[?1049h\033[?1000;1002;1006h\033[?2004h'; sleep 5`}, nil, "", 24, 80, false)
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -730,5 +734,95 @@ func TestTermModeRestore(t *testing.T) {
 			t.Fatalf("TermModeRestore = %q, want %q", sess.TermModeRestore(), want)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestUnregisterQUICClient は意図した終了で出力ファンアウト先から外れ、
+// 他のクライアントは残ることを確かめる（以前は追加されるだけで減らなかった）。
+func TestUnregisterQUICClient(t *testing.T) {
+	mgr := NewManager()
+	sess, err := mgr.CreateSession("", "/bin/sleep", []string{"10"}, nil, "", 24, 80, false)
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	defer sess.Close()
+
+	for _, id := range []uint16{11, 22, 33} {
+		if err := sess.RegisterQUICClient(id); err != nil {
+			t.Fatalf("RegisterQUICClient(%d): %v", id, err)
+		}
+	}
+	sess.UnregisterQUICClient(22)
+	sess.UnregisterQUICClient(99) // 未登録は無視
+
+	sess.mu.RLock()
+	got := slices.Clone(sess.quicClientIDsOut)
+	sess.mu.RUnlock()
+	if want := []uint16{11, 33}; !slices.Equal(got, want) {
+		t.Fatalf("quicClientIDsOut = %v, want %v", got, want)
+	}
+}
+
+// TestStartProcessAfterClose は起動中に Close されたセッションの StartProcess が、起動した
+// プロセスを片付けてエラーを返すことをテスト（Close は空の ptyMaster / proc を見て何もしないため）。
+func TestStartProcessAfterClose(t *testing.T) {
+	mgr := NewManager()
+	sess, err := mgr.CreateSession("", "/bin/sleep", []string{"30"}, nil, "", 24, 80, false)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+	sess.Close()
+	if err := sess.StartProcess(); err == nil {
+		t.Fatal("StartProcess after Close succeeded")
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for sess.cmd.Process.Signal(syscall.Signal(0)) == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("process started after Close is still running")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestSessionKillExitCode は kill したセッションの終了コードが SIGKILL 由来の 137 ではなく
+// 0 になり、UDS の SESSION_CLOSED 通知も "session killed" を載せることをテスト。
+func TestSessionKillExitCode(t *testing.T) {
+	mgr := NewManager()
+	sess, err := mgr.CreateSession("", "/bin/sleep", []string{"30"}, nil, "", 24, 80, false)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+	client := sess.AttachClient(0, "TEST", "test-client", 0)
+	if err := sess.StartProcess(); err != nil {
+		t.Fatalf("failed to start process: %v", err)
+	}
+
+	if err := mgr.DeleteSession(sess.ID); err != nil {
+		t.Fatalf("DeleteSession: %v", err)
+	}
+	if code := waitExitCode(t, sess, 5*time.Second); code != 0 {
+		t.Errorf("exit code = %d, want 0", code)
+	}
+
+	timeout := time.After(5 * time.Second)
+	for {
+		select {
+		case data, ok := <-client.OutCh:
+			if !ok {
+				t.Fatal("OutCh closed before SESSION_CLOSED")
+			}
+			msg, err := proto.Decode(data)
+			if err != nil {
+				continue // PTY 出力
+			}
+			if note, ok := msg.(*proto.NoteMsg); ok && note.Kind == "SESSION_CLOSED" {
+				if note.Msg != sessionKilledMsg || note.ExitCode == nil || *note.ExitCode != 0 {
+					t.Errorf("SESSION_CLOSED = %+v (exit %v), want msg %q exit 0", note, note.ExitCode, sessionKilledMsg)
+				}
+				return
+			}
+		case <-timeout:
+			t.Fatal("timeout waiting for SESSION_CLOSED")
+		}
 	}
 }

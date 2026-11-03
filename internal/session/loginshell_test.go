@@ -13,7 +13,7 @@ func TestUseLoginShell(t *testing.T) {
 	}
 	mgr := NewManager()
 	defer mgr.Close()
-	sess, err := mgr.CreateSession("", "/bin/sh", []string{"-c", `echo "argv0=$0 cwd=$(pwd)"`}, nil, "", 24, 80, false, 0, false)
+	sess, err := mgr.CreateSession("", "/bin/sh", []string{"-c", `echo "argv0=$0 cwd=$(pwd)"`}, nil, "", 24, 80, false)
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}

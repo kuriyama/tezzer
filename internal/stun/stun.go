@@ -13,12 +13,10 @@ import (
 
 const (
 	// STUN Message Types
-	BindingRequest       = 0x0001
-	BindingResponse      = 0x0101
-	BindingErrorResponse = 0x0111
+	BindingRequest  = 0x0001
+	BindingResponse = 0x0101
 
 	// STUN Attribute Types
-	AttrMappedAddress    = 0x0001
 	AttrXorMappedAddress = 0x0020
 
 	// STUN Magic Cookie (RFC 5389)
@@ -34,33 +32,14 @@ var (
 	ErrNoXorMapped     = errors.New("no XOR-MAPPED-ADDRESS in response")
 )
 
-// Client is a STUN client.
-type Client struct {
-	ServerAddr string
-	Timeout    time.Duration
-	IPv4Only   bool   // use IPv4 only (consulted only when Network is empty)
-	Network    string // explicit family, "udp4"/"udp6"; empty selects "udp"/"udp4" from IPv4Only
-}
+// DefaultTimeout is the usual timeout for MappedAddr.
+const DefaultTimeout = 5 * time.Second
 
-// NewClient creates a new STUN client.
-func NewClient(serverAddr string) *Client {
-	return &Client{
-		ServerAddr: serverAddr,
-		Timeout:    5 * time.Second,
-	}
-}
-
-// GetMappedAddr queries the STUN server and returns the public address as
-// seen across NAT.
-func (c *Client) GetMappedAddr() (*net.UDPAddr, error) {
-	// UDP接続を作成（Network指定があれば優先、なければIPv4Onlyの場合にudp4を使用）
-	network := "udp"
-	if c.Network != "" {
-		network = c.Network
-	} else if c.IPv4Only {
-		network = "udp4"
-	}
-	conn, err := net.DialTimeout(network, c.ServerAddr, c.Timeout)
+// MappedAddr queries the STUN server over network ("udp4"/"udp6"/"udp") and
+// returns the public address as seen across NAT. timeout bounds the dial
+// (including name resolution), the send and the receive individually.
+func MappedAddr(network, server string, timeout time.Duration) (*net.UDPAddr, error) {
+	conn, err := net.DialTimeout(network, server, timeout)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to STUN server: %w", err)
 	}
@@ -75,7 +54,7 @@ func (c *Client) GetMappedAddr() (*net.UDPAddr, error) {
 	req := makeBindingRequest(txID)
 
 	// リクエストを送信
-	if err := conn.SetWriteDeadline(time.Now().Add(c.Timeout)); err != nil {
+	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
 		return nil, err
 	}
 	if _, err := conn.Write(req); err != nil {
@@ -84,7 +63,7 @@ func (c *Client) GetMappedAddr() (*net.UDPAddr, error) {
 
 	// レスポンスを受信
 	buf := make([]byte, 1500)
-	if err := conn.SetReadDeadline(time.Now().Add(c.Timeout)); err != nil {
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
 		return nil, err
 	}
 	n, err := conn.Read(buf)
