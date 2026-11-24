@@ -1,7 +1,6 @@
 package qtransport
 
 import (
-	"github.com/kuriyama/tezzer/internal/transport"
 	"testing"
 	"time"
 )
@@ -12,8 +11,8 @@ import (
 
 func TestOnClientExit_FiredOnClose(t *testing.T) {
 	p := setupRFwdPair(t, true, map[uint16]string{9222: "127.0.0.1:1"})
-	exits := make(chan transport.ClientID, 1)
-	p.srv.OnClientExit(func(id transport.ClientID) { exits <- id })
+	exits := make(chan ClientID, 1)
+	p.srv.OnClientExit(func(id ClientID) { exits <- id })
 	ev := waitHello(t, p)
 
 	p.cli.Close()
@@ -29,8 +28,8 @@ func TestOnClientExit_FiredOnClose(t *testing.T) {
 
 func TestOnClientExit_NotFiredOnLoss(t *testing.T) {
 	p := setupRFwdPair(t, true, map[uint16]string{9222: "127.0.0.1:1"})
-	exits := make(chan transport.ClientID, 1)
-	p.srv.OnClientExit(func(id transport.ClientID) { exits <- id })
+	exits := make(chan ClientID, 1)
+	p.srv.OnClientExit(func(id ClientID) { exits <- id })
 	waitHello(t, p)
 
 	// reconnect と同じコード（0）で閉じる = 意図した終了ではない。

@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"github.com/kuriyama/tezzer/internal/netx"
 	"github.com/kuriyama/tezzer/internal/proto"
+	"github.com/kuriyama/tezzer/internal/qtransport"
 	"github.com/kuriyama/tezzer/internal/session"
 	"github.com/kuriyama/tezzer/internal/stun"
-	"github.com/kuriyama/tezzer/internal/transport"
 	"github.com/kuriyama/tezzer/internal/version"
 	"io"
 	"log"
@@ -197,7 +197,7 @@ func main() {
 }
 
 // udsConn は UDS 接続への書き込みを直列化するラッパ。attach 後は writer goroutine
-// （OutCh 配信）と読み取りループ内の直接応答（PONG / SERVER_META / SESSION_KILLED /
+// （OutCh 配信）と読み取りループ内の直接応答（SERVER_META / SESSION_KILLED /
 // QUIC timeout エラー）が同一 conn へ並行して書くため、無ロックの netx.WriteFrame
 // （長さヘッダとペイロードを別 Write する）ではフレームが混線しうる。
 type udsConn struct {
@@ -498,9 +498,12 @@ readLoop:
 			}
 
 		case *proto.UDPClientInfoMsg:
-			// クライアント ClientID を受信 → 出力ファンアウト対象として登録。
+			// クライアント ClientID を受信 → 出力ファンアウト対象として登録し、この UDS
+			// クライアントと結び付ける（その QUIC 接続中は UDS へ出力を送らない）。
 			if err := sess.RegisterQUICClient(m.ClientID); err != nil {
 				log.Printf("session %s: failed to register QUIC client: %v", m.SessionID, err)
+			} else {
+				client.SetQUICClientID(m.ClientID)
 			}
 
 		case *proto.GetServerMetaMsg:
@@ -608,11 +611,9 @@ func sessionProtoInfo(s *session.Session) proto.SessionInfo {
 
 // clientInfosWithStats は session.ClientInfo を対応する送信統計（backpressure 観測・
 // 転送統計を含む）とマージして proto.ClientInfo のスライスに変換する。
-// LIST_SESSIONS・GET_SESSION_INFO で共通（旧実装では LIST_SESSIONS 側だけ
-// SendBufferBytes/SlowOutputWrites/MaxOutputWriteMs が未設定という非対称性が
-// あったが、統合により解消した）。
-func clientInfosWithStats(clientInfos []session.ClientInfo, sendStats []transport.ClientSendStat) []proto.ClientInfo {
-	sendStatsMap := make(map[uint16]transport.ClientSendStat, len(sendStats))
+// LIST_SESSIONS・GET_SESSION_INFO で共通（両者で送信統計の項目をそろえるため）。
+func clientInfosWithStats(clientInfos []session.ClientInfo, sendStats []qtransport.ClientSendStat) []proto.ClientInfo {
+	sendStatsMap := make(map[uint16]qtransport.ClientSendStat, len(sendStats))
 	for _, st := range sendStats {
 		sendStatsMap[st.Client.Num] = st
 	}
@@ -673,7 +674,9 @@ func waitSessionAndRespond(conn *udsConn, mgr *session.Manager, sessionID string
 		close(connClosed)
 	}()
 
-	// Done() はプロセス回収（exit code 記録）後に close される（ptyReader の defer 参照）
+	// Done() は、プロセスが自分で終了したときは回収（exit code 記録）後に close される
+	// （ptyReader の defer 参照）。kill では回収前に close されるので exit code は不明（-1）に
+	// なりうるが、tezzer -wait は不明を 0 として扱い、kill の慣行（exit 0）と揃う。
 	select {
 	case <-sess.Done():
 	case <-connClosed:
@@ -692,9 +695,6 @@ func waitSessionAndRespond(conn *udsConn, mgr *session.Manager, sessionID string
 	conn.WriteMsg(noteMsg, "wait notification")
 }
 
-// resolveUDPAddrs はセッションのSTUNアドレス候補・ローカルアドレス候補
-// （いずれもIPv4/IPv6、取得できた分すべて）を解決する。初回接続の候補を
-// 増やすため両familyを問い合わせる。
 // serverMetaMsg は GET_SERVER_META への応答を組み立てる。
 func serverMetaMsg(mgr *session.Manager) proto.ServerMetaMsg {
 	serverInstanceID := mgr.GetServerInstanceID()
@@ -707,6 +707,9 @@ func serverMetaMsg(mgr *session.Manager) proto.ServerMetaMsg {
 	}
 }
 
+// resolveUDPAddrs はセッションのSTUNアドレス候補・ローカルアドレス候補
+// （いずれもIPv4/IPv6、取得できた分すべて）を解決する。初回接続の候補を
+// 増やすため両familyを問い合わせる。
 func resolveUDPAddrs(sess *session.Session, stunServer string, ipv4Only bool) (stunAddrs, localAddrs []string) {
 	if !sess.IsQUICEnabled() {
 		return

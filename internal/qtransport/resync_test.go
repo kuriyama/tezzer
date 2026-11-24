@@ -6,12 +6,9 @@ package qtransport
 import (
 	"context"
 	"crypto/rand"
-	"net"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/kuriyama/tezzer/internal/transport"
 )
 
 func TestQUICTransport_ResyncBacklog(t *testing.T) {
@@ -25,16 +22,16 @@ func TestQUICTransport_ResyncBacklog(t *testing.T) {
 	defer srv.Close()
 
 	// バックログ（OutputRingBuffer 相当）。offset 1..3。
-	backlog := []transport.OutputChunk{
+	backlog := []OutputChunk{
 		{Offset: 1, Data: []byte("aaa")},
 		{Offset: 2, Data: []byte("bbb")},
 		{Offset: 3, Data: []byte("ccc")},
 	}
 	// バッチ契約により空が返るまで繰り返し呼ばれるため、初回の fromOffset のみ記録する。
 	var gotFrom atomic.Uint64
-	srv.OnResyncNeeded(func(_ transport.ClientID, fromOffset uint64) ([]transport.OutputChunk, error) {
+	srv.OnResyncNeeded(func(_ ClientID, fromOffset uint64) ([]OutputChunk, error) {
 		gotFrom.CompareAndSwap(0, fromOffset)
-		var out []transport.OutputChunk
+		var out []OutputChunk
 		for _, ch := range backlog {
 			if ch.Offset >= fromOffset {
 				out = append(out, ch)
@@ -48,9 +45,9 @@ func TestQUICTransport_ResyncBacklog(t *testing.T) {
 	if err := srv.Start(ctx); err != nil {
 		t.Fatalf("server Start: %v", err)
 	}
-	addr := srv.(interface{ Addr() net.Addr }).Addr().String()
+	addr := srv.Addr().String()
 
-	cli := NewClient(k, addr, 55, "")
+	cli := NewClient(ClientConfig{Key: k, Candidates: []string{addr}, ClientID: 55})
 	defer cli.Close()
 	if err := cli.Start(ctx); err != nil {
 		t.Fatalf("client Start: %v", err)
@@ -75,9 +72,9 @@ func TestQUICTransport_ResyncBacklog(t *testing.T) {
 	}
 
 	// 再送（offset<=lastOffset）は重複排除される: backlog を再度ライブ送信しても届かない。
-	_ = srv.SendOutput(2, []byte("DUP"), []transport.ClientID{{Num: 55}})
+	_ = srv.SendOutput(2, []byte("DUP"), []ClientID{{Num: 55}})
 	// 新しい offset は届く。
-	_ = srv.SendOutput(4, []byte("ddd"), []transport.ClientID{{Num: 55}})
+	_ = srv.SendOutput(4, []byte("ddd"), []ClientID{{Num: 55}})
 	select {
 	case chunk := <-cli.Output():
 		out := chunk.Data

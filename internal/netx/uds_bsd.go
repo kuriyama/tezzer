@@ -2,34 +2,13 @@
 
 package netx
 
-import (
-	"fmt"
-	"net"
+import "golang.org/x/sys/unix"
 
-	"golang.org/x/sys/unix"
-)
-
-// GetPeerUID returns the UID of the peer connected to a Unix Domain Socket
-// on macOS / FreeBSD
-func GetPeerUID(conn net.Conn) (uint32, error) {
-	unixConn, ok := conn.(*net.UnixConn)
-	if !ok {
-		return 0, fmt.Errorf("not a Unix connection")
-	}
-
-	file, err := unixConn.File()
-	if err != nil {
-		return 0, fmt.Errorf("failed to get file descriptor: %w", err)
-	}
-	defer file.Close()
-
-	fd := int(file.Fd())
-
-	// macOS / FreeBSD では LOCAL_PEERCRED を使用（どちらも xucred を返す）
+// peerUID は LOCAL_PEERCRED（macOS / FreeBSD とも xucred を返す）で接続相手の UID を返す。
+func peerUID(fd int) (uint32, error) {
 	cred, err := unix.GetsockoptXucred(fd, unix.SOL_LOCAL, unix.LOCAL_PEERCRED)
 	if err != nil {
-		return 0, fmt.Errorf("failed to get peer credentials: %w", err)
+		return 0, err
 	}
-
 	return cred.Uid, nil
 }

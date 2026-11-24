@@ -8,11 +8,12 @@ import (
 	"fmt"
 	"github.com/kuriyama/tezzer/internal/netx"
 	"github.com/kuriyama/tezzer/internal/proto"
+	"github.com/kuriyama/tezzer/internal/qtransport"
 	"github.com/kuriyama/tezzer/internal/termui"
-	"github.com/kuriyama/tezzer/internal/transport"
 	"io"
 	"log"
 	"net"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -43,10 +44,17 @@ type Client struct {
 	// exitErr は終了理由（nil = 正常終了）。finish が done の close 前に 1 回だけ書くので、
 	// <-done の後なら無ロックで読める
 	exitErr error
-	// QUIC トランスポート（nil の場合は UDS のみ）。startQUICTransport（メイン goroutine）が
-	// 書き、handleServer/handleStdin など別 goroutine が読むため ctMu で保護する。
-	ct   transport.ClientTransport
+	// QUIC トランスポート（nil の場合は UDS のみ）。startQUICTransport（裏の確立・再試行
+	// goroutine）が setTransport で書き、handleServer/handleStdin など別 goroutine が読むため
+	// ctMu で保護する。
+	ct   *qtransport.Client
 	ctMu sync.RWMutex
+	// QUIC 未確立（ct == nil）の間の段階（quicSetupNone / quicSetupConnecting /
+	// quicSetupRetrying）。Ctrl-^ i の表示に使う。
+	quicSetup atomic.Int32
+	// lastLost は直近の届かなかった入力（lostinput.go。Ctrl-^ i に冒頭を出す）。lostMu で保護
+	lastLost lostInputInfo
+	lostMu   sync.Mutex
 	// quicClientID は QUIC の client 識別子。最初の startQUICTransport で作り、バックグラウンド
 	// 再試行でも使い回す（試行ごとに作るとサーバの配信先リストに使われない ID が積もる）。
 	// startQUICTransport は初回の後に再試行 goroutine から順に呼ばれるだけなので、ロックは不要。
@@ -58,8 +66,8 @@ type Client struct {
 	lastSeq       atomic.Uint64 // UDS 経路で最後に受信したシーケンス番号（欠番検出用）
 	// renderedSeq は stdout へ描画済みの最大セッションオフセット。UDS の OutputMsg.Seq と
 	// QUIC の出力 offset は同じ番号空間（サーバの currentSeq）なので、このカウンタ 1 つで
-	// クロスパスの重複排除ができる（attach 時のバックログ二重描画の防止と、
-	// QUIC 断中に UDS 経由の出力を安全に描画するためのフォールバック）。
+	// クロスパスの重複排除ができる（attach 時のバックログ二重描画の防止と、QUIC/UDS の
+	// 切り替わり境界で両経路から届いたチャンクの二重描画の防止）。
 	// 更新は renderMu 下で行う（読み取りはどこからでも可）。
 	renderedSeq atomic.Uint64
 	renderMu    sync.Mutex // renderedSeq の判定〜stdout 書き込みの直列化（UDS/QUIC 両経路）
@@ -169,7 +177,7 @@ func (c *Client) noteSessionExitCode(code int) {
 }
 
 // transport は現在の QUIC トランスポートを返す（nil の場合は UDS のみ）。ctMu で保護。
-func (c *Client) transport() transport.ClientTransport {
+func (c *Client) transport() *qtransport.Client {
 	c.ctMu.RLock()
 	defer c.ctMu.RUnlock()
 	return c.ct
@@ -179,7 +187,7 @@ func (c *Client) transport() transport.ClientTransport {
 // 設定せずに t を閉じて false を返す。バックグラウンド再試行の確立が終了と重なったとき、
 // 終了処理が transport なしと判断した後に設定されると、誰にも閉じられずサーバに意図した
 // 終了が伝わらない（-R の listener が休眠扱いで残る）ため。
-func (c *Client) setTransport(t transport.ClientTransport) bool {
+func (c *Client) setTransport(t *qtransport.Client) bool {
 	c.ctMu.Lock()
 	select {
 	case <-c.done:
@@ -255,17 +263,14 @@ func renderSparkline(samples []float64) string {
 
 // showStatus displays status information for 3 seconds
 func (c *Client) showStatus() {
-	sessID := c.sessionID
-	if len(sessID) > 6 {
-		sessID = sessID[:6]
-	}
-	transportInfo := "UDS"
+	var transportInfo string
 	if ct := c.transport(); ct != nil {
-		rtt := ct.Stats().RTT
 		c.rttHistoryMu.Lock()
 		spark := renderSparkline(c.rttHistory)
 		c.rttHistoryMu.Unlock()
-		transportInfo = fmt.Sprintf("%s RTT:%.0fms %s", ct.State(), rtt, spark)
+		transportInfo = quicLabel(ct.RemoteAddr(), ct.State(), ct.Stats().RTT, spark)
+	} else {
+		transportInfo = udsLabel(c.quicSetup.Load())
 	}
 	outInfo := ""
 	if t := c.lastOutputRecv.Load(); t != 0 {
@@ -282,8 +287,8 @@ func (c *Client) showStatus() {
 	}
 	if len(c.rforwards) > 0 {
 		active := 0
-		if rf, ok := c.transport().(transport.RemoteForwardClient); ok {
-			active = rf.RemoteForwardActive()
+		if ct := c.transport(); ct != nil {
+			active = ct.RemoteForwardActive()
 		}
 		ports := make([]string, len(c.rforwards))
 		for i, sp := range c.rforwards {
@@ -295,8 +300,52 @@ func (c *Client) showStatus() {
 	if c.statusRedraw {
 		scrInfo = fmt.Sprintf(" | scr:%s", termui.ScreenState(c.screenState.Load()))
 	}
-	status := fmt.Sprintf("[Tezzer] %ssess:%s | %s%s%s%s", nameLabel(c.sessionName), sessID, transportInfo, outInfo, fwdInfo, scrInfo)
-	c.showRequestedStatus(status)
+	head := fmt.Sprintf("[Tezzer] %ssess:%s | ", nameLabel(c.sessionName), shortSessionID(c.sessionID))
+	rest := transportInfo + outInfo + fwdInfo + scrInfo
+	// 届かなかった入力の冒頭はパスワードが混ざりうるので、画面にだけ出してログには残さない
+	c.addLogMessage(head + rest)
+	c.displayRequestedStatus(head + c.lostInputLabel() + rest)
+}
+
+// QUIC 未確立の間の段階（Client.quicSetup）。
+const (
+	quicSetupNone       int32 = iota // QUIC 情報なし（ローカル接続等）
+	quicSetupConnecting              // 初回確立中
+	quicSetupRetrying                // 初回確立に失敗し、裏で再試行中
+)
+
+// udsLabel は QUIC 未確立（UDS のみ）のときの経路表示。先頭 2 文字は quicLabel と揃えた
+// 固定カラム（UD / Q4 / Q6）で、どの経路で動いているかを一目で分かるようにする。
+func udsLabel(setup int32) string {
+	switch setup {
+	case quicSetupConnecting:
+		return "UD connecting QUIC"
+	case quicSetupRetrying:
+		return "UD retrying QUIC"
+	}
+	return "UD"
+}
+
+// quicLabel は QUIC 確立後の経路表示。先頭 2 文字は Q4 / Q6（接続先の address family。
+// 判定できなければ Q?。現状の接続候補はサーバの IP・STUN 結果・127.0.0.1 と
+// すべて IP リテラルなので通常は出ない。将来ホスト名の候補が入っても誤った family を
+// 出さないための防御）。接続中なら RTT、それ以外は状態を添える（復帰中の
+// recovering など。family は直前の接続のもの）。
+func quicLabel(remoteAddr string, state qtransport.ConnectionState, rttMs float64, spark string) string {
+	code := "Q?"
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		if ip, err := netip.ParseAddr(host); err == nil {
+			if ip.Unmap().Is4() {
+				code = "Q4"
+			} else {
+				code = "Q6"
+			}
+		}
+	}
+	if state == qtransport.StateConnected {
+		return fmt.Sprintf("%s RTT:%.0fms %s", code, rttMs, spark)
+	}
+	return code + " " + strings.ToLower(state.String())
 }
 
 // maxStatusNameLen はステータス行に出すセッション名の最大桁数。名前は最大 63 文字だが、
@@ -458,6 +507,11 @@ func (c *Client) setStatusMessage(msg string) {
 // その返答）を出す。TEZZER_STATUS=off でも表示する。
 func (c *Client) showRequestedStatus(msg string) {
 	c.addLogMessage(msg)
+	c.displayRequestedStatus(msg)
+}
+
+// displayRequestedStatus は showRequestedStatus のうち表示だけを行う（ログには残さない）。
+func (c *Client) displayRequestedStatus(msg string) {
 	if c.statusMgr == nil {
 		// -N（転送専用）ではステータス行がないので通常のログに出す
 		log.Print(msg)
@@ -498,6 +552,33 @@ func (c *Client) getLogMessages() []logEntry {
 	return result
 }
 
+// finalOutputWait はセッション終了の通知を受けてから、最後の出力の描画を待つ上限。
+const finalOutputWait = 2 * time.Second
+
+// waitRendered はセッションの最後の出力 finalSeq まで描画し終わるのを待つ（上限
+// finalOutputWait）。終了の通知（UDS の SESSION_CLOSED・QUIC の SessionGone）は、QUIC の
+// 出力ストリームとは別経路なので出力を追い越しうる。終了表示と finish の前に呼ぶ。
+// finalSeq == 0（旧サーバ・不明）なら待たない。
+func (c *Client) waitRendered(finalSeq uint64) {
+	if finalSeq == 0 || c.noPTY {
+		return
+	}
+	// QUIC が切れていれば待っても届かない（UDS の飛びを越えたチャンクは描かない）ので待たない。
+	// UDS だけ（ct == nil）なら、出力は同じ UDS で通知より先に届いて描画済みのはずなので、
+	// 下のループはすぐ抜ける
+	if ct := c.transport(); ct != nil && ct.State() != qtransport.StateConnected {
+		return
+	}
+	deadline := time.Now().Add(finalOutputWait)
+	for c.renderedSeq.Load() < finalSeq && time.Now().Before(deadline) {
+		select {
+		case <-c.done:
+			return
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
 // renderOutput は出力チャンク列を重複排除しつつ stdout へ描画する。
 // UDS（OutputMsg.Seq）と QUIC（出力 offset）は同じ番号空間（チャンクごとに +1）なので、
 // 描画済み最大オフセット（renderedSeq）1 つでクロスパスの一度だけ描画を保証できる。
@@ -506,8 +587,8 @@ func (c *Client) getLogMessages() []logEntry {
 // evict 由来の正当な欠落。別途 redraw を促すステータス通知が届く）。
 // fromQUIC = false（UDS。サーバ側 OutCh あふれで欠落しうる）は、QUIC 併用時は
 // 厳密連続（frontier+1）のみ描画し、欠落を跨いだチャンクは QUIC 側の信頼配送に
-// 任せて捨てる。QUIC 未確立（UDS 単独）のときは従来どおり欠落を跨いで描画する。
-func (c *Client) renderOutput(chunks []transport.OutputChunk, fromQUIC bool) {
+// 任せて捨てる。QUIC 未確立（UDS 単独）のときは欠落を跨いで描画する。
+func (c *Client) renderOutput(chunks []qtransport.OutputChunk, fromQUIC bool) {
 	c.renderMu.Lock()
 	defer c.renderMu.Unlock()
 	if c.outputStopped {
@@ -573,7 +654,7 @@ func (c *Client) shouldRedrawAfterStatus() bool {
 	if termui.ScreenState(c.screenState.Load()) != termui.ScreenAlt {
 		return false
 	}
-	if ct := c.transport(); ct != nil && ct.State() != transport.StateConnected {
+	if ct := c.transport(); ct != nil && ct.State() != qtransport.StateConnected {
 		return false
 	}
 	return true

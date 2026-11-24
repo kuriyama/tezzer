@@ -7,8 +7,6 @@ package qtransport
 import (
 	"context"
 	"crypto/rand"
-	"github.com/kuriyama/tezzer/internal/transport"
-	"net"
 	"testing"
 	"time"
 )
@@ -22,16 +20,17 @@ func TestQUICTransport_Stats(t *testing.T) {
 		t.Fatalf("NewServer: %v", err)
 	}
 	defer srv.Close()
+	inputs := inputChan(srv)
 
 	var off uint64
 	go func() {
 		for {
-			in, ok := <-srv.Input()
+			in, ok := <-inputs
 			if !ok {
 				return
 			}
 			off++
-			_ = srv.SendOutput(off, in.Data, []transport.ClientID{in.Client})
+			_ = srv.SendOutput(off, in.Data, []ClientID{in.Client})
 		}
 	}()
 
@@ -40,14 +39,13 @@ func TestQUICTransport_Stats(t *testing.T) {
 	if err := srv.Start(ctx); err != nil {
 		t.Fatalf("server Start: %v", err)
 	}
-	addr := srv.(interface{ Addr() net.Addr }).Addr().String()
+	addr := srv.Addr().String()
 
-	cli := NewClient(k, addr, 12, "")
+	cli := NewClient(ClientConfig{Key: k, Candidates: []string{addr}, ClientID: 12})
 	defer cli.Close()
 	if err := cli.Start(ctx); err != nil {
 		t.Fatalf("client Start: %v", err)
 	}
-	qc := cli.(*quicClient)
 
 	roundTrip := func(msg string) {
 		t.Helper()
@@ -74,8 +72,8 @@ func TestQUICTransport_Stats(t *testing.T) {
 
 	// reconnect / migration が migrateMu を握っている間も Stats() は待たない
 	// （Ctrl-^ i の表示が stdin 処理ごと止まらないこと）。
-	qc.migrateMu.Lock()
-	done := make(chan transport.Stats, 1)
+	cli.migrateMu.Lock()
+	done := make(chan Stats, 1)
 	go func() { done <- cli.Stats() }()
 	select {
 	case s := <-done:
@@ -85,10 +83,10 @@ func TestQUICTransport_Stats(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Errorf("Stats blocked while migrateMu was held")
 	}
-	qc.migrateMu.Unlock()
+	cli.migrateMu.Unlock()
 
 	// migration 後に回復統計が更新される。
-	if err := qc.migrate("stats-test"); err != nil {
+	if err := cli.migrate("stats-test"); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	roundTrip("after")

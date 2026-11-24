@@ -112,7 +112,10 @@ tezzer       # connect; creates and attaches a session running your shell
 
 Use the `tezzer-ssh` wrapper. It starts `tezzerd` on the remote host if needed,
 forwards the control socket over SSH, and connects the client (UDP is negotiated
-automatically):
+automatically). A new session needs QUIC: if UDP cannot get through within 15
+seconds, the session is closed (`QUIC_TIMEOUT`). Attaching to an existing session
+still works over the SSH connection alone, without roaming, while the client
+retries QUIC in the background:
 
 ```bash
 tezzer-ssh myserver run -- tmux        # myserver = any ssh(1) target
@@ -283,7 +286,12 @@ The escape prefix is `Ctrl-^` (Ctrl-Shift-6) by default; change it with
 `tezzer -escape-key`.
 
 - `Ctrl-^ .` — detach from the session
-- `Ctrl-^ i` — show connection status (session name, state, RTT, output freshness)
+- `Ctrl-^ i` — show connection status (session name, path, RTT, output freshness).
+  The path is a fixed two-letter column: `Q4` / `Q6` for QUIC over IPv4 / IPv6,
+  `UD` while running over the Unix socket only (SSH), followed by the state
+  when not connected, e.g. `Q4 recovering` or `UD retrying QUIC`.
+  For ten minutes after input was lost (see below) it also shows the
+  beginning of that input, e.g. `lost:"make dep…"(23B)`
 - `Ctrl-^ h` — show help
 - `Ctrl-^ s` — write stats to `~/.tezzer/stats/<session>.stats.json` (see `tezzer -stats`)
 - `Ctrl-^ d` — toggle debug output
@@ -295,6 +303,15 @@ All of these flash a single status line at the top of the terminal for a few
 seconds; they do not restore whatever was there before. Full-screen apps
 repaint that row only when they next redraw it, so a top bar that rarely
 changes (Zellij's tab bar, tmux with `status-position top`) can stay blank.
+
+Input typed while the connection is down, or sent just before it dropped and
+never delivered, is discarded rather than replayed after the recovery, so a
+command typed before the laptop lid closed does not run hours later. When
+the connection comes back, the status line says how many bytes did not reach
+the session; `Ctrl-^ i` shows their beginning, to help you remember where you
+were typing. That beginning is shown on screen only and never written to the
+client log, since the input may include a password; when more than the last
+64 KB sent was lost, only the count is known.
 
 Experimental: with `TEZZER_STATUS=redraw`, the client nudges the remote app
 to repaint (the same resize trick as `Ctrl-^ f`) right after the status line
@@ -388,6 +405,10 @@ Type=simple
 ExecStart=/usr/local/bin/tezzerd --udp-port 7020
 Restart=always
 RestartSec=5
+# By default (OOMPolicy=stop) systemd stops the whole unit when the OOM killer
+# kills any process in it, so one memory-hungry program inside a session would
+# take down tezzerd and every other session. Keep the rest running instead:
+OOMPolicy=continue
 # Environment needed for screen/tmux to behave correctly:
 Environment=TERM=xterm-256color
 Environment=SHELL=/bin/bash

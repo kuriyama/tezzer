@@ -2,7 +2,7 @@ package session
 
 // agent.go: SSH agent forwarding（-A）のサーバ側（session 層）実装。
 // 設計は docs/dev/agent-forwarding.md。ローカル UDS の accept ループと、
-// transport.AgentForwarder 経由で agent provider クライアントへの中継を担う。
+// qtransport.Server.OpenAgentStream 経由で agent provider クライアントへの中継を担う。
 // QUIC 側の実装（provider 選出・ctrlAgentOpen ハンドシェイク）は internal/qtransport/agent.go。
 
 import (
@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/kuriyama/tezzer/internal/netx"
-	"github.com/kuriyama/tezzer/internal/transport"
+	"github.com/kuriyama/tezzer/internal/qtransport"
 )
 
 // maxAgentStreams はセッションあたりの同時 agent 中継数の上限。
@@ -59,8 +59,8 @@ func (s *Session) handleAgentConn(uconn *net.UnixConn) {
 	}
 	defer s.agentActive.Add(-1)
 
-	af, ok := s.st.(transport.AgentForwarder)
-	if !ok {
+	af := s.st
+	if af == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), agentOpenTimeout)
@@ -77,6 +77,6 @@ func (s *Session) handleAgentConn(uconn *net.UnixConn) {
 }
 
 // pipeAgentConn は UDS 接続と QUIC 中継路を双方向に中継する（バイト数は計上しない）。
-func pipeAgentConn(uconn *net.UnixConn, fc transport.ForwardConn) {
+func pipeAgentConn(uconn *net.UnixConn, fc qtransport.ForwardConn) {
 	pipeForward(uconn, fc, nil, nil)
 }

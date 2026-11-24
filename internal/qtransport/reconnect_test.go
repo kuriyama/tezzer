@@ -7,12 +7,9 @@ package qtransport
 import (
 	"context"
 	"crypto/rand"
-	"net"
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/kuriyama/tezzer/internal/transport"
 )
 
 func TestQUICTransport_ReconnectResync(t *testing.T) {
@@ -28,13 +25,13 @@ func TestQUICTransport_ReconnectResync(t *testing.T) {
 	// バッチ契約（transport は空が返るまで offset+1 で繰り返し呼ぶ）に合わせ、
 	// 呼び出しごとの fromOffset を列で記録する。
 	var mu sync.Mutex
-	backlog := []transport.OutputChunk{{Offset: 1, Data: []byte("aaa")}}
+	backlog := []OutputChunk{{Offset: 1, Data: []byte("aaa")}}
 	var resyncCalls []uint64
-	srv.OnResyncNeeded(func(_ transport.ClientID, fromOffset uint64) ([]transport.OutputChunk, error) {
+	srv.OnResyncNeeded(func(_ ClientID, fromOffset uint64) ([]OutputChunk, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		resyncCalls = append(resyncCalls, fromOffset)
-		var out []transport.OutputChunk
+		var out []OutputChunk
 		for _, ch := range backlog {
 			if ch.Offset >= fromOffset {
 				out = append(out, ch)
@@ -48,14 +45,13 @@ func TestQUICTransport_ReconnectResync(t *testing.T) {
 	if err := srv.Start(ctx); err != nil {
 		t.Fatalf("server Start: %v", err)
 	}
-	addr := srv.(interface{ Addr() net.Addr }).Addr().String()
+	addr := srv.Addr().String()
 
-	cli := NewClient(k, addr, 7, "")
+	cli := NewClient(ClientConfig{Key: k, Candidates: []string{addr}, ClientID: 7})
 	defer cli.Close()
 	if err := cli.Start(ctx); err != nil {
 		t.Fatalf("client Start: %v", err)
 	}
-	qc := cli.(*quicClient)
 
 	recv := func(want string) {
 		t.Helper()
@@ -94,11 +90,11 @@ func TestQUICTransport_ReconnectResync(t *testing.T) {
 
 	// 断中に出力が積まれた状況を模擬（backlog に offset=2 追加）。
 	mu.Lock()
-	backlog = append(backlog, transport.OutputChunk{Offset: 2, Data: []byte("bbb")})
+	backlog = append(backlog, OutputChunk{Offset: 2, Data: []byte("bbb")})
 	mu.Unlock()
 
 	// 接続死を模擬して full reconnect（lastOffset=1 を保持して Hello）。
-	if err := qc.reconnect("test"); err != nil {
+	if err := cli.reconnect("test"); err != nil {
 		t.Fatalf("reconnect: %v", err)
 	}
 
@@ -115,7 +111,7 @@ func TestQUICTransport_ReconnectResync(t *testing.T) {
 
 // reconnect 連続失敗時の指数バックオフ（bump で倍々・上限で頭打ち・reset で即時復帰可）。
 func TestReconnectBackoff(t *testing.T) {
-	c := &quicClient{}
+	c := &Client{}
 	if c.inBackoff() {
 		t.Fatal("fresh client should not be in backoff")
 	}
@@ -148,7 +144,7 @@ func TestReconnectBackoff(t *testing.T) {
 // inputBackoffResetInterval に 1 回までに間引かれることを確認する（接続断中に
 // マウス等の自動生成 ESC シーケンスが送信失敗を連発しても reconnect が連打されない）。
 func TestResetBackoffByInputThrottled(t *testing.T) {
-	c := &quicClient{}
+	c := &Client{}
 	c.bumpBackoff()
 	c.resetBackoffByInput()
 	if c.inBackoff() {

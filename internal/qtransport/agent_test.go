@@ -41,18 +41,17 @@ func startUnixEchoServer(t *testing.T) string {
 }
 
 // setupAgentPair はサーバ・クライアントを接続し、クライアントを agent provider として
-// 登録した quicServer を返す（sessionID は固定 "sess1"）。
-func setupAgentPair(t *testing.T, agentForwardingEnabled bool, clientSockPath string) *quicServer {
+// 登録した Server を返す（sessionID は固定 "sess1"）。
+func setupAgentPair(t *testing.T, agentForwardingEnabled bool, clientSockPath string) *Server {
 	t.Helper()
 	k := make([]byte, 32)
 	rand.Read(k)
 
-	srvT, err := NewServer(k, "127.0.0.1:0")
+	srv, err := NewServer(k, "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
-	t.Cleanup(func() { srvT.Close() })
-	srv := srvT.(*quicServer)
+	t.Cleanup(func() { srv.Close() })
 	srv.SetAgentForwarding(agentForwardingEnabled)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -62,12 +61,8 @@ func setupAgentPair(t *testing.T, agentForwardingEnabled bool, clientSockPath st
 	}
 	addr := srv.Addr().String()
 
-	cliT := NewClient(k, addr, 1, "sess1")
-	t.Cleanup(func() { cliT.Close() })
-	cli := cliT.(*quicClient)
-	if clientSockPath != "" {
-		cli.SetAgentSockPath(clientSockPath)
-	}
+	cli := NewClient(ClientConfig{Key: k, Candidates: []string{addr}, ClientID: 1, SessionID: "sess1", AgentSockPath: clientSockPath})
+	t.Cleanup(func() { cli.Close() })
 	if err := cli.Start(ctx); err != nil {
 		t.Fatalf("client Start: %v", err)
 	}
@@ -76,7 +71,7 @@ func setupAgentPair(t *testing.T, agentForwardingEnabled bool, clientSockPath st
 
 // openAgentStreamRetry は provider 登録（Hello の非同期処理）を待ちながら
 // OpenAgentStream をリトライする。
-func openAgentStreamRetry(t *testing.T, srv *quicServer, sessionID string, timeout time.Duration) (io.ReadWriteCloser, error) {
+func openAgentStreamRetry(t *testing.T, srv *Server, sessionID string, timeout time.Duration) (io.ReadWriteCloser, error) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	var lastErr error
@@ -172,12 +167,11 @@ func TestAgent_ProviderHandoffOnDisconnect(t *testing.T) {
 	k := make([]byte, 32)
 	rand.Read(k)
 
-	srvT, err := NewServer(k, "127.0.0.1:0")
+	srv, err := NewServer(k, "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
-	t.Cleanup(func() { srvT.Close() })
-	srv := srvT.(*quicServer)
+	t.Cleanup(func() { srv.Close() })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	t.Cleanup(cancel)
@@ -187,9 +181,7 @@ func TestAgent_ProviderHandoffOnDisconnect(t *testing.T) {
 	addr := srv.Addr().String()
 
 	// 1台目: provider として接続。
-	cli1T := NewClient(k, addr, 1, "sess1")
-	cli1 := cli1T.(*quicClient)
-	cli1.SetAgentSockPath(sockPath)
+	cli1 := NewClient(ClientConfig{Key: k, Candidates: []string{addr}, ClientID: 1, SessionID: "sess1", AgentSockPath: sockPath})
 	if err := cli1.Start(ctx); err != nil {
 		t.Fatalf("client1 Start: %v", err)
 	}
@@ -199,10 +191,8 @@ func TestAgent_ProviderHandoffOnDisconnect(t *testing.T) {
 	}
 
 	// 2台目: 同じセッションに別クライアントとして -A 付きで attach。
-	cli2T := NewClient(k, addr, 2, "sess1")
-	t.Cleanup(func() { cli2T.Close() })
-	cli2 := cli2T.(*quicClient)
-	cli2.SetAgentSockPath(sockPath)
+	cli2 := NewClient(ClientConfig{Key: k, Candidates: []string{addr}, ClientID: 2, SessionID: "sess1", AgentSockPath: sockPath})
+	t.Cleanup(func() { cli2.Close() })
 	if err := cli2.Start(ctx); err != nil {
 		t.Fatalf("client2 Start: %v", err)
 	}

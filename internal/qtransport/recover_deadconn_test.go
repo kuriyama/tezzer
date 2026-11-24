@@ -8,8 +8,6 @@ package qtransport
 import (
 	"context"
 	"crypto/rand"
-	"github.com/kuriyama/tezzer/internal/transport"
-	"net"
 	"testing"
 	"time"
 )
@@ -23,16 +21,17 @@ func TestQUICTransport_RecoverOnDeadConn(t *testing.T) {
 		t.Fatalf("NewServer: %v", err)
 	}
 	defer srv.Close()
+	inputs := inputChan(srv)
 
 	var off uint64
 	go func() {
 		for {
-			in, ok := <-srv.Input()
+			in, ok := <-inputs
 			if !ok {
 				return
 			}
 			off++
-			_ = srv.SendOutput(off, in.Data, []transport.ClientID{in.Client})
+			_ = srv.SendOutput(off, in.Data, []ClientID{in.Client})
 		}
 	}()
 
@@ -41,14 +40,13 @@ func TestQUICTransport_RecoverOnDeadConn(t *testing.T) {
 	if err := srv.Start(ctx); err != nil {
 		t.Fatalf("server Start: %v", err)
 	}
-	addr := srv.(interface{ Addr() net.Addr }).Addr().String()
+	addr := srv.Addr().String()
 
-	cli := NewClient(k, addr, 7, "")
+	cli := NewClient(ClientConfig{Key: k, Candidates: []string{addr}, ClientID: 7})
 	defer cli.Close()
 	if err := cli.Start(ctx); err != nil {
 		t.Fatalf("client Start: %v", err)
 	}
-	qc := cli.(*quicClient)
 
 	roundTrip := func(msg string) {
 		t.Helper()
@@ -67,17 +65,17 @@ func TestQUICTransport_RecoverOnDeadConn(t *testing.T) {
 	roundTrip("before")
 
 	// 接続を強制終了（idle timeout で死んだ状態を模擬）。
-	qc.conn.Load().CloseWithError(0, "simulated idle death")
+	cli.conn.Load().CloseWithError(0, "simulated idle death")
 	deadline := time.Now().Add(3 * time.Second)
-	for !qc.connDead() && time.Now().Before(deadline) {
+	for !cli.connDead() && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
-	if !qc.connDead() {
+	if !cli.connDead() {
 		t.Fatal("conn did not become dead after CloseWithError")
 	}
 
 	// recover() は connDead を見て reconnect にフォールバックするはず。
-	qc.recover("test dead conn")
+	cli.recover("test dead conn")
 
 	if st := cli.Stats(); st.RecoveryCount != 1 {
 		t.Fatalf("RecoveryCount=%d want 1 after recover", st.RecoveryCount)
@@ -91,13 +89,13 @@ func TestQUICTransport_RecoverOnDeadConn(t *testing.T) {
 
 	// 長スリープ復帰（サーバー側 idle timeout 見込み）では、接続が生きて見えても
 	// migration を試さず直接 reconnect する（Probe の 4 秒待ちを避ける）。
-	qc.migrateMu.Lock()
-	before := qc.conn.Load()
-	qc.migrateMu.Unlock()
-	qc.recoverWith("test long sleep", false)
-	qc.migrateMu.Lock()
-	after, held := qc.conn.Load(), len(qc.pathTransports)
-	qc.migrateMu.Unlock()
+	cli.migrateMu.Lock()
+	before := cli.conn.Load()
+	cli.migrateMu.Unlock()
+	cli.recoverWith("test long sleep", false)
+	cli.migrateMu.Lock()
+	after, held := cli.conn.Load(), len(cli.pathTransports)
+	cli.migrateMu.Unlock()
 	if after == before || held != 0 {
 		t.Fatalf("recoverWith(tryMigrate=false) did not reconnect (conn replaced=%v, paths held=%d)", after != before, held)
 	}

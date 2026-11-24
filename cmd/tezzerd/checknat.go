@@ -40,7 +40,7 @@ func runCheckNAT(serverA, serverB string, ipv4Only bool) int {
 		fmt.Println()
 	}
 
-	fmt.Println("LAN candidate address (same-LAN connect shortcut, see getLocalAddr):")
+	fmt.Println("LAN candidate addresses (same-LAN connect shortcut, see getLocalAddrs):")
 	checkLocalAddr(ipv4Only)
 	fmt.Println()
 
@@ -100,35 +100,18 @@ func checkNATFamily(network, label, serverA, serverB string) bool {
 	return true
 }
 
-// checkLocalAddr は getLocalAddr と同じ経路解決（v4決め打ち→v6フォールバック）を
-// 両family分実行し、実際にどちらが同一LAN候補として広告されるかを表示する。
-// v4/v6-only/dualstack 環境それぞれで getLocalAddr の挙動を単発コマンドで確認できるように、
-// -check-nat の一部として提供する。
+// checkLocalAddr は同一 LAN 候補として実際に広告するローカルアドレス（getLocalAddrs。
+// 生きている family はすべて）を表示する。
 func checkLocalAddr(ipv4Only bool) {
-	v4 := dialLocalAddr("udp4", "8.8.8.8:80")
-	if v4 != "" {
-		fmt.Printf("  IPv4 route: %s (used)\n", v4)
-	} else {
-		fmt.Printf("  IPv4 route: unavailable\n")
+	addrs := getLocalAddrs(ipv4Only)
+	for _, a := range addrs {
+		fmt.Printf("  advertised:  %s\n", a)
 	}
-
-	var v6 string
-	if ipv4Only {
-		fmt.Printf("  IPv6 route: skipped (-ipv4-only)\n")
-	} else {
-		v6 = dialLocalAddr("udp6", "[2001:4860:4860::8888]:80")
-		switch {
-		case v6 == "":
-			fmt.Printf("  IPv6 route: unavailable\n")
-		case v4 == "":
-			fmt.Printf("  IPv6 route: %s (used; IPv4 fallback)\n", v6)
-		default:
-			fmt.Printf("  IPv6 route: %s (not used; IPv4 succeeded)\n", v6)
-		}
-	}
-
-	if v4 == "" && v6 == "" {
+	if len(addrs) == 0 {
 		fmt.Printf("  advertised:  none (clients will fall back to STUN-derived addresses only)\n")
+	}
+	if ipv4Only {
+		fmt.Printf("  IPv6:        skipped (-ipv4-only)\n")
 	}
 }
 

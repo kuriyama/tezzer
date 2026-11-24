@@ -19,7 +19,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/kuriyama/tezzer/internal/transport"
 	"github.com/quic-go/quic-go"
 )
 
@@ -29,16 +28,15 @@ const agentDialTimeout = 3 * time.Second
 
 // ---- サーバ側 ----
 
-// SetAgentForwarding は agent forwarding（-A）の許可/禁止を設定する（既定: 許可）。
-// transport.ServerTransport には含めず、呼び出し側が型アサーションで使う
-// （SetTCPForwarding と同じパターン）。
-func (s *quicServer) SetAgentForwarding(enabled bool) {
+// SetAgentForwarding allows or denies SSH agent forwarding (-A). Default:
+// allowed.
+func (s *Server) SetAgentForwarding(enabled bool) {
 	s.agentFwdDisabled.Store(!enabled)
 }
 
-// features はctrlServerMeta で広告する機能ビットを返す。
-func (s *quicServer) features() uint64 {
-	f := FeatureLiveness
+// features は ctrlServerMeta で広告する機能ビットを返す。
+func (s *Server) features() uint64 {
+	f := FeatureLiveness | FeatureInputApplied
 	if !s.fwdDisabled.Load() {
 		f |= FeatureTCPForward
 	}
@@ -51,11 +49,12 @@ func (s *quicServer) features() uint64 {
 	return f
 }
 
-// OpenAgentStream は sessionID の現在の agent provider クライアントへ bidi ストリームを開き、
-// agent dial ハンドシェイクを行う（transport.AgentForwarder の実装）。
-// provider が unset、または --no-agent-forwarding の場合はエラーを返す
-// （呼び出し元の session 層はローカル UDS 接続を即 close する）。
-func (s *quicServer) OpenAgentStream(ctx context.Context, sessionID string) (transport.ForwardConn, error) {
+// OpenAgentStream opens a relay channel to the session's current agent
+// provider client (the reverse direction of -L's OpenForward). It returns an
+// error when no provider is set (no -A client attached) or agent forwarding
+// is disabled; the caller then closes the local socket connection. ctx
+// applies only to the open handshake.
+func (s *Server) OpenAgentStream(ctx context.Context, sessionID string) (ForwardConn, error) {
 	if s.agentFwdDisabled.Load() {
 		return nil, errors.New("agent forwarding disabled by server")
 	}
@@ -87,26 +86,17 @@ func (s *quicServer) OpenAgentStream(ctx context.Context, sessionID string) (tra
 	return &forwardStream{st: st}, nil
 }
 
-var _ transport.AgentForwarder = (*quicServer)(nil)
-
 // ---- クライアント側 ----
 
-// AgentForwardingSupported はサーバが agent forwarding 対応を広告しているかを返す
-// （serverMeta 受信後に確定）。
-func (c *quicClient) AgentForwardingSupported() bool {
+// AgentForwardingSupported reports whether the server advertises -A support
+// (known once serverMeta has been received; false until then).
+func (c *Client) AgentForwardingSupported() bool {
 	return c.serverFeatures.Load()&FeatureAgentForward != 0
-}
-
-// SetAgentSockPath はこのクライアントが中継するローカル agent ソケットのパスを設定する。
-// Start() 前に一度だけ呼ぶ想定（-A 未指定、または $SSH_AUTH_SOCK が使えない場合は空文字のまま）。
-// 空文字の間は Hello の AgentForward が false になり、サーバからの agent 要求も拒否する。
-func (c *quicClient) SetAgentSockPath(path string) {
-	c.agentSockPath = path
 }
 
 // acceptServerStreams はサーバが開く control 以外の bidi ストリーム（-A・-R の中継要求）を受ける。
 // forward.go の acceptForwardStreams と対称（サーバ→クライアント方向）。
-func (c *quicClient) acceptServerStreams(conn *quic.Conn) {
+func (c *Client) acceptServerStreams(conn *quic.Conn) {
 	for {
 		st, err := conn.AcceptStream(c.ctx)
 		if err != nil {
@@ -116,7 +106,7 @@ func (c *quicClient) acceptServerStreams(conn *quic.Conn) {
 	}
 }
 
-func (c *quicClient) handleServerStream(st *quic.Stream) {
+func (c *Client) handleServerStream(st *quic.Stream) {
 	_ = st.SetReadDeadline(time.Now().Add(forwardOpenTimeout))
 	m, err := readFrame(st)
 	_ = st.SetReadDeadline(time.Time{})
@@ -137,7 +127,7 @@ func (c *quicClient) handleServerStream(st *quic.Stream) {
 }
 
 // handleAgentStream はサーバからの agent 中継要求 1 本を処理する（先頭フレーム読み取り済み）。
-func (c *quicClient) handleAgentStream(st *quic.Stream) {
+func (c *Client) handleAgentStream(st *quic.Stream) {
 	reject := func(reason string) {
 		_ = writeFrame(st, &ctrlMsg{Type: ctrlAgentOpenErr, Msg: reason})
 		st.CancelRead(fwdCodeProtocol)

@@ -6,11 +6,8 @@ package qtransport
 import (
 	"context"
 	"crypto/rand"
-	"net"
 	"testing"
 	"time"
-
-	"github.com/kuriyama/tezzer/internal/transport"
 )
 
 func TestQUICTransport_ServerMetaAndSessionGone(t *testing.T) {
@@ -29,23 +26,27 @@ func TestQUICTransport_ServerMetaAndSessionGone(t *testing.T) {
 	if err := srv.Start(ctx); err != nil {
 		t.Fatalf("server Start: %v", err)
 	}
-	addr := srv.(interface{ Addr() net.Addr }).Addr().String()
-
-	cli := NewClient(k, addr, 7, "s1")
-	defer cli.Close()
+	addr := srv.Addr().String()
 
 	metaCh := make(chan [3]string, 1)
-	cli.OnServerMeta(func(buildID, buildTime string, instanceID []byte) {
-		metaCh <- [3]string{buildID, buildTime, string(instanceID)}
-	})
 	type goneEvent struct {
-		reason   string
-		exitCode int
+		reason      string
+		exitCode    int
+		finalOffset uint64
 	}
 	goneCh := make(chan goneEvent, 2)
-	cli.OnSessionNotFound(func(reason string, exitCode int) { goneCh <- goneEvent{reason, exitCode} })
 	statusCh := make(chan string, 1)
-	cli.OnStatusMessage(func(msg string) { statusCh <- msg })
+	cli := NewClient(ClientConfig{
+		Key: k, Candidates: []string{addr}, ClientID: 7, SessionID: "s1",
+		OnServerMeta: func(buildID, buildTime string, instanceID []byte) {
+			metaCh <- [3]string{buildID, buildTime, string(instanceID)}
+		},
+		OnSessionNotFound: func(reason string, exitCode int, finalOffset uint64) {
+			goneCh <- goneEvent{reason, exitCode, finalOffset}
+		},
+		OnStatusMessage: func(msg string) { statusCh <- msg },
+	})
+	defer cli.Close()
 
 	if err := cli.Start(ctx); err != nil {
 		t.Fatalf("client Start: %v", err)
@@ -68,7 +69,7 @@ func TestQUICTransport_ServerMetaAndSessionGone(t *testing.T) {
 	}
 
 	// SendStatus が OnStatusMessage へ届く（再同期欠損の再描画通知などに使う）。
-	if err := srv.SendStatus(transport.ClientID{Session: "s1", Num: 7}, "Output was dropped"); err != nil {
+	if err := srv.SendStatus(ClientID{Session: "s1", Num: 7}, "Output was dropped"); err != nil {
 		t.Fatalf("SendStatus: %v", err)
 	}
 	select {
@@ -81,7 +82,7 @@ func TestQUICTransport_ServerMetaAndSessionGone(t *testing.T) {
 	}
 
 	// SessionGone が OnSessionNotFound へ届く（exit code なし = -1）。
-	if err := srv.SendSessionGone(transport.ClientID{Session: "s1", Num: 7}, "killed", -1); err != nil {
+	if err := srv.SendSessionGone(ClientID{Session: "s1", Num: 7}, "killed", -1, 0); err != nil {
 		t.Fatalf("SendSessionGone: %v", err)
 	}
 	select {
@@ -93,14 +94,14 @@ func TestQUICTransport_ServerMetaAndSessionGone(t *testing.T) {
 		t.Fatal("did not receive session-gone notification")
 	}
 
-	// exit code 付きの SessionGone が届く（0 も「不明(-1)」と区別されて伝搬される）。
-	if err := srv.SendSessionGone(transport.ClientID{Session: "s1", Num: 7}, "SESSION_CLOSED: PTY session has ended", 0); err != nil {
+	// exit code と最後の出力 offset 付きの SessionGone が届く（0 も「不明(-1)」と区別されて伝搬される）。
+	if err := srv.SendSessionGone(ClientID{Session: "s1", Num: 7}, "SESSION_CLOSED: PTY session has ended", 0, 42); err != nil {
 		t.Fatalf("SendSessionGone with exit code: %v", err)
 	}
 	select {
 	case ev := <-goneCh:
-		if ev.exitCode != 0 {
-			t.Fatalf("OnSessionNotFound exitCode=%d want 0", ev.exitCode)
+		if ev.exitCode != 0 || ev.finalOffset != 42 {
+			t.Fatalf("OnSessionNotFound got (exitCode=%d, finalOffset=%d) want (0, 42)", ev.exitCode, ev.finalOffset)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("did not receive session-gone notification with exit code")

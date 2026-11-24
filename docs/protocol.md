@@ -59,10 +59,14 @@ Selected fields:
   (0–2 STUN-derived candidate addresses, one per address family available),
   and `local_addr` (for same-LAN connections).
 - `UDP_CLIENT_INFO` — the client announces its 16-bit `client_id` and STUN
-  address before dialing QUIC (needed for routing on a shared transport).
+  address before dialing QUIC (needed for routing on a shared transport). It
+  also ties the Unix-socket client to its QUIC client ID: while that QUIC
+  client is connected, output is not sent over the socket.
 - `OUTPUT.data` — raw PTY bytes including escape sequences (relayed verbatim).
 - `NOTE.kind` — `SESSION_CLOSED` (the PTY exited) or `OUTPUT_DROPPED` (the
-  output ring buffer overflowed).
+  output ring buffer overflowed). `SESSION_CLOSED` carries the session's
+  last output sequence (`final_seq`, optional); output delivered over QUIC
+  can arrive after the note, so the client renders up to it before exiting.
 - `ERROR.code` — `BAD_REQUEST`, `NO_SUCH_SESSION`, `INTERNAL`, `BUSY`,
   `UNAUTHORIZED`, `DUPLICATE_NAME`.
 - `SERVER_META.server_instance_id` — random ID used to detect server restarts.
@@ -108,8 +112,8 @@ Control frames are `[u32be length][MessagePack]`, max 1 MiB. Frame types:
 |---|---|---|---|
 | 1 | Hello | C→S | bind connection to `(session_id, client_id)`; carries `last_offset` for resync |
 | 2 | Resize | C→S | terminal resize |
-| 3 | ServerMeta | S→C | build ID/time, instance ID, feature bits (bit 0 = tcp-forwarding, bit 1 = agent-forwarding, bit 2 = liveness ping, bit 3 = remote-forwarding) |
-| 4 | SessionGone | S→C | session no longer exists (restart/kill); when the session's process exited, carries its exit code (`ec`, optional; signal death is 128+signal; 0 when the session was killed), which the client adopts as its own exit status like ssh |
+| 3 | ServerMeta | S→C | build ID/time, instance ID, feature bits (bit 0 = tcp-forwarding, bit 1 = agent-forwarding, bit 2 = liveness ping, bit 3 = remote-forwarding, bit 4 = input-applied) |
+| 4 | SessionGone | S→C | session no longer exists (restart/kill); when the session's process exited, carries its exit code (`ec`, optional; signal death is 128+signal; 0 when the session was killed), which the client adopts as its own exit status like ssh, and the offset of the session's last output (`fo`, optional), which the client renders before exiting since this control frame can overtake it |
 | 5 | Status | S→C | status message for the user |
 | 6 | Log | S→C | log message |
 | 7 | FwdOpen | C→S | first frame of a forward stream: `msg` = dial target `"host:port"` |
@@ -123,6 +127,7 @@ Control frames are `[u32be length][MessagePack]`, max 1 MiB. Frame types:
 | 15 | RFwdOpen | S→C | first frame of a remote-forward stream opened by the server: `p` = server-side listen port |
 | 16 | RFwdOpenOK | C→S | the client dialed its target for that port; stream switches to raw relay |
 | 17 | RFwdOpenErr | C→S | dial failed or port not defined on this client; `msg` = reason |
+| 18 | InputApplied | S→C | sent after ServerMeta on every connect (servers advertising bit 4): how many input bytes of this client's previous connection reached the PTY (`ia`, omitted when unknown: first connect, after a server restart, when the previous connection's input is still blocked after 2 s, or when the client was away for more than 24 h). The client reports the difference from what it wrote as input that was not delivered; it does not re-send it |
 
 Types 7–12 and 15–17 appear only at the head of forward streams, never on the
 control stream (they share the frame encoding).
@@ -154,7 +159,9 @@ is negotiated by QUIC transport parameters; without it, input is stream-only.
 - **Reconnect** (connection dead, e.g. sleep longer than the idle timeout): a
   new connection is dialed in parallel to all candidate addresses; the Hello's
   `last_offset` drives output resync. The input-stream offset (and thus the
-  datagram dedup state) resets with the new connection. Forward streams do not
+  datagram dedup state) resets with the new connection. Input written to the
+  old connection that never reached the PTY is not re-sent; InputApplied
+  tells the client how much of it arrived. Forward streams do not
   survive, but client-side listeners and tunnel definitions do.
 
 Sleep is detected by wall-clock jumps (the monotonic clock stops during OS

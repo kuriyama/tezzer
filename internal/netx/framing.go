@@ -37,28 +37,14 @@ func WriteFrame(w io.Writer, payload []byte) error {
 	var lenBuf [4]byte
 	binary.BigEndian.PutUint32(lenBuf[:], length)
 
-	// Write length header (handle partial writes)
-	if err := writeAll(w, lenBuf[:]); err != nil {
+	// io.Writer は書き切れなければ必ずエラーを返す契約なので、部分書き込みの再試行は不要
+	if _, err := w.Write(lenBuf[:]); err != nil {
 		return err
 	}
-	// Write payload (handle partial writes)
 	if length > 0 {
-		if err := writeAll(w, payload); err != nil {
+		if _, err := w.Write(payload); err != nil {
 			return err
 		}
-	}
-	return nil
-}
-
-// writeAll writes all data to w, handling partial writes.
-func writeAll(w io.Writer, data []byte) error {
-	offset := 0
-	for offset < len(data) {
-		n, err := w.Write(data[offset:])
-		if err != nil {
-			return err
-		}
-		offset += n
 	}
 	return nil
 }

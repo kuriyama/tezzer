@@ -167,6 +167,10 @@ type NoteMsg struct {
 	// ExitCode is the session process's exit status. Only set on
 	// SESSION_CLOSED; nil = unknown (notifications from old servers omit it).
 	ExitCode *int `msgpack:"exit_code,omitempty"`
+	// FinalSeq is the sequence number of the session's last output. Only set
+	// on SESSION_CLOSED; 0 = unknown. Output delivered over QUIC can arrive
+	// after this notification, so the client renders up to FinalSeq first.
+	FinalSeq uint64 `msgpack:"final_seq,omitempty"`
 }
 
 // ClientInfo describes one connected client.

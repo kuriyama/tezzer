@@ -7,11 +7,8 @@ package qtransport
 import (
 	"context"
 	"crypto/rand"
-	"net"
 	"testing"
 	"time"
-
-	"github.com/kuriyama/tezzer/internal/transport"
 )
 
 func TestQUICTransport_ClientSendStats(t *testing.T) {
@@ -29,9 +26,9 @@ func TestQUICTransport_ClientSendStats(t *testing.T) {
 	if err := srv.Start(ctx); err != nil {
 		t.Fatalf("server Start: %v", err)
 	}
-	addr := srv.(interface{ Addr() net.Addr }).Addr().String()
+	addr := srv.Addr().String()
 
-	cli := NewClient(k, addr, 7, "s1")
+	cli := NewClient(ClientConfig{Key: k, Candidates: []string{addr}, ClientID: 7, SessionID: "s1"})
 	defer cli.Close()
 	if err := cli.Start(ctx); err != nil {
 		t.Fatalf("client Start: %v", err)
@@ -50,13 +47,13 @@ func TestQUICTransport_ClientSendStats(t *testing.T) {
 	const n = 5
 	payload := []byte("0123456789") // 10 bytes
 	for i := 0; i < n; i++ {
-		if err := srv.SendOutput(uint64(i+1), payload, []transport.ClientID{{Session: "s1", Num: 7}}); err != nil {
+		if err := srv.SendOutput(uint64(i+1), payload, []ClientID{{Session: "s1", Num: 7}}); err != nil {
 			t.Fatalf("SendOutput: %v", err)
 		}
 	}
 
 	// 統計に反映されるまで待つ。
-	var st transport.ClientSendStat
+	var st ClientSendStat
 	got := false
 	for time.Now().Before(deadline) {
 		for _, s := range srv.ClientSendStats() {

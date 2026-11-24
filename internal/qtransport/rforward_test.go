@@ -13,24 +13,22 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/kuriyama/tezzer/internal/transport"
 )
 
 type rfwdHelloEvent struct {
-	id     transport.ClientID
+	id     ClientID
 	device string
 	ports  []uint16
 }
 
 type rfwdGoneEvent struct {
-	id       transport.ClientID
+	id       ClientID
 	explicit bool
 }
 
 type rfwdPair struct {
-	srv    *quicServer
-	cli    *quicClient
+	srv    *Server
+	cli    *Client
 	hellos chan rfwdHelloEvent
 	gones  chan rfwdGoneEvent
 }
@@ -40,19 +38,18 @@ func setupRFwdPair(t *testing.T, forwardingEnabled bool, targets map[uint16]stri
 	t.Helper()
 	k := make([]byte, 32)
 	rand.Read(k)
-	st, err := NewServer(k, "127.0.0.1:0")
+	srv, err := NewServer(k, "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
-	t.Cleanup(func() { st.Close() })
-	srv := st.(*quicServer)
+	t.Cleanup(func() { srv.Close() })
 	srv.SetTCPForwarding(forwardingEnabled)
 	p := &rfwdPair{srv: srv, hellos: make(chan rfwdHelloEvent, 8), gones: make(chan rfwdGoneEvent, 8)}
 	srv.OnRemoteForward(
-		func(id transport.ClientID, device string, ports []uint16) {
+		func(id ClientID, device string, ports []uint16) {
 			p.hellos <- rfwdHelloEvent{id, device, ports}
 		},
-		func(id transport.ClientID, explicit bool) { p.gones <- rfwdGoneEvent{id, explicit} },
+		func(id ClientID, explicit bool) { p.gones <- rfwdGoneEvent{id, explicit} },
 	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -60,9 +57,10 @@ func setupRFwdPair(t *testing.T, forwardingEnabled bool, targets map[uint16]stri
 	if err := srv.Start(ctx); err != nil {
 		t.Fatalf("server Start: %v", err)
 	}
-	ct := NewClient(k, srv.Addr().String(), 1, "sess")
-	p.cli = ct.(*quicClient)
-	p.cli.SetRemoteForwards("0123456789abcdef0123456789abcdef", targets)
+	p.cli = NewClient(ClientConfig{
+		Key: k, Candidates: []string{srv.Addr().String()}, ClientID: 1, SessionID: "sess",
+		DeviceID: "0123456789abcdef0123456789abcdef", RemoteForwards: targets,
+	})
 	t.Cleanup(func() { p.cli.Close() })
 	if err := p.cli.Start(ctx); err != nil {
 		t.Fatalf("client Start: %v", err)
@@ -124,11 +122,11 @@ func TestRemoteForward_ClientRejects(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	if _, err := p.srv.OpenRemoteForward(ctx, ev.id, 9222); !errors.Is(err, transport.ErrForwardRejected) {
+	if _, err := p.srv.OpenRemoteForward(ctx, ev.id, 9222); !errors.Is(err, ErrForwardRejected) {
 		t.Fatalf("dial failure: err = %v, want ErrForwardRejected", err)
 	}
 	// 定義のないポートも拒否される（サーバがクライアントに任意の dial 先を指示できない）。
-	if _, err := p.srv.OpenRemoteForward(ctx, ev.id, 9999); !errors.Is(err, transport.ErrForwardRejected) {
+	if _, err := p.srv.OpenRemoteForward(ctx, ev.id, 9999); !errors.Is(err, ErrForwardRejected) {
 		t.Fatalf("unknown port: err = %v, want ErrForwardRejected", err)
 	}
 }
@@ -172,7 +170,7 @@ func TestRemoteForward_DisabledNotAdvertised(t *testing.T) {
 	if p.cli.RemoteForwardingSupported() {
 		t.Fatal("-R advertised while forwarding disabled")
 	}
-	if _, err := p.srv.OpenRemoteForward(context.Background(), transport.ClientID{Session: "sess", Num: 1}, 9222); err == nil {
+	if _, err := p.srv.OpenRemoteForward(context.Background(), ClientID{Session: "sess", Num: 1}, 9222); err == nil {
 		t.Fatal("OpenRemoteForward succeeded while forwarding disabled")
 	}
 }
@@ -191,13 +189,12 @@ func TestRemoteForward_NoHelloWithoutSpecs(t *testing.T) {
 func TestRemoteForward_DeviceIDTooLong(t *testing.T) {
 	k := make([]byte, 32)
 	rand.Read(k)
-	st, err := NewServer(k, "127.0.0.1:0")
+	srv, err := NewServer(k, "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { st.Close() })
-	srv := st.(*quicServer)
-	srv.OnRemoteForward(func(transport.ClientID, string, []uint16) {}, func(transport.ClientID, bool) {})
+	t.Cleanup(func() { srv.Close() })
+	srv.OnRemoteForward(func(ClientID, string, []uint16) {}, func(ClientID, bool) {})
 	if h := srv.rfwdHelloFor(&ctrlMsg{RemoteForwards: []uint16{9222}, DeviceID: strings.Repeat("a", maxDeviceIDLen+1)}); h != nil {
 		t.Fatal("over-long device ID accepted")
 	}

@@ -16,7 +16,6 @@ import (
 
 	"github.com/kuriyama/tezzer/internal/proto"
 	"github.com/kuriyama/tezzer/internal/qtransport"
-	"github.com/kuriyama/tezzer/internal/transport"
 	"github.com/kuriyama/tezzer/internal/version"
 )
 
@@ -31,7 +30,7 @@ type Manager struct {
 	// 共有 QUIC transport（固定ポート運用＝1ポートで複数セッション相乗り時）。
 	// QUIC は connection ID で多接続を多重化するので、1 ソケットを全セッションで共有できる。
 	// fixedPort 未指定時は nil（各セッションが per-session で transport を持つ）。
-	sharedTransport transport.ServerTransport
+	sharedTransport *qtransport.Server
 	sharedCancel    context.CancelFunc
 	sharedPort      int
 	sharedKey       []byte
@@ -76,11 +75,9 @@ func (m *Manager) AgentForwardingEnabled() bool {
 }
 
 // applyTransportPolicy は生成した transport にサーバポリシー（転送許可）を適用する。
-func (m *Manager) applyTransportPolicy(st transport.ServerTransport) {
-	if p, ok := st.(transport.ForwardingPolicy); ok {
-		p.SetTCPForwarding(m.tcpForwardingEnabled())
-		p.SetAgentForwarding(m.AgentForwardingEnabled())
-	}
+func (m *Manager) applyTransportPolicy(st *qtransport.Server) {
+	st.SetTCPForwarding(m.tcpForwardingEnabled())
+	st.SetAgentForwarding(m.AgentForwardingEnabled())
 	// -R は TCP 転送の一部として --no-tcp-forwarding で一緒に無効になる
 	// （ssh の AllowTcpForwarding と同じ）。登録しなければ transport は広告もしない。
 	if m.tcpForwardingEnabled() {
@@ -109,12 +106,7 @@ func (m *Manager) InitSharedTransport(fixedPort int) error {
 	if err != nil {
 		return fmt.Errorf("failed to create shared QUIC transport: %w", err)
 	}
-	a, ok := st.(transport.Addresser)
-	if !ok {
-		_ = st.Close()
-		return fmt.Errorf("transport does not expose listen address")
-	}
-	addr, ok := a.Addr().(*net.UDPAddr)
+	addr, ok := st.Addr().(*net.UDPAddr)
 	if !ok {
 		_ = st.Close()
 		return fmt.Errorf("failed to get shared QUIC listen address")
@@ -124,7 +116,7 @@ func (m *Manager) InitSharedTransport(fixedPort int) error {
 
 // adoptSharedTransport は共有 QUIC トランスポートの配線・起動を行う（InitSharedTransport 用）。
 // 失敗時は st を閉じる。
-func (m *Manager) adoptSharedTransport(st transport.ServerTransport, port int, key []byte) error {
+func (m *Manager) adoptSharedTransport(st *qtransport.Server, port int, key []byte) error {
 	m.prepareSharedTransport(st, port, key)
 	return m.startSharedTransport()
 }
@@ -132,10 +124,11 @@ func (m *Manager) adoptSharedTransport(st transport.ServerTransport, port int, k
 // prepareSharedTransport は共有 transport のコールバックを配線して manager に持たせる（まだ
 // 受け付けない）。無停止再起動の復元では、この後に全セッションを復元してから
 // startSharedTransport する（先に受け付けると、即座に来る再接続に NO_SUCH_SESSION を返しうる）。
-func (m *Manager) prepareSharedTransport(st transport.ServerTransport, port int, key []byte) {
+func (m *Manager) prepareSharedTransport(st *qtransport.Server, port int, key []byte) {
 	st.OnResyncNeeded(m.sharedResync)
 	st.OnClientConnect(m.sharedOnConnect)
 	st.OnClientExit(m.sharedOnExit)
+	st.OnInput(m.routeSharedInput)
 	st.SetServerMeta(version.GetVersion(), version.GetBuildTime(), m.serverInstanceID[:])
 	m.applyTransportPolicy(st)
 	m.sharedTransport = st
@@ -156,7 +149,6 @@ func (m *Manager) startSharedTransport() error {
 	}
 	m.sharedCancel = cancel
 
-	go m.routeSharedInput()
 	go m.routeSharedResize()
 	log.Printf("shared QUIC transport enabled on port %d", m.sharedPort)
 	return nil
@@ -179,7 +171,7 @@ func (m *Manager) sessionByID(sessionID string) *Session {
 }
 
 // sharedResync は共有 transport の OnResyncNeeded を Client.Session で振り分ける。
-func (m *Manager) sharedResync(client transport.ClientID, fromOffset uint64) ([]transport.OutputChunk, error) {
+func (m *Manager) sharedResync(client qtransport.ClientID, fromOffset uint64) ([]qtransport.OutputChunk, error) {
 	sess := m.sessionByID(client.Session)
 	if sess == nil {
 		return nil, nil
@@ -189,11 +181,11 @@ func (m *Manager) sharedResync(client transport.ClientID, fromOffset uint64) ([]
 
 // sharedOnConnect は接続クライアントのセッションが存在するか検証し、消えていれば
 // （サーバ再起動後の reconnect・kill 済み等）QUIC 経路で sessionGone を通知する。
-func (m *Manager) sharedOnConnect(client transport.ClientID) {
+func (m *Manager) sharedOnConnect(client qtransport.ClientID) {
 	sess := m.sessionByID(client.Session)
 	if sess == nil {
 		if m.sharedTransport != nil {
-			_ = m.sharedTransport.SendSessionGone(client, "NO_SUCH_SESSION: session not found", -1)
+			_ = m.sharedTransport.SendSessionGone(client, "NO_SUCH_SESSION: session not found", -1, 0)
 		}
 		return
 	}
@@ -202,30 +194,20 @@ func (m *Manager) sharedOnConnect(client transport.ClientID) {
 }
 
 // sharedOnExit は意図して終了したクライアントを、そのセッションの出力ファンアウト先から外す。
-func (m *Manager) sharedOnExit(client transport.ClientID) {
+func (m *Manager) sharedOnExit(client qtransport.ClientID) {
 	if sess := m.sessionByID(client.Session); sess != nil {
 		sess.UnregisterQUICClient(client.Num)
 	}
 }
 
-// routeSharedInput は共有 transport の入力を Client.Session で PTY へ振り分ける。
+// routeSharedInput は共有 transport の入力を Client.Session で PTY へ振り分ける（OnInput。
+// 送ってきたクライアントの受信 goroutine 上で同期的に書くので、あるセッションの PTY が
+// 詰まっても止まるのはそのクライアントだけで、他のセッションの入力は流れ続ける）。
 // 識別子は Hello に載った (SessionID, Num) の複合 ClientID なので、別セッションの同じ Num と
 // 衝突しない。
-func (m *Manager) routeSharedInput() {
-	for {
-		select {
-		case <-m.done:
-			return
-		case in, ok := <-m.sharedTransport.Input():
-			if !ok {
-				return
-			}
-			if sess := m.sessionByID(in.Client.Session); sess != nil {
-				if err := sess.WriteInput(in.Data); err != nil && !sess.IsPTYClosed() {
-					log.Printf("shared QUIC: write input to session failed: %v", err)
-				}
-			}
-		}
+func (m *Manager) routeSharedInput(in qtransport.Input) {
+	if sess := m.sessionByID(in.Client.Session); sess != nil {
+		sess.writeTransportInput(in.Data)
 	}
 }
 

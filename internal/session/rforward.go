@@ -30,7 +30,7 @@ import (
 	"time"
 
 	"github.com/kuriyama/tezzer/internal/proto"
-	"github.com/kuriyama/tezzer/internal/transport"
+	"github.com/kuriyama/tezzer/internal/qtransport"
 )
 
 const (
@@ -47,10 +47,18 @@ const (
 	maxRFwdPortsPerClient = 16
 )
 
+// rfwdTransport は -R の登録表が QUIC transport（*qtransport.Server）に求める操作。
+// テストで偽物に差し替えるために interface にしている。
+type rfwdTransport interface {
+	OnRemoteForward(hello func(qtransport.ClientID, string, []uint16), gone func(qtransport.ClientID, bool))
+	OpenRemoteForward(ctx context.Context, client qtransport.ClientID, port uint16) (qtransport.ForwardConn, error)
+	SendStatus(client qtransport.ClientID, msg string) error
+}
+
 // rfwdProv は 1 ポートに対する 1 クライアントの登録。
 type rfwdProv struct {
-	st      transport.ServerTransport
-	id      transport.ClientID
+	st      rfwdTransport
+	id      qtransport.ClientID
 	device  string
 	live    bool      // 接続中（false = 休眠）
 	helloAt time.Time // 最後の Hello（provider 選出に使う）
@@ -64,7 +72,7 @@ type rfwdPort struct {
 	owner   string // listener を持つ端末の device ID（"" = 未 bind）
 	lns     []net.Listener
 	bindErr string // 直近の bind 失敗の理由（owner == "" の間のみ意味を持つ）
-	provs   map[transport.ClientID]*rfwdProv
+	provs   map[qtransport.ClientID]*rfwdProv
 
 	active    atomic.Int32
 	opened    atomic.Uint64
@@ -75,8 +83,8 @@ type rfwdPort struct {
 
 // rfwdNotice はロック外で送るクライアントへの通知。
 type rfwdNotice struct {
-	st  transport.ServerTransport
-	id  transport.ClientID
+	st  rfwdTransport
+	id  qtransport.ClientID
 	msg string
 }
 
@@ -98,20 +106,16 @@ func newRFwdRegistry() *rfwdRegistry {
 	}
 }
 
-// wire は transport に -R のコールバックを登録する（-R 対応 transport のみ）。
-func (r *rfwdRegistry) wire(st transport.ServerTransport) {
-	rf, ok := st.(transport.RemoteForwarder)
-	if !ok {
-		return
-	}
-	rf.OnRemoteForward(
-		func(id transport.ClientID, device string, ports []uint16) { r.hello(st, id, device, ports) },
+// wire は transport に -R のコールバックを登録する。
+func (r *rfwdRegistry) wire(st rfwdTransport) {
+	st.OnRemoteForward(
+		func(id qtransport.ClientID, device string, ports []uint16) { r.hello(st, id, device, ports) },
 		r.gone,
 	)
 }
 
 // hello はクライアントの登録（初回接続・reconnect）を反映する。
-func (r *rfwdRegistry) hello(st transport.ServerTransport, id transport.ClientID, device string, ports []uint16) {
+func (r *rfwdRegistry) hello(st rfwdTransport, id qtransport.ClientID, device string, ports []uint16) {
 	if len(ports) > maxRFwdPortsPerClient {
 		ports = ports[:maxRFwdPortsPerClient]
 	}
@@ -135,7 +139,7 @@ func (r *rfwdRegistry) hello(st transport.ServerTransport, id transport.ClientID
 	for port := range want {
 		p := r.ports[port]
 		if p == nil {
-			p = &rfwdPort{port: port, provs: make(map[transport.ClientID]*rfwdProv)}
+			p = &rfwdPort{port: port, provs: make(map[qtransport.ClientID]*rfwdProv)}
 			r.ports[port] = p
 		}
 		pr := p.provs[id]
@@ -156,7 +160,7 @@ func (r *rfwdRegistry) hello(st transport.ServerTransport, id transport.ClientID
 }
 
 // gone はクライアントの接続終了を反映する。explicit = クライアントが意図して閉じた。
-func (r *rfwdRegistry) gone(id transport.ClientID, explicit bool) {
+func (r *rfwdRegistry) gone(id qtransport.ClientID, explicit bool) {
 	now := r.now()
 	r.mu.Lock()
 	var notices []rfwdNotice
@@ -346,8 +350,8 @@ func (r *rfwdRegistry) send(notices []rfwdNotice) {
 
 // rfwdTarget は中継先の候補（ロック外で使うためのコピー）。
 type rfwdTarget struct {
-	rf transport.RemoteForwarder
-	id transport.ClientID
+	rf rfwdTransport
+	id qtransport.ClientID
 }
 
 // targets は p の listener を持つ端末の接続中 provider を、Hello の新しい順に返す。
@@ -363,9 +367,7 @@ func (r *rfwdRegistry) targets(p *rfwdPort) []rfwdTarget {
 	sort.Slice(live, func(i, j int) bool { return live[i].helloAt.After(live[j].helloAt) })
 	out := make([]rfwdTarget, 0, len(live))
 	for _, pr := range live {
-		if rf, ok := pr.st.(transport.RemoteForwarder); ok {
-			out = append(out, rfwdTarget{rf: rf, id: pr.id})
-		}
+		out = append(out, rfwdTarget{rf: pr.st, id: pr.id})
 	}
 	return out
 }
@@ -399,7 +401,7 @@ func (r *rfwdRegistry) handleConn(p *rfwdPort, tconn *net.TCPConn) {
 	if len(targets) > 2 {
 		targets = targets[:2]
 	}
-	var fc transport.ForwardConn
+	var fc qtransport.ForwardConn
 	for _, t := range targets {
 		ctx, cancel := context.WithTimeout(context.Background(), rfwdOpenTimeout)
 		c, err := t.rf.OpenRemoteForward(ctx, t.id, p.port)
@@ -410,7 +412,7 @@ func (r *rfwdRegistry) handleConn(p *rfwdPort, tconn *net.TCPConn) {
 			break
 		}
 		log.Printf("rforward: port %d: client %d (session %s): %v", p.port, t.id.Num, t.id.Session, err)
-		if errors.Is(err, transport.ErrForwardRejected) {
+		if errors.Is(err, qtransport.ErrForwardRejected) {
 			return
 		}
 	}
@@ -431,34 +433,27 @@ type halfCloser interface {
 // pipeForward は接続と QUIC 中継路を双方向に中継する。
 // qtransport.forwardPipe と同じ半クローズ規約（正常 EOF は CloseWrite、エラーは Close）。
 // toPeer / fromPeer には転送バイト数を計上する（nil なら計上しない）。
-func pipeForward(c halfCloser, fc transport.ForwardConn, toPeer, fromPeer *atomic.Uint64) {
+func pipeForward(c halfCloser, fc qtransport.ForwardConn, toPeer, fromPeer *atomic.Uint64) {
 	done := make(chan struct{}, 2)
-	go func() {
-		n, err := io.Copy(fc, c)
-		if toPeer != nil {
-			toPeer.Add(uint64(n))
-		}
-		if err == nil {
-			_ = fc.CloseWrite()
-		} else {
-			_ = fc.Close()
-		}
-		done <- struct{}{}
-	}()
-	go func() {
-		n, err := io.Copy(c, fc)
-		if fromPeer != nil {
-			fromPeer.Add(uint64(n))
-		}
-		if err == nil {
-			_ = c.CloseWrite()
-		} else {
-			_ = c.Close()
-		}
-		done <- struct{}{}
-	}()
+	go copyHalf(fc, c, toPeer, done)
+	go copyHalf(c, fc, fromPeer, done)
 	<-done
 	<-done
+}
+
+// copyHalf は src から dst へ片方向に中継し、正常 EOF なら dst の送信側だけを閉じる
+// （エラーなら dst ごと閉じる）。n には転送バイト数を計上する（nil なら計上しない）。
+func copyHalf(dst halfCloser, src io.Reader, n *atomic.Uint64, done chan<- struct{}) {
+	written, err := io.Copy(dst, src)
+	if n != nil {
+		n.Add(uint64(written))
+	}
+	if err == nil {
+		_ = dst.CloseWrite()
+	} else {
+		_ = dst.Close()
+	}
+	done <- struct{}{}
 }
 
 // shortDevice はログ・表示用に device ID の先頭 8 文字を返す。

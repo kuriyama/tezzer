@@ -3,10 +3,10 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kuriyama/tezzer/internal/qtransport"
 	"github.com/kuriyama/tezzer/internal/termui"
-	"github.com/kuriyama/tezzer/internal/transport"
 )
 
 func TestStatusOffSuppressesUnsolicited(t *testing.T) {
@@ -126,14 +126,38 @@ func TestShowStatusIncludesForwardPorts(t *testing.T) {
 func TestSetTransportAfterFinish(t *testing.T) {
 	c := &Client{done: make(chan struct{})}
 	c.finish(nil)
-	ct := qtransport.NewClient(make([]byte, 32), "192.0.2.1:4242", 1, "")
+	ct := qtransport.NewClient(qtransport.ClientConfig{Key: make([]byte, 32), Candidates: []string{"192.0.2.1:4242"}})
 	if c.setTransport(ct) {
 		t.Fatal("setTransport after finish returned true")
 	}
 	if c.transport() != nil {
 		t.Error("transport set after finish")
 	}
-	if ct.State() != transport.StateClosed {
+	if ct.State() != qtransport.StateClosed {
 		t.Errorf("transport state = %v, want StateClosed", ct.State())
+	}
+}
+
+// waitRendered はセッション終了の通知が出力を追い越したとき、最後の出力が描画されるまで待つ。
+func TestWaitRendered(t *testing.T) {
+	c := &Client{done: make(chan struct{})}
+	c.renderedSeq.Store(3)
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		c.renderedSeq.Store(5)
+	}()
+	start := time.Now()
+	c.waitRendered(5)
+	if got := c.renderedSeq.Load(); got != 5 {
+		t.Errorf("waitRendered returned before the final output was rendered (renderedSeq=%d)", got)
+	}
+	if d := time.Since(start); d >= finalOutputWait {
+		t.Errorf("waitRendered took %v, want it to return once rendered", d)
+	}
+	// 旧サーバ（finalSeq 不明）は待たない
+	start = time.Now()
+	c.waitRendered(0)
+	if d := time.Since(start); d > 100*time.Millisecond {
+		t.Errorf("waitRendered(0) took %v, want no wait", d)
 	}
 }

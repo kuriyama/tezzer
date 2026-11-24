@@ -8,12 +8,9 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
-	"net"
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/kuriyama/tezzer/internal/transport"
 )
 
 func TestQUICTransport_LiveOutputDuringResync(t *testing.T) {
@@ -27,29 +24,29 @@ func TestQUICTransport_LiveOutputDuringResync(t *testing.T) {
 
 	// セッションのリングバッファ相当。PTY reader と同じく「追記してから SendOutput」する。
 	var ringMu sync.Mutex
-	var ring []transport.OutputChunk
+	var ring []OutputChunk
 	const backlog = 10
 	for i := uint64(1); i <= backlog; i++ {
-		ring = append(ring, transport.OutputChunk{Offset: i, Data: []byte(fmt.Sprintf("<%d>", i))})
+		ring = append(ring, OutputChunk{Offset: i, Data: []byte(fmt.Sprintf("<%d>", i))})
 	}
-	cid := transport.ClientID{Num: 55}
+	cid := ClientID{Num: 55}
 	var live sync.Once
-	srv.OnResyncNeeded(func(_ transport.ClientID, from uint64) ([]transport.OutputChunk, error) {
+	srv.OnResyncNeeded(func(_ ClientID, from uint64) ([]OutputChunk, error) {
 		if from == backlog/2 {
 			// 追い付きの途中でライブ出力を 1 つ送る
 			live.Do(func() {
 				ringMu.Lock()
-				ch := transport.OutputChunk{Offset: backlog + 1, Data: []byte(fmt.Sprintf("<%d>", backlog+1))}
+				ch := OutputChunk{Offset: backlog + 1, Data: []byte(fmt.Sprintf("<%d>", backlog+1))}
 				ring = append(ring, ch)
 				ringMu.Unlock()
-				_ = srv.SendOutput(ch.Offset, ch.Data, []transport.ClientID{cid})
+				_ = srv.SendOutput(ch.Offset, ch.Data, []ClientID{cid})
 			})
 		}
 		ringMu.Lock()
 		defer ringMu.Unlock()
 		for _, ch := range ring {
 			if ch.Offset >= from {
-				return []transport.OutputChunk{ch}, nil // 1 チャンクずつのバッチにして割り込む隙を作る
+				return []OutputChunk{ch}, nil // 1 チャンクずつのバッチにして割り込む隙を作る
 			}
 		}
 		return nil, nil
@@ -60,7 +57,7 @@ func TestQUICTransport_LiveOutputDuringResync(t *testing.T) {
 	if err := srv.Start(ctx); err != nil {
 		t.Fatalf("server Start: %v", err)
 	}
-	cli := NewClient(k, srv.(interface{ Addr() net.Addr }).Addr().String(), cid.Num, "")
+	cli := NewClient(ClientConfig{Key: k, Candidates: []string{srv.Addr().String()}, ClientID: cid.Num})
 	defer cli.Close()
 	if err := cli.Start(ctx); err != nil {
 		t.Fatalf("client Start: %v", err)

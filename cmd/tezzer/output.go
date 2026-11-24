@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"github.com/kuriyama/tezzer/internal/netx"
 	"github.com/kuriyama/tezzer/internal/proto"
-	"github.com/kuriyama/tezzer/internal/transport"
+	"github.com/kuriyama/tezzer/internal/qtransport"
 	"io"
 	"log"
 	"os"
@@ -38,7 +38,7 @@ func (c *Client) handleQUICOutput() {
 			// stdout への Write を 1 回にする（バースト出力時の syscall 削減）。
 			// まとめすぎて書き出しが遅れないよう上限を設ける。
 			const maxCoalesce = 256 * 1024
-			chunks := []transport.OutputChunk{chunk}
+			chunks := []qtransport.OutputChunk{chunk}
 			total := len(chunk.Data)
 		drain:
 			for total < maxCoalesce {
@@ -103,9 +103,10 @@ func (c *Client) handleServer() {
 		switch m := msg.(type) {
 		case *proto.OutputMsg:
 			// 描画は renderOutput が renderedSeq で判定する（クロスパス重複排除）。
-			// QUIC 接続中は通常サーバ側ゲーティングにより UDS 出力は届かないが、
-			// 届いた場合（旧サーバ・ゲーティング切替の境界・QUIC 断中のフォール
-			// バック）も一度だけ描画される。
+			// QUIC 接続中はサーバ側ゲーティングにより UDS 出力は届かない。届いた場合
+			// （旧サーバ・ゲーティング切替の境界）も一度だけ描画される。QUIC 断をサーバが
+			// 検知して UDS 配信が戻っても、断中の欠番を跨いだチャンクは捨て、QUIC の
+			// 復帰（再同期）で埋める。
 			if c.transport() == nil {
 				// UDS 単独経路のときだけ欠番を警告（QUIC 併用時は QUIC が信頼配送で埋める）
 				lastSeq := c.lastSeq.Load()
@@ -117,7 +118,7 @@ func (c *Client) handleServer() {
 			c.lastSeq.Store(m.Seq)
 
 			// PTY出力をそのままstdoutに書く（OSC含む）
-			c.renderOutput([]transport.OutputChunk{{Offset: m.Seq, Data: m.Data}}, false)
+			c.renderOutput([]qtransport.OutputChunk{{Offset: m.Seq, Data: m.Data}}, false)
 
 		case *proto.ErrorMsg:
 			// セッション確立後に届く ERROR はサーバがセッションを継続できない状態
@@ -151,6 +152,7 @@ func (c *Client) handleServer() {
 				if m.ExitCode != nil {
 					c.noteSessionExitCode(*m.ExitCode)
 				}
+				c.waitRendered(m.FinalSeq)
 				if c.sessionClosedNotified.CompareAndSwap(false, true) {
 					c.restoreTerminalModes()
 					fmt.Fprintf(os.Stderr, "\r\n[Tezzer] Session closed: %s\r\n", m.Msg)

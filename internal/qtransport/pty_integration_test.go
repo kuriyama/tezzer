@@ -1,15 +1,14 @@
 package qtransport
 
 // PTY-over-QUIC 縦スライス: 実 PTY（cat）を qtransport 越しに駆動できることを検証する。
-// session↔transport の中核ループ（PTY 出力 → SendOutput → client、client 入力 → Input() → PTY）
-// が成立することを示す。本番 session-manager の置換前に方式を固めるための e2e スライス。
+// session↔transport の中核ループ（PTY 出力 → SendOutput → client、client 入力 → OnInput → PTY）
+// が成立することを示す。
 //
 // 実プロセス起動を伴うため -short ではスキップ。
 
 import (
 	"context"
 	"crypto/rand"
-	"net"
 	"os/exec"
 	"strings"
 	"sync"
@@ -35,10 +34,11 @@ func TestPTYoverQUIC(t *testing.T) {
 		t.Fatalf("NewServer: %v", err)
 	}
 	defer srv.Close()
+	inputs := inputChan(srv)
 	if err := srv.Start(ctx); err != nil {
 		t.Fatalf("server Start: %v", err)
 	}
-	addr := srv.(interface{ Addr() net.Addr }).Addr().String()
+	addr := srv.Addr().String()
 
 	cmd := exec.Command("cat") // stdin をそのまま stdout へ（PTY エコーも乗る）
 	ptmx, err := pty.Start(cmd)
@@ -72,7 +72,7 @@ func TestPTYoverQUIC(t *testing.T) {
 	go func() {
 		for {
 			select {
-			case in := <-srv.Input():
+			case in := <-inputs:
 				_, _ = ptmx.Write(in.Data)
 			case <-ctx.Done():
 				return
@@ -81,7 +81,7 @@ func TestPTYoverQUIC(t *testing.T) {
 	}()
 
 	// --- クライアント ---
-	cli := NewClient(k, addr, 7777, "")
+	cli := NewClient(ClientConfig{Key: k, Candidates: []string{addr}, ClientID: 7777})
 	defer cli.Close()
 	if err := cli.Start(ctx); err != nil {
 		t.Fatalf("client Start: %v", err)

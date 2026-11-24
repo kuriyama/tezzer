@@ -12,6 +12,7 @@ import (
 	"log"
 	"os"
 	"time"
+	"unicode/utf8"
 )
 
 // sendInputBytes は入力バイト列をサーバーに送信する
@@ -81,45 +82,16 @@ func (c *Client) flushEscBatch(reason string) {
 }
 
 // utf8IncompleteTrail は data 末尾の不完全な UTF-8 シーケンスのバイト数を返す。
-// 末尾が完全な UTF-8 文字で終わっている場合は 0 を返す。
+// 末尾が完全な UTF-8 文字（または続きが来ても完成しない壊れた並び）で終わっている場合は 0 を返す。
 func utf8IncompleteTrail(data []byte) int {
-	n := len(data)
-	if n == 0 {
-		return 0
-	}
-	// 末尾から最大3バイトさかのぼってマルチバイト先頭バイトを探す
-	// UTF-8 の先頭バイトは 0xC0 以上（continuation byte は 0x80-0xBF）
-	limit := 3
-	if limit > n {
-		limit = n
-	}
-	for i := 1; i <= limit; i++ {
-		b := data[n-i]
-		if b < 0x80 {
-			// ASCII: ここで完結しているので不完全なし
-			return 0
-		}
-		if b >= 0xC0 {
-			// マルチバイト先頭バイト発見
-			// 期待される全体バイト数を求める
-			var expected int
-			if b < 0xE0 {
-				expected = 2
-			} else if b < 0xF0 {
-				expected = 3
-			} else {
-				expected = 4
+	for i := 1; i <= min(utf8.UTFMax-1, len(data)); i++ {
+		if utf8.RuneStart(data[len(data)-i]) {
+			if utf8.FullRune(data[len(data)-i:]) {
+				return 0
 			}
-			if i < expected {
-				// 不完全: i バイトしかないが expected バイト必要
-				return i
-			}
-			// 完全なシーケンス
-			return 0
+			return i
 		}
-		// 0x80-0xBF: continuation byte, さらにさかのぼる
 	}
-	// 4バイト以上 continuation byte が続く場合は壊れているので 0
 	return 0
 }
 
@@ -227,21 +199,11 @@ func shouldFlushEscBuf(buf []byte) bool {
 // handleStdin reads from stdin and sends to server
 func (c *Client) handleStdin() {
 	// フラッシュタイマー（バッチ開始時のみアーム、アイドル時は停止）
-	flushTimer := time.NewTimer(0)
-	if !flushTimer.Stop() {
-		<-flushTimer.C
-	}
+	// Go 1.23 以降、Stop/Reset 後に古い発火が C に残らないので読み捨ては不要
+	flushTimer := time.NewTimer(time.Hour)
+	flushTimer.Stop()
 	defer flushTimer.Stop()
 
-	resetFlushTimer := func(d time.Duration) {
-		if !flushTimer.Stop() {
-			select {
-			case <-flushTimer.C:
-			default:
-			}
-		}
-		flushTimer.Reset(d)
-	}
 	// バッチ状態に基づいてタイマーを更新する（バッチがなければ停止）
 	recheckFlushTimer := func() {
 		var d time.Duration
@@ -250,18 +212,13 @@ func (c *Client) handleStdin() {
 		} else if len(c.inputBatchBuf) > 0 {
 			d = 2*time.Millisecond - time.Since(c.inputBatchStart)
 		} else {
-			if !flushTimer.Stop() {
-				select {
-				case <-flushTimer.C:
-				default:
-				}
-			}
+			flushTimer.Stop()
 			return
 		}
 		if d < 0 {
 			d = 0
 		}
-		resetFlushTimer(d)
+		flushTimer.Reset(d)
 	}
 
 	stdinCh := make(chan struct {

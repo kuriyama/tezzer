@@ -19,7 +19,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/kuriyama/tezzer/internal/transport"
 	"github.com/quic-go/quic-go"
 )
 
@@ -87,15 +86,15 @@ func openBidiStream(ctx context.Context, conn *quic.Conn, req *ctrlMsg, okType, 
 
 // ---- サーバ側 ----
 
-// SetTCPForwarding は転送の許可/禁止を設定する（既定: 許可）。
-// transport.ServerTransport には含めず、呼び出し側が型アサーションで使う。
-func (s *quicServer) SetTCPForwarding(enabled bool) {
+// SetTCPForwarding allows or denies TCP port forwarding (-L). Default:
+// allowed.
+func (s *Server) SetTCPForwarding(enabled bool) {
 	s.fwdDisabled.Store(!enabled)
 }
 
 // acceptForwardStreams は control 以降にクライアントが開く bidi ストリームを受ける。
 // 現状の用途は転送のみ（先頭フレームで種別を確認する）。
-func (s *quicServer) acceptForwardStreams(sc *serverClient) {
+func (s *Server) acceptForwardStreams(sc *serverClient) {
 	for {
 		st, err := sc.conn.AcceptStream(s.ctx)
 		if err != nil {
@@ -105,7 +104,7 @@ func (s *quicServer) acceptForwardStreams(sc *serverClient) {
 	}
 }
 
-func (s *quicServer) handleForwardStream(sc *serverClient, st *quic.Stream) {
+func (s *Server) handleForwardStream(sc *serverClient, st *quic.Stream) {
 	// 先頭フレームで種別確認。転送以外（未知の用途）は即 reset。
 	_ = st.SetReadDeadline(time.Now().Add(forwardOpenTimeout))
 	m, err := readFrame(st)
@@ -200,14 +199,16 @@ func forwardPipe(st *quic.Stream, tconn halfCloseConn, toTarget, fromTarget *ato
 
 // ---- クライアント側 ----
 
-// ForwardingSupported はサーバが転送対応を広告しているかを返す（serverMeta 受信後に確定）。
-func (c *quicClient) ForwardingSupported() bool {
+// ForwardingSupported reports whether the server advertises forwarding
+// support (known once serverMeta has been received; false until then).
+func (c *Client) ForwardingSupported() bool {
 	return c.serverFeatures.Load()&FeatureTCPForward != 0
 }
 
-// OpenForward はサーバ側から target へ TCP 接続する転送路を開く。
-// ctx は open ハンドシェイクにのみ効く（確立後の中継には影響しない）。
-func (c *quicClient) OpenForward(ctx context.Context, target string) (transport.ForwardConn, error) {
+// OpenForward opens a forwarding channel that makes the server dial a TCP
+// connection to target ("host:port"). ctx applies only to the open handshake
+// (stream open + dial response), not to the relay afterwards.
+func (c *Client) OpenForward(ctx context.Context, target string) (ForwardConn, error) {
 	if !c.ForwardingSupported() {
 		return nil, errors.New("server does not advertise TCP forwarding (old server or --no-tcp-forwarding)")
 	}
@@ -227,7 +228,7 @@ func (c *quicClient) OpenForward(ctx context.Context, target string) (transport.
 	return &forwardStream{st: st}, nil
 }
 
-// forwardStream は quic.Stream を transport.ForwardConn に適合させる。
+// forwardStream は quic.Stream を ForwardConn に適合させる。
 type forwardStream struct{ st *quic.Stream }
 
 func (f *forwardStream) Read(p []byte) (int, error)  { return f.st.Read(p) }
@@ -241,5 +242,3 @@ func (f *forwardStream) Close() error {
 	f.st.CancelRead(fwdCodeAbort)
 	return f.st.Close()
 }
-
-var _ transport.TCPForwarder = (*quicClient)(nil)

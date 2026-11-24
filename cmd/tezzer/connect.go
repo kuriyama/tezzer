@@ -15,11 +15,11 @@ import (
 	"github.com/kuriyama/tezzer/internal/proto"
 	"github.com/kuriyama/tezzer/internal/qtransport"
 	"github.com/kuriyama/tezzer/internal/stun"
-	"github.com/kuriyama/tezzer/internal/transport"
 	"log"
 	"net"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -97,7 +97,18 @@ func buildQUICCandidateAddrs(quicInfo *QUICInfo, clientSTUNAddrs []string) []str
 }
 
 // startQUICTransport は QUIC トランスポートを確立し、コールバック・候補リフレッシャーを配線する。
-func (c *Client) startQUICTransport(quicInfo *QUICInfo) error {
+// quiet（バックグラウンド再試行の 2 回目以降）なら、確立までの診断表示（候補一覧・
+// 状態遷移・失敗理由）を status line に出さずログだけに残す。15 秒ごとに同じ表示が
+// 点滅して騒がしいため。再試行中であることは固定カラム（UD retrying QUIC）で見える。
+func (c *Client) startQUICTransport(quicInfo *QUICInfo, quiet bool) error {
+	notify := c.setStatusMessage
+	if quiet {
+		notify = c.addLogMessage
+	}
+	// quiet の確立前だけ状態遷移を status line に出さない（確立後の recovering 等は表示する）
+	var suppressStatus atomic.Bool
+	suppressStatus.Store(quiet)
+
 	// クライアント識別子を生成（16-bit ランダム値。再試行では前回の値を使い回す）。0 は
 	// 「QUIC 未使用」の番兵として各所（UDS 配信抑制・-info 表示）が解釈するため避ける。
 	// 0 のままだと QUIC 接続済みでも UDS 併送が止まらず、WAN 帯域が二重になる。
@@ -115,21 +126,22 @@ func (c *Client) startQUICTransport(quicInfo *QUICInfo) error {
 	candidateAddrs, clientSTUNAddrs := c.resolveCandidates(quicInfo, false)
 	if len(quicInfo.STUNAddrs) > 0 {
 		if len(clientSTUNAddrs) > 0 {
-			c.setStatusMessage(fmt.Sprintf("client STUN address: %s", strings.Join(clientSTUNAddrs, ", ")))
+			notify(fmt.Sprintf("client STUN address: %s", strings.Join(clientSTUNAddrs, ", ")))
 		} else {
-			c.setStatusMessage("warning: failed to get client STUN address")
+			notify("warning: failed to get client STUN address")
 		}
 	}
 
 	// clientID をサーバーに通知（UDS経由）。出力ファンアウト対象への登録に必要
+	// 失敗すると出力の配信先に登録されないので、quiet でも status line に出す
 	if err := c.sendQUICClientInfo(clientID); err != nil {
 		c.setStatusMessage(fmt.Sprintf("warning: failed to send client ID info: %v", err))
 	}
 
 	// 候補アドレスを常時ログ＆通知（debug 不要で「どのアドレス/ポートを叩いたか」を診断できる）
-	// ファイルログへは setStatusMessage（addLogMessage）経由で書かれる
+	// ファイルログへは notify（addLogMessage）経由で書かれる
 	if len(candidateAddrs) > 0 {
-		c.setStatusMessage(fmt.Sprintf("QUIC candidates: %s", strings.Join(candidateAddrs, ", ")))
+		notify(fmt.Sprintf("QUIC candidates: %s", strings.Join(candidateAddrs, ", ")))
 	}
 
 	// 候補アドレスを表示
@@ -139,101 +151,103 @@ func (c *Client) startQUICTransport(quicInfo *QUICInfo) error {
 		}
 	}
 
-	// QUIC トランスポートを構築（認証は quicInfo.Key）。候補は SetRoamingCandidates で
-	// 渡し、全候補への並行 Dial は transport 内部（Start = reconnect と同じ dialParallel）
-	// が行う。最初に確立した候補が採用される（localhost / LAN / グローバル STUN の選択）。
+	// QUIC トランスポートを構築（認証は quicInfo.Key）。全候補への並行 Dial は
+	// transport 内部（Start = reconnect と同じ dialParallel）が行う。最初に確立した
+	// 候補が採用される（localhost / LAN / グローバル STUN の選択）。
 	if len(candidateAddrs) == 0 {
 		return fmt.Errorf("no QUIC candidate addresses")
 	}
 
-	ct := qtransport.NewClient(quicInfo.Key, candidateAddrs[0], clientID, c.sessionID)
-	if c.agentSockPath != "" {
-		if as, ok := ct.(transport.AgentForwardClient); ok {
-			as.SetAgentSockPath(c.agentSockPath)
-		}
-	}
-	if len(c.rforwards) > 0 {
-		if rf, ok := ct.(transport.RemoteForwardClient); ok {
-			rf.SetRemoteForwards(c.deviceID, remoteForwardTargets(c.rforwards))
-		}
-	}
-	// UDS 経由で既に描画済みの分は QUIC の再同期対象から外す
-	// （attach 直後のバックログ二重転送の防止。Hello の LastOffset に反映される）。
-	if seed := c.renderedSeq.Load(); seed > 0 {
-		if sr, ok := ct.(transport.ResyncSeeder); ok {
-			sr.SeedResyncOffset(seed)
-		}
-	}
-
-	// コールバックは Start 前に登録する（初回接続の state 遷移「connected via <addr>」や
+	// コールバックは Start 前に設定済みにする（初回接続の state 遷移「connected via <addr>」や
 	// 診断ログを取りこぼさないため）。
-	ct.OnStateChange(func(oldState, newState transport.ConnectionState, message string) {
-		c.setStatusMessage(fmt.Sprintf("[QUIC] %s", message))
-		c.addLogMessage(fmt.Sprintf("[QUIC] state: %s", message))
-		if newState == transport.StateConnected && oldState == transport.StateRecovering {
-			c.requestServerRedraw()
-		}
-	})
-	ct.OnStatusMessage(func(message string) { c.setStatusMessage(message) })
-	ct.OnLogMessage(func(message string) { c.addLogMessage(message) })
-	ct.OnServerMeta(func(buildID, buildTime string, instanceID []byte) {
-		c.metaMu.Lock()
-		c.serverMeta = &proto.ServerMetaMsg{
-			Type:             "SERVER_META",
-			ServerBuildID:    buildID,
-			ServerBuildTime:  buildTime,
-			ServerInstanceID: instanceID,
-		}
-		c.metaMu.Unlock()
-	})
-	ct.OnSessionNotFound(func(reason string, exitCode int) {
-		if c.killing.Load() {
-			// killSession() の結果として届いた sessionGone は正常終了扱い
-			c.finish(nil)
-			return
-		}
-		if strings.HasPrefix(reason, "SESSION_CLOSED:") {
-			// PTY プロセス終了による通知。終了コードを記録して伝搬する。
-			c.noteSessionExitCode(exitCode)
-			// UDS 経由で先に表示済みでなければここで出す
-			// （QUIC-only クライアント、または QUIC が UDS より先に届いたケース）。
-			// CompareAndSwap で先着した側だけが表示する。
-			if c.sessionClosedNotified.CompareAndSwap(false, true) {
-				msg := strings.TrimPrefix(reason, "SESSION_CLOSED: ")
-				c.restoreTerminalModes()
-				fmt.Fprintf(os.Stderr, "\r\n[Tezzer] Session closed: %s\r\n", msg)
+	ct := qtransport.NewClient(qtransport.ClientConfig{
+		Key:        quicInfo.Key,
+		Candidates: candidateAddrs,
+		ClientID:   clientID,
+		SessionID:  c.sessionID,
+		// UDS 経由で既に描画済みの分は QUIC の再同期対象から外す
+		// （attach 直後のバックログ二重転送の防止。Hello の LastOffset に反映される）。
+		ResyncOffset:   c.renderedSeq.Load(),
+		AgentSockPath:  c.agentSockPath,
+		DeviceID:       c.deviceID,
+		RemoteForwards: remoteForwardTargets(c.rforwards),
+		// 全候補失敗時の候補リフレッシャー。
+		// reconnect がすべて失敗した場合のみ呼ばれる（通常 reconnect にはコスト増なし）。
+		RefreshCandidates: func() []string {
+			fresh, _ := c.resolveCandidates(quicInfo, false)
+			if len(fresh) > 0 {
+				c.addLogMessage(fmt.Sprintf("QUIC: refreshed candidates: %s", strings.Join(fresh, ", ")))
 			}
-			c.finish(nil)
-			return
-		}
-		c.finish(errors.New(reason))
-	})
-
-	// 全候補失敗時の候補リフレッシャーを登録する。
-	// reconnect がすべて失敗した場合のみ呼ばれる（通常 reconnect にはコスト増なし）。
-	ct.SetCandidatesRefresher(func() []string {
-		fresh, _ := c.resolveCandidates(quicInfo, false)
-		if len(fresh) > 0 {
-			c.addLogMessage(fmt.Sprintf("QUIC: refreshed candidates: %s", strings.Join(fresh, ", ")))
-		}
-		return fresh
+			return fresh
+		},
+		OnStateChange: func(oldState, newState qtransport.ConnectionState, message string) {
+			if !suppressStatus.Load() {
+				c.setStatusMessage(fmt.Sprintf("[QUIC] %s", message))
+			}
+			c.addLogMessage(fmt.Sprintf("[QUIC] state: %s", message))
+			if newState == qtransport.StateConnected && oldState == qtransport.StateRecovering {
+				c.requestServerRedraw()
+			}
+		},
+		OnStatusMessage:   c.setStatusMessage,
+		OnLogMessage:      c.addLogMessage,
+		OnServerMeta:      c.setServerMeta,
+		OnSessionNotFound: c.onSessionGone,
+		OnInputLost:       c.onInputLost,
 	})
 
 	// 高遅延リンク（RTT 数秒）でも成功できるよう全体で 10s（並行 Dial なので直列より速い）。
-	ct.SetRoamingCandidates(candidateAddrs)
 	dialCtx, dialCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer dialCancel()
 	if err := ct.Start(dialCtx); err != nil {
 		_ = ct.Close()
-		c.setStatusMessage("QUIC: " + err.Error())
+		notify("QUIC: " + err.Error())
 		return fmt.Errorf("failed to connect: %w", err)
 	}
 
+	suppressStatus.Store(false)
 	if !c.setTransport(ct) {
 		return fmt.Errorf("client is exiting")
 	}
 	c.startCandidateRefreshLoop(quicInfo)
 	return nil
+}
+
+// setServerMeta は QUIC で届いたサーバーメタ情報を記録する。
+func (c *Client) setServerMeta(buildID, buildTime string, instanceID []byte) {
+	c.metaMu.Lock()
+	c.serverMeta = &proto.ServerMetaMsg{
+		Type:             "SERVER_META",
+		ServerBuildID:    buildID,
+		ServerBuildTime:  buildTime,
+		ServerInstanceID: instanceID,
+	}
+	c.metaMu.Unlock()
+}
+
+// onSessionGone は QUIC の sessionGone 通知（セッション消失・終了）を処理する。
+func (c *Client) onSessionGone(reason string, exitCode int, finalOffset uint64) {
+	if c.killing.Load() {
+		// killSession() の結果として届いた sessionGone は正常終了扱い
+		c.finish(nil)
+		return
+	}
+	if strings.HasPrefix(reason, "SESSION_CLOSED:") {
+		// PTY プロセス終了による通知。終了コードを記録して伝搬する。
+		c.noteSessionExitCode(exitCode)
+		c.waitRendered(finalOffset)
+		// UDS 経由で先に表示済みでなければここで出す
+		// （QUIC-only クライアント、または QUIC が UDS より先に届いたケース）。
+		// CompareAndSwap で先着した側だけが表示する。
+		if c.sessionClosedNotified.CompareAndSwap(false, true) {
+			msg := strings.TrimPrefix(reason, "SESSION_CLOSED: ")
+			c.restoreTerminalModes()
+			fmt.Fprintf(os.Stderr, "\r\n[Tezzer] Session closed: %s\r\n", msg)
+		}
+		c.finish(nil)
+		return
+	}
+	c.finish(errors.New(reason))
 }
 
 // logQUICSetupFailure は QUIC 確立失敗の全文を通常ログ（stderr）に出す。
@@ -245,7 +259,9 @@ func (c *Client) logQUICSetupFailure(err error, last string, port int) string {
 	if msg == last {
 		return last
 	}
-	if c.statusMgr != nil { // statusMgr なし（-N）は setStatusMessage が既に log に出している
+	// statusMgr なし（-N）では初回の失敗は setStatusMessage が既に log に出している。
+	// 2 回目以降（last あり）は quiet で status に出さないのでここで出す
+	if c.statusMgr != nil || last != "" {
 		log.Printf("QUIC setup failed: %v", err)
 	}
 	if hint := quicSetupHint(msg, port); hint != "" {
@@ -267,26 +283,43 @@ func quicSetupHint(msg string, port int) string {
 		"and that the client network does not block UDP", port)
 }
 
+// udsOnlyNoticeAfter は QUIC なし（UDS のみ）の状態がこれだけ続いたら一度だけ案内する時間。
+// 初回の失敗表示は status line に数秒出るだけで見逃しやすく、そのまま気づかずに
+// ローミング・スリープ耐性のない「ただの SSH」で使い続けてしまうため。
+const udsOnlyNoticeAfter = time.Minute
+
+// udsOnlyNotice は udsOnlyNoticeAfter 経過時の案内文。
+const udsOnlyNotice = "[Tezzer] No QUIC for 1m: running over SSH only (no roaming). Still retrying"
+
 // retryQUICTransport は QUIC 初回確立に失敗した場合に、UDS が生きている間
 // バックグラウンドで再試行する。成功したら出力ポンプを起動して昇格する。
-// firstErr は初回確立の失敗（ログの重複抑制の起点）。
-func (c *Client) retryQUICTransport(quicInfo *QUICInfo, firstErr error) {
+// firstErr は初回確立の失敗（ログの重複抑制の起点）、started は QUIC の確立を始めた時刻。
+func (c *Client) retryQUICTransport(quicInfo *QUICInfo, firstErr error, started time.Time) {
 	lastErr := c.logQUICSetupFailure(firstErr, "", quicInfo.Port)
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
+	// 案内は QUIC の確立を始めてから udsOnlyNoticeAfter で出す。再試行の失敗時に判定すると
+	// 15 秒刻みの試行（各最大 10 秒強）に引きずられて 1 分を大きく過ぎるので、タイマーで分ける
+	notice := time.NewTimer(time.Until(started.Add(udsOnlyNoticeAfter)))
+	defer notice.Stop()
 	for {
 		select {
 		case <-c.done:
 			return
+		case <-notice.C:
+			if c.transport() == nil {
+				c.setStatusMessage(udsOnlyNotice)
+			}
 		case <-ticker.C:
 			if c.transport() != nil {
 				return // 既に確立済み（別経路で昇格した等）
 			}
-			if err := c.startQUICTransport(quicInfo); err != nil {
+			if err := c.startQUICTransport(quicInfo, true); err != nil {
 				lastErr = c.logQUICSetupFailure(err, lastErr, quicInfo.Port)
 				continue
 			}
-			c.setStatusMessage("[Tezzer] QUIC connection established (background retry)")
+			// 確立時の状態遷移（connected via ...）は quiet で出ていないので、接続先をここで示す
+			c.setStatusMessage(fmt.Sprintf("[Tezzer] QUIC connection established via %s (background retry)", c.transport().RemoteAddr()))
 			go c.handleQUICOutput()
 			return
 		}

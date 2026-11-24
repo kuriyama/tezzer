@@ -9,7 +9,6 @@ import (
 	"github.com/kuriyama/tezzer/internal/proto"
 	"github.com/kuriyama/tezzer/internal/qtransport"
 	"github.com/kuriyama/tezzer/internal/termui"
-	"github.com/kuriyama/tezzer/internal/transport"
 	"github.com/kuriyama/tezzer/internal/version"
 	"io"
 	"log"
@@ -105,7 +104,7 @@ type Session struct {
 	clientIDSeed int
 
 	// トランスポート（QUIC）。per-session で 1 つ、または manager の共有 transport を参照。
-	st                  transport.ServerTransport
+	st                  *qtransport.Server
 	stCancel            context.CancelFunc
 	usesSharedTransport bool // true なら st は manager 所有の共有 transport（Close/ループは manager 管理）
 	quicPort            int
@@ -161,13 +160,12 @@ type OutputChunk struct {
 
 // Client represents a connected client
 type Client struct {
-	ID           string
-	Session      *Session
-	OutCh        chan []byte
-	Done         chan struct{} // used by the writer goroutine to detect detach
-	QUICClientID uint16        // client identifier for the QUIC path (0 = QUIC unused)
-	Protocol     string        // "UDS", "TCP", "UDP"
-	RemoteAddr   string        // remote address (TCP/UDP)
+	ID         string
+	Session    *Session
+	OutCh      chan []byte
+	Done       chan struct{} // used by the writer goroutine to detect detach
+	Protocol   string        // transport of the control connection (always "UDS")
+	RemoteAddr string        // peer address of the control connection (usually empty for a Unix socket)
 	// catchingUp は attach 直後に過去の出力を送っている間（s.mu で保護）。この間ライブ出力は
 	// このクライアントに積まず、sendBufferedOutput がリングから拾って順番どおりに送る
 	// （ライブ分が過去分に割り込むと、クライアントは割り込んだ番号まで描画済みとみなして
@@ -176,7 +174,20 @@ type Client struct {
 	// droppedFrom は送信キューがあふれて捨て始めた出力の番号（0 = 捨てていない）。次に積めた
 	// ときに OUTPUT_DROPPED を 1 回だけ先に送る。PTY reader（handlePTYOutput）だけが触る
 	droppedFrom uint64
+	// quicClientID はこの UDS クライアントが使う QUIC の client 識別子（0 = QUIC 未使用）。
+	// AttachClient（ATTACH の ClientID）か UDP_CLIENT_INFO で設定され、PTY reader 等がロックなしで
+	// 読むので atomic にする。
+	quicClientID atomic.Uint32
 }
+
+// QUICClientID returns the client identifier this Unix-socket client uses on
+// the QUIC path (0 = QUIC unused).
+func (c *Client) QUICClientID() uint16 { return uint16(c.quicClientID.Load()) }
+
+// SetQUICClientID records the client identifier this Unix-socket client uses
+// on the QUIC path. While that QUIC client is connected, output is not sent
+// over the Unix socket.
+func (c *Client) SetQUICClientID(id uint16) { c.quicClientID.Store(uint32(id)) }
 
 // lookupLoginShell は /etc/passwd からユーザーのログインシェルを返す。
 // 失敗時は空文字を返す。
@@ -403,12 +414,7 @@ func (s *Session) startQUICTransport() error {
 		return fmt.Errorf("failed to create QUIC transport: %w", err)
 	}
 
-	a, ok := st.(transport.Addresser)
-	if !ok {
-		_ = st.Close()
-		return fmt.Errorf("transport does not expose listen address")
-	}
-	addr, ok := a.Addr().(*net.UDPAddr)
+	addr, ok := st.Addr().(*net.UDPAddr)
 	if !ok {
 		_ = st.Close()
 		return fmt.Errorf("failed to get QUIC listen address")
@@ -419,19 +425,20 @@ func (s *Session) startQUICTransport() error {
 
 // adoptPerSessionTransport は per-session QUIC トランスポートの配線・起動を行う
 // （startQUICTransport と無停止再起動の復元経路で共通）。失敗時は st を閉じる。
-func (s *Session) adoptPerSessionTransport(st transport.ServerTransport, port int, key []byte) error {
+func (s *Session) adoptPerSessionTransport(st *qtransport.Server, port int, key []byte) error {
 	// 再同期: クライアント接続時に OutputRingBuffer から欠損分を埋める（Start 前に配線）。
 	st.OnResyncNeeded(s.outputFromOffset)
 	// サーバ情報をクライアントへ通知する（UDS 非依存・QUIC 経路）。
 	instanceID := s.manager.GetServerInstanceID()
 	st.SetServerMeta(version.GetVersion(), version.GetBuildTime(), instanceID[:])
 	// QUIC クライアント接続時に Gate 2 を通知（BeginQuicPendingMode と連携）
-	st.OnClientConnect(func(_ transport.ClientID) {
+	st.OnClientConnect(func(_ qtransport.ClientID) {
 		s.OnQUICClientConnected()
 	})
-	st.OnClientExit(func(cid transport.ClientID) {
+	st.OnClientExit(func(cid qtransport.ClientID) {
 		s.UnregisterQUICClient(cid.Num)
 	})
+	st.OnInput(func(in qtransport.Input) { s.writeTransportInput(in.Data) })
 	s.manager.applyTransportPolicy(st)
 
 	// Start より前に s.mu 下で設定する（復元時は Start 直後に再接続が来て、
@@ -454,8 +461,7 @@ func (s *Session) adoptPerSessionTransport(st transport.ServerTransport, port in
 
 	log.Printf("session %s: QUIC transport enabled on port %d", s.ID, s.quicPort)
 
-	// 入力/リサイズ処理ゴルーチンを起動
-	go s.handleTransportInput()
+	// リサイズ処理ゴルーチンを起動（入力は OnInput で受信 goroutine から直接書く）
 	go s.handleTransportResize()
 
 	return nil
@@ -463,12 +469,12 @@ func (s *Session) adoptPerSessionTransport(st transport.ServerTransport, port in
 
 // outputFromOffset は OutputRingBuffer から offset(=Seq) >= fromOffset のチャンクを、
 // 先頭から maxResyncBatchRawBytes を目安としたバッチで返す
-// （transport.OnResyncNeeded の実装。再接続/長スリープ後の取りこぼし回復）。
+// （qtransport.Server.OnResyncNeeded に渡すコールバック。再接続/長スリープ後の取りこぼし回復）。
 // transport は空が返るまで「最後の offset+1」で繰り返し呼ぶ契約なので、ここで全量を
 // 一括で返す必要はない（cold 層全量の一括解凍によるメモリスパイクを避ける）。
 // 再接続クライアントが要求した位置より古いチャンクが evict 済みで再同期の穴を埋められない
 // 場合は、QUIC 経路で再描画を促すステータスを通知する（旧 UDP の OUTPUT_DROPPED 相当）。
-func (s *Session) outputFromOffset(client transport.ClientID, fromOffset uint64) ([]transport.OutputChunk, error) {
+func (s *Session) outputFromOffset(client qtransport.ClientID, fromOffset uint64) ([]qtransport.OutputChunk, error) {
 	s.mu.RLock()
 	// cold 層は再接続クライアント（fromOffset>1）の欠損埋めにのみ使う。
 	// 新規クライアント（fromOffset<=1）へ数日分を全再生するのは過剰なので raw 層のみ。
@@ -480,15 +486,15 @@ func (s *Session) outputFromOffset(client transport.ClientID, fromOffset uint64)
 			}
 		}
 	}
-	var rawChunks []transport.OutputChunk
+	var rawChunks []qtransport.OutputChunk
 	for _, ch := range s.coldPending {
 		if ch.Seq >= fromOffset {
-			rawChunks = append(rawChunks, transport.OutputChunk{Offset: ch.Seq, Data: ch.Data})
+			rawChunks = append(rawChunks, qtransport.OutputChunk{Offset: ch.Seq, Data: ch.Data})
 		}
 	}
 	for _, ch := range s.outputChunks {
 		if ch.Seq >= fromOffset {
-			rawChunks = append(rawChunks, transport.OutputChunk{Offset: ch.Seq, Data: ch.Data})
+			rawChunks = append(rawChunks, qtransport.OutputChunk{Offset: ch.Seq, Data: ch.Data})
 		}
 	}
 	oldestSeq, hasAny := s.oldestRetainedSeqLocked()
@@ -507,7 +513,7 @@ func (s *Session) outputFromOffset(client transport.ClientID, fromOffset uint64)
 	// 全セグメント分の raw を同時にメモリへ載せない）。判定はセグメント境界で行うため
 	// バッチは常にセグメント単位で完結し、次バッチの fromOffset が次セグメントの
 	// 先頭（または raw 層）を指す。
-	var out []transport.OutputChunk
+	var out []qtransport.OutputChunk
 	total := 0
 	for i := range segs {
 		if total >= maxResyncBatchRawBytes {
@@ -521,7 +527,7 @@ func (s *Session) outputFromOffset(client transport.ClientID, fromOffset uint64)
 			continue
 		}
 		for _, ch := range chunks {
-			out = append(out, transport.OutputChunk{Offset: ch.Seq, Data: ch.Data})
+			out = append(out, qtransport.OutputChunk{Offset: ch.Seq, Data: ch.Data})
 			total += len(ch.Data)
 		}
 	}
@@ -549,28 +555,16 @@ func (s *Session) oldestRetainedSeqLocked() (uint64, bool) {
 	return 0, false
 }
 
-// handleTransportInput は QUIC 経由の入力を PTY に転送する。
-func (s *Session) handleTransportInput() {
-	if s.st == nil {
-		return
+// writeTransportInput は QUIC 経由の入力を PTY に書く（transport の OnInput から、
+// クライアントの受信 goroutine 上で同期的に呼ばれる）。PTY が詰まると、このセッションへ
+// 書こうとする受信 goroutine（同じセッションの他クライアントも inputMu で待つ）だけが止まり、
+// 他のセッションには波及しない。
+func (s *Session) writeTransportInput(data []byte) {
+	if IsDebugEnabled() {
+		log.Printf("session %s: received input (%d bytes): %q", s.ID, len(data), string(data))
 	}
-	for {
-		select {
-		case <-s.done:
-			return
-		case input, ok := <-s.st.Input():
-			if !ok {
-				return
-			}
-			if IsDebugEnabled() {
-				log.Printf("session %s: received input (%d bytes): %q", s.ID, len(input.Data), string(input.Data))
-			}
-			if err := s.WriteInput(input.Data); err != nil {
-				if !s.IsPTYClosed() {
-					log.Printf("session %s: failed to write input to PTY: %v", s.ID, err)
-				}
-			}
-		}
+	if err := s.WriteInput(data); err != nil && !s.IsPTYClosed() {
+		log.Printf("session %s: failed to write input to PTY: %v", s.ID, err)
 	}
 }
 
@@ -597,10 +591,12 @@ func (s *Session) handleTransportResize() {
 // ptyReader reads from PTY and distributes output
 func (s *Session) ptyReader() {
 	defer func() {
-		// PTY終了をマーク
+		// PTY終了をマーク（Close が先に立てていれば、その時刻を残す）
 		s.mu.Lock()
-		s.ptyClosed = true
-		s.ptyClosedAt = time.Now()
+		if !s.ptyClosed {
+			s.ptyClosed = true
+			s.ptyClosedAt = time.Now()
+		}
 		s.mu.Unlock()
 
 		// プロセスを回収して exit code を記録（通知に載せるため先に行う）
@@ -615,14 +611,9 @@ func (s *Session) ptyReader() {
 	// 効くのはバースト時のみ（SendOutput のブロック中に貯まった分を少ない syscall で
 	// 回収する）。Linux では単発 read が最大 32KB 程度返ることを実測済みで、
 	// これ以上大きくしてもカーネル側の tty バッファが先に律速する。
+	// done は Close でしか閉じず、Close は PTY も閉じるので、終了は Read のエラーで分かる。
 	buf := make([]byte, 64*1024)
 	for {
-		select {
-		case <-s.done:
-			return
-		default:
-		}
-
 		n, err := s.ptyMaster.Read(buf)
 		if err != nil {
 			if err != io.EOF {
@@ -845,12 +836,14 @@ func (s *Session) notifySessionClosed() {
 	if s.killed {
 		msg = sessionKilledMsg
 	}
+	finalSeq := s.seq
 	s.mu.RUnlock()
 
 	noteMsg := &proto.NoteMsg{
-		Type: "NOTE",
-		Kind: "SESSION_CLOSED",
-		Msg:  msg,
+		Type:     "NOTE",
+		Kind:     "SESSION_CLOSED",
+		Msg:      msg,
+		FinalSeq: finalSeq,
 	}
 	if code := s.ExitCode(); code >= 0 {
 		noteMsg.ExitCode = &code
@@ -922,9 +915,9 @@ func (s *Session) handlePTYOutput(data []byte) {
 	// このセッションの QUIC クライアントへファンアウトする。識別子は (SessionID, Num) の
 	// 複合 ClientID。共有 transport では別セッションの同じ Num と衝突しないよう Session で
 	// 区別する。Num は RegisterQUICClient が登録した quicClientIDsOut（このセッション固有）。
-	udpClients := make([]transport.ClientID, len(s.quicClientIDsOut))
+	udpClients := make([]qtransport.ClientID, len(s.quicClientIDsOut))
 	for i, num := range s.quicClientIDsOut {
-		udpClients[i] = transport.ClientID{Session: s.ID, Num: num}
+		udpClients[i] = qtransport.ClientID{Session: s.ID, Num: num}
 	}
 	s.mu.Unlock()
 
@@ -944,7 +937,8 @@ func (s *Session) handlePTYOutput(data []byte) {
 	}
 
 	// UDS 経由の配信は以下のクライアントには行わない:
-	// - QUIC 接続がアクティブなクライアント（QUIC が同じ内容を信頼配送するため。
+	// - QUIC 接続がアクティブなクライアント（経路が黙って切れていてもサーバが断を検知するまでを
+	//   含む。QUIC が同じ内容を信頼配送するため。
 	//   UDS は tezzer-ssh の ssh -L 転送で SSH の TCP に載って実ネットワークを通るので、
 	//   両方に送ると WAN 帯域が実質 2 倍になる。クライアント側は renderedSeq による
 	//   クロスパス重複排除を持つため、境界タイミングで両方届いても二重描画しない）
@@ -961,7 +955,7 @@ func (s *Session) handlePTYOutput(data []byte) {
 			}
 		}
 		for _, client := range clients {
-			if client.QUICClientID != 0 && activeQUIC[client.QUICClientID] {
+			if id := client.QUICClientID(); id != 0 && activeQUIC[id] {
 				continue
 			}
 			udsClients = append(udsClients, client)
@@ -1036,15 +1030,15 @@ func (s *Session) AttachClient(fromSeq uint64, protocol, remoteAddr string, quic
 	clientID := fmt.Sprintf("client-%d", s.clientIDSeed)
 
 	client := &Client{
-		ID:           clientID,
-		Session:      s,
-		OutCh:        make(chan []byte, 1000),
-		Done:         make(chan struct{}),
-		QUICClientID: quicClientID,
-		Protocol:     protocol,
-		RemoteAddr:   remoteAddr,
-		catchingUp:   true,
+		ID:         clientID,
+		Session:    s,
+		OutCh:      make(chan []byte, 1000),
+		Done:       make(chan struct{}),
+		Protocol:   protocol,
+		RemoteAddr: remoteAddr,
+		catchingUp: true,
 	}
+	client.SetQUICClientID(quicClientID)
 
 	s.clients[clientID] = client
 
@@ -1269,14 +1263,15 @@ func (s *Session) GetClientInfos() []ClientInfo {
 	seenQUICClientNums := make(map[uint16]bool)
 
 	for _, c := range clientsCopy {
-		if c.QUICClientID != 0 {
-			seenQUICClientNums[c.QUICClientID] = true
+		quicID := c.QUICClientID()
+		if quicID != 0 {
+			seenQUICClientNums[quicID] = true
 		}
 		result = append(result, ClientInfo{
 			ID:           c.ID,
 			Protocol:     c.Protocol,
 			RemoteAddr:   c.RemoteAddr,
-			QUICClientID: c.QUICClientID,
+			QUICClientID: quicID,
 		})
 	}
 
@@ -1376,12 +1371,12 @@ func (s *Session) GetOutputBufferStats() OutputBufferStats {
 
 // GetClientSendStats returns per-client send health (bytes, last send time,
 // backpressure and forwarding counters) for this session's QUIC clients.
-func (s *Session) GetClientSendStats() []transport.ClientSendStat {
+func (s *Session) GetClientSendStats() []qtransport.ClientSendStat {
 	if s.st == nil {
 		return nil
 	}
 	// 共有 transport では他セッションのクライアントも混じるため自セッション分に絞る。
-	return slices.DeleteFunc(s.st.ClientSendStats(), func(st transport.ClientSendStat) bool {
+	return slices.DeleteFunc(s.st.ClientSendStats(), func(st qtransport.ClientSendStat) bool {
 		return st.Client.Session != s.ID
 	})
 }
@@ -1484,6 +1479,9 @@ func (s *Session) Done() <-chan struct{} {
 // sessionKilledMsg は kill されたセッションの終了通知に載せる文言。
 const sessionKilledMsg = "session killed"
 
+// stCloseGrace は per-session transport を閉じる前に、クライアントの切断を待つ上限。
+const stCloseGrace = 3 * time.Second
+
 // Kill terminates the session as an explicit request (KILL_SESSION).
 // Attached clients are told the session closed with exit code 0 instead of
 // the signal-derived status of the killed process.
@@ -1507,6 +1505,7 @@ func (s *Session) Close() error {
 			ptyClosed := s.ptyClosed
 			killed := s.killed
 			clients := append([]uint16(nil), s.quicClientIDsOut...)
+			finalSeq := s.seq
 			s.mu.RUnlock()
 			reason := "NO_SUCH_SESSION: session closed"
 			exitCode := -1
@@ -1521,15 +1520,25 @@ func (s *Session) Close() error {
 				exitCode = s.ExitCode()
 			}
 			for _, num := range clients {
-				_ = s.st.SendSessionGone(transport.ClientID{Session: s.ID, Num: num}, reason, exitCode)
+				_ = s.st.SendSessionGone(qtransport.ClientID{Session: s.ID, Num: num}, reason, exitCode, finalSeq)
 			}
 		}
 		// 共有 transport は manager 所有のため閉じない（per-session のときだけ閉じる）。
+		// クライアントが切断するまで（上限 stCloseGrace）待ってから閉じる。すぐ閉じると、
+		// まだ届いていない最後の出力や SessionGone を CONNECTION_CLOSE で捨ててしまう
+		// （クライアントは SessionGone を受けて最後の出力まで描画してから切断する）。
 		if s.st != nil && !s.usesSharedTransport {
-			if s.stCancel != nil {
-				s.stCancel()
-			}
-			_ = s.st.Close()
+			st, cancel := s.st, s.stCancel
+			go func() {
+				deadline := time.Now().Add(stCloseGrace)
+				for len(st.ActiveClients()) > 0 && time.Now().Before(deadline) {
+					time.Sleep(20 * time.Millisecond)
+				}
+				if cancel != nil {
+					cancel()
+				}
+				_ = st.Close()
+			}()
 		}
 		// agent forwarding の UDS を閉じる（bind していた場合のみ）。
 		if s.agentListener != nil {

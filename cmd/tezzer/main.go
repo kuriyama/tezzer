@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"golang.org/x/term"
 )
@@ -623,15 +624,18 @@ func run(o runOptions) (int, error) {
 	// STUN ルックアップを含むため数百ms かかることがある。
 	// handleServer/handleStdin は既に起動済みで UDS で動作している。
 	if quicInfo != nil {
+		client.quicSetup.Store(quicSetupConnecting)
+		quicStarted := time.Now()
 		// QUIC セットアップは Dial が最大 10s かかりうるためバックグラウンドで行い、
 		// メインのイベントループや UDS 経路を妨げない。
 		go func() {
-			if err := client.startQUICTransport(quicInfo); err != nil {
+			if err := client.startQUICTransport(quicInfo, false); err != nil {
 				// 初回確立に失敗しても UDS-only で居座らせない（それは「ただの SSH」）。
 				// UDS が生きている間、QUIC 確立を再試行する（高遅延でハンドシェイクが
 				// 間に合わなかった等、後から繋がりうる）。
 				client.setStatusMessage(fmt.Sprintf("QUIC setup failed, retrying in background: %v", err))
-				client.retryQUICTransport(quicInfo, err)
+				client.quicSetup.Store(quicSetupRetrying)
+				client.retryQUICTransport(quicInfo, err, quicStarted)
 				return
 			}
 			client.setStatusMessage(fmt.Sprintf("QUIC enabled: server port %d", quicInfo.Port))

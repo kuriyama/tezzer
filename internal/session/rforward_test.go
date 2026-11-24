@@ -13,33 +13,31 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kuriyama/tezzer/internal/transport"
+	"github.com/kuriyama/tezzer/internal/qtransport"
 )
 
 // fakeRFwdTransport は SendStatus と OpenRemoteForward だけを実装する偽 transport。
 // OpenRemoteForward は target（クライアント側の dial 先の代わり）へ直接 TCP 接続する。
 type fakeRFwdTransport struct {
-	transport.ServerTransport // 未使用メソッドは呼ばれない（呼ばれたら nil で panic）
-
 	target string
 
 	mu       sync.Mutex
-	statuses map[transport.ClientID][]string
-	opens    map[transport.ClientID]int
+	statuses map[qtransport.ClientID][]string
+	opens    map[qtransport.ClientID]int
 }
 
 func newFakeRFwdTransport(target string) *fakeRFwdTransport {
-	return &fakeRFwdTransport{target: target, statuses: map[transport.ClientID][]string{}, opens: map[transport.ClientID]int{}}
+	return &fakeRFwdTransport{target: target, statuses: map[qtransport.ClientID][]string{}, opens: map[qtransport.ClientID]int{}}
 }
 
-func (f *fakeRFwdTransport) SendStatus(id transport.ClientID, msg string) error {
+func (f *fakeRFwdTransport) SendStatus(id qtransport.ClientID, msg string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.statuses[id] = append(f.statuses[id], msg)
 	return nil
 }
 
-func (f *fakeRFwdTransport) lastStatus(id transport.ClientID) string {
+func (f *fakeRFwdTransport) lastStatus(id qtransport.ClientID) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	s := f.statuses[id]
@@ -49,16 +47,16 @@ func (f *fakeRFwdTransport) lastStatus(id transport.ClientID) string {
 	return s[len(s)-1]
 }
 
-func (f *fakeRFwdTransport) openCount(id transport.ClientID) int {
+func (f *fakeRFwdTransport) openCount(id qtransport.ClientID) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.opens[id]
 }
 
-func (f *fakeRFwdTransport) OnRemoteForward(func(transport.ClientID, string, []uint16), func(transport.ClientID, bool)) {
+func (f *fakeRFwdTransport) OnRemoteForward(func(qtransport.ClientID, string, []uint16), func(qtransport.ClientID, bool)) {
 }
 
-func (f *fakeRFwdTransport) OpenRemoteForward(ctx context.Context, id transport.ClientID, port uint16) (transport.ForwardConn, error) {
+func (f *fakeRFwdTransport) OpenRemoteForward(ctx context.Context, id qtransport.ClientID, port uint16) (qtransport.ForwardConn, error) {
 	f.mu.Lock()
 	f.opens[id]++
 	f.mu.Unlock()
@@ -146,8 +144,8 @@ func TestRFwd_RelayAndBundleSameDevice(t *testing.T) {
 	r := newTestRegistry(t)
 	st := newFakeRFwdTransport(startEcho(t))
 	port := freePort(t)
-	c1 := transport.ClientID{Session: "s1", Num: 1}
-	c2 := transport.ClientID{Session: "s2", Num: 1}
+	c1 := qtransport.ClientID{Session: "s1", Num: 1}
+	c2 := qtransport.ClientID{Session: "s2", Num: 1}
 
 	r.hello(st, c1, devA, []uint16{port})
 	r.hello(st, c2, devA, []uint16{port})
@@ -186,8 +184,8 @@ func TestRFwd_OtherDeviceWaitsThenTakesOver(t *testing.T) {
 	stA := newFakeRFwdTransport(startEcho(t))
 	stB := newFakeRFwdTransport(startEcho(t))
 	port := freePort(t)
-	a := transport.ClientID{Session: "s1", Num: 1}
-	b := transport.ClientID{Session: "s2", Num: 1}
+	a := qtransport.ClientID{Session: "s1", Num: 1}
+	b := qtransport.ClientID{Session: "s2", Num: 1}
 
 	r.hello(stA, a, devA, []uint16{port})
 	r.hello(stB, b, devB, []uint16{port})
@@ -218,8 +216,8 @@ func TestRFwd_DormantHoldsPortAndRefuses(t *testing.T) {
 	st := newFakeRFwdTransport(startEcho(t))
 	stB := newFakeRFwdTransport(startEcho(t))
 	port := freePort(t)
-	a := transport.ClientID{Session: "s1", Num: 1}
-	b := transport.ClientID{Session: "s2", Num: 1}
+	a := qtransport.ClientID{Session: "s1", Num: 1}
+	b := qtransport.ClientID{Session: "s2", Num: 1}
 
 	r.hello(st, a, devA, []uint16{port})
 	r.gone(a, false) // スリープ等で接続喪失 → 休眠
@@ -263,7 +261,7 @@ func TestRFwd_BindFailureRetries(t *testing.T) {
 		t.Fatal(err)
 	}
 	port := uint16(blocker.Addr().(*net.TCPAddr).Port)
-	a := transport.ClientID{Session: "s1", Num: 1}
+	a := qtransport.ClientID{Session: "s1", Num: 1}
 
 	r.hello(st, a, devA, []uint16{port})
 	if !strings.Contains(st.lastStatus(a), "cannot listen") {
@@ -287,7 +285,7 @@ func TestRFwd_DropSessionReleases(t *testing.T) {
 	r := newTestRegistry(t)
 	st := newFakeRFwdTransport(startEcho(t))
 	port := freePort(t)
-	a := transport.ClientID{Session: "s1", Num: 1}
+	a := qtransport.ClientID{Session: "s1", Num: 1}
 
 	r.hello(st, a, devA, []uint16{port})
 	r.gone(a, false) // 休眠中でも
@@ -301,7 +299,7 @@ func TestRFwd_NoDuplicateNotices(t *testing.T) {
 	r := newTestRegistry(t)
 	st := newFakeRFwdTransport(startEcho(t))
 	port := freePort(t)
-	a := transport.ClientID{Session: "s1", Num: 1}
+	a := qtransport.ClientID{Session: "s1", Num: 1}
 	r.hello(st, a, devA, []uint16{port})
 	r.tick()
 	r.tick()

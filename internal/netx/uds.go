@@ -2,6 +2,7 @@ package netx
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 )
@@ -52,4 +53,23 @@ func GetAgentSocketPath(sessionID string) (string, error) {
 		return "", fmt.Errorf("failed to create agent socket directory: %w", err)
 	}
 	return filepath.Join(agentDir, sessionID+".sock"), nil
+}
+
+// GetPeerUID returns the UID of the peer connected to a Unix domain socket
+// (SO_PEERCRED on Linux, LOCAL_PEERCRED on macOS and FreeBSD).
+func GetPeerUID(conn net.Conn) (uint32, error) {
+	unixConn, ok := conn.(*net.UnixConn)
+	if !ok {
+		return 0, fmt.Errorf("not a Unix connection")
+	}
+	file, err := unixConn.File()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get file descriptor: %w", err)
+	}
+	defer file.Close()
+	uid, err := peerUID(int(file.Fd()))
+	if err != nil {
+		return 0, fmt.Errorf("failed to get peer credentials: %w", err)
+	}
+	return uid, nil
 }

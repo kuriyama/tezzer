@@ -13,8 +13,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/kuriyama/tezzer/internal/transport"
 )
 
 // startTCPEchoServer は受けたバイトをそのまま返す TCP サーバを起動する。
@@ -41,9 +39,9 @@ func startTCPEchoServer(t *testing.T) net.Listener {
 	return ln
 }
 
-// setupForwardPair はサーバ・クライアントを接続し、TCPForwarder を返す。
+// setupForwardPair はサーバ・クライアントを接続し、クライアントを返す。
 // forwardingEnabled=false ならサーバ側で転送を無効化する。
-func setupForwardPair(t *testing.T, forwardingEnabled bool) transport.TCPForwarder {
+func setupForwardPair(t *testing.T, forwardingEnabled bool) *Client {
 	t.Helper()
 	k := make([]byte, 32)
 	rand.Read(k)
@@ -53,26 +51,25 @@ func setupForwardPair(t *testing.T, forwardingEnabled bool) transport.TCPForward
 		t.Fatalf("NewServer: %v", err)
 	}
 	t.Cleanup(func() { srv.Close() })
-	srv.(*quicServer).SetTCPForwarding(forwardingEnabled)
+	srv.SetTCPForwarding(forwardingEnabled)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	t.Cleanup(cancel)
 	if err := srv.Start(ctx); err != nil {
 		t.Fatalf("server Start: %v", err)
 	}
-	addr := srv.(interface{ Addr() net.Addr }).Addr().String()
+	addr := srv.Addr().String()
 
-	cli := NewClient(k, addr, 1, "")
+	cli := NewClient(ClientConfig{Key: k, Candidates: []string{addr}, ClientID: 1})
 	t.Cleanup(func() { cli.Close() })
 	if err := cli.Start(ctx); err != nil {
 		t.Fatalf("client Start: %v", err)
 	}
 
-	fw := cli.(transport.TCPForwarder)
 	// serverMeta（Features）到着を待つ（有効時のみ。無効時は届いても bit が立たない）。
 	if forwardingEnabled {
 		deadline := time.Now().Add(5 * time.Second)
-		for !fw.ForwardingSupported() {
+		for !cli.ForwardingSupported() {
 			if time.Now().After(deadline) {
 				t.Fatal("client did not learn forwarding feature")
 			}
@@ -81,7 +78,7 @@ func setupForwardPair(t *testing.T, forwardingEnabled bool) transport.TCPForward
 	} else {
 		time.Sleep(100 * time.Millisecond) // meta 到着猶予
 	}
-	return fw
+	return cli
 }
 
 func TestForward_EchoAndHalfClose(t *testing.T) {
@@ -221,7 +218,7 @@ func TestForward_PerClientLimit(t *testing.T) {
 	fw := setupForwardPair(t, true)
 
 	// 上限まで開く（echo サーバに接続を保持させる）。
-	open := make([]transport.ForwardConn, 0, maxForwardsPerClient)
+	open := make([]ForwardConn, 0, maxForwardsPerClient)
 	defer func() {
 		for _, fs := range open {
 			fs.Close()

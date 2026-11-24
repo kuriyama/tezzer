@@ -7,7 +7,6 @@ package qtransport
 import (
 	"context"
 	"crypto/rand"
-	"net"
 	"testing"
 	"time"
 )
@@ -20,8 +19,9 @@ func TestSendInput_DoesNotBlockOnDeadPath(t *testing.T) {
 		t.Fatalf("NewServer: %v", err)
 	}
 	defer srv.Close()
+	inputs := inputChan(srv)
 	go func() {
-		for range srv.Input() {
+		for range inputs {
 		}
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -29,8 +29,8 @@ func TestSendInput_DoesNotBlockOnDeadPath(t *testing.T) {
 	if err := srv.Start(ctx); err != nil {
 		t.Fatalf("server Start: %v", err)
 	}
-	relay := newBlackholeRelay(t, srv.(interface{ Addr() net.Addr }).Addr().String())
-	cli := NewClient(k, relay.Addr(), 7, "")
+	relay := newBlackholeRelay(t, srv.Addr().String())
+	cli := NewClient(ClientConfig{Key: k, Candidates: []string{relay.Addr()}, ClientID: 7})
 	defer cli.Close()
 	if err := cli.Start(ctx); err != nil {
 		t.Fatalf("client Start: %v", err)

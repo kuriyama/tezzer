@@ -3,8 +3,8 @@ package main
 import (
 	"testing"
 
+	"github.com/kuriyama/tezzer/internal/qtransport"
 	"github.com/kuriyama/tezzer/internal/termui"
-	"github.com/kuriyama/tezzer/internal/transport"
 )
 
 func newScreenTestClient() *Client {
@@ -15,8 +15,8 @@ func newScreenTestClient() *Client {
 	}
 }
 
-func chunk(off uint64, s string) []transport.OutputChunk {
-	return []transport.OutputChunk{{Offset: off, Data: []byte(s)}}
+func chunk(off uint64, s string) []qtransport.OutputChunk {
+	return []qtransport.OutputChunk{{Offset: off, Data: []byte(s)}}
 }
 
 func (c *Client) screen() termui.ScreenState { return termui.ScreenState(c.screenState.Load()) }

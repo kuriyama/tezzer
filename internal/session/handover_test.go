@@ -184,7 +184,7 @@ func TestHandover_RoundTrip(t *testing.T) {
 	}
 
 	// QUIC トランスポートも fd 越しに生きていることを、実クライアントの接続で確認する。
-	cli := qtransport.NewClient(oldKey, "127.0.0.1:"+strconv.Itoa(oldPort), 4242, "")
+	cli := qtransport.NewClient(qtransport.ClientConfig{Key: oldKey, Candidates: []string{"127.0.0.1:" + strconv.Itoa(oldPort)}, ClientID: 4242})
 	defer cli.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

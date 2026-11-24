@@ -24,7 +24,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kuriyama/tezzer/internal/transport"
 	"github.com/quic-go/quic-go"
 )
 
@@ -36,7 +35,7 @@ var (
 )
 
 // livenessLoop は ping の送信と pong 途絶の判定を行う（Start で起動）。
-func (c *quicClient) livenessLoop() {
+func (c *Client) livenessLoop() {
 	t := time.NewTicker(livenessPingInterval.Get())
 	defer t.Stop()
 	var watched *quic.Conn // 監視中の接続（差し替わったら監視をやり直す）
@@ -71,12 +70,12 @@ func (c *quicClient) livenessLoop() {
 
 // livenessTarget は ping を打つべき状況なら現在の接続・その dial 先・別 family の候補を
 // 返す。打つべきでなければ conn == nil。
-func (c *quicClient) livenessTarget() (conn *quic.Conn, addr string, alts []string) {
-	if c.State() != transport.StateConnected || c.serverFeatures.Load()&FeatureLiveness == 0 {
+func (c *Client) livenessTarget() (conn *quic.Conn, addr string, alts []string) {
+	if c.State() != StateConnected || c.serverFeatures.Load()&FeatureLiveness == 0 {
 		return nil, "", nil
 	}
 	c.migrateMu.Lock()
-	conn, addr = c.conn.Load(), c.connAddr
+	conn, addr = c.conn.Load(), c.RemoteAddr() // 組で読むためロック下
 	c.migrateMu.Unlock()
 	alts = otherFamilyCandidates(c.currentCandidates(), addr)
 	if conn == nil || len(alts) == 0 {
@@ -85,13 +84,13 @@ func (c *quicClient) livenessTarget() (conn *quic.Conn, addr string, alts []stri
 	return conn, addr, alts
 }
 
-func (c *quicClient) currentCandidates() []string {
+func (c *Client) currentCandidates() []string {
 	c.candidatesMu.Lock()
 	defer c.candidatesMu.Unlock()
 	return c.candidates
 }
 
-func (c *quicClient) sendPing() {
+func (c *Client) sendPing() {
 	c.ctrlMu.Lock()
 	defer c.ctrlMu.Unlock()
 	_ = writeFrame(c.ctrl, &ctrlMsg{Type: ctrlPing})
@@ -99,7 +98,7 @@ func (c *quicClient) sendPing() {
 
 // failover は pong が silent の間途絶えた接続（addr）から、別 family の候補 alts への
 // 乗り換えを試みる。失敗時は現在の接続・状態・バックオフに触れない（ファイル冒頭の方針）。
-func (c *quicClient) failover(addr string, silent time.Duration, alts []string) {
+func (c *Client) failover(addr string, silent time.Duration, alts []string) {
 	// recover（watchdog・打鍵起点）と排他。向こうが走っているならそちらに任せる。
 	if !c.recovering.CompareAndSwap(false, true) {
 		return
@@ -122,19 +121,19 @@ func (c *quicClient) failover(addr string, silent time.Duration, alts []string) 
 
 	c.migrateMu.Lock()
 	defer c.migrateMu.Unlock()
-	if c.State() != transport.StateConnected || c.connAddr != addr {
+	if c.State() != StateConnected || c.RemoteAddr() != addr {
 		// dial 中に他経路で復帰・差し替え済み
 		_ = winner.conn.CloseWithError(0, "")
 		_ = closeTransport(winner.tr)
 		return
 	}
-	if err := c.adoptConn(winner); err != nil {
+	if err := c.adoptConn(c.ctx, winner); err != nil {
 		c.logf("liveness: failover to %s failed: %v", winner.addr, err)
 		return
 	}
 	d := c.recordRecovery(start)
-	c.setState(transport.StateRecovering, fmt.Sprintf("failover: no response via %s for %v", addr, silent.Truncate(time.Second)))
-	c.setState(transport.StateConnected, fmt.Sprintf("reconnected via %s (recovery %dms)", winner.addr, d.Milliseconds()))
+	c.setState(StateRecovering, fmt.Sprintf("failover: no response via %s for %v", addr, silent.Truncate(time.Second)))
+	c.setState(StateConnected, fmt.Sprintf("reconnected via %s (recovery %dms)", winner.addr, d.Milliseconds()))
 }
 
 // otherFamilyCandidates は candidates のうち current と別 family（v4/v6）のものを返す。

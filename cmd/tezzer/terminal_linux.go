@@ -2,19 +2,10 @@
 
 package main
 
-import (
-	"syscall"
-	"unsafe"
+import "golang.org/x/sys/unix"
 
-	"golang.org/x/sys/unix"
+// termios の取得・設定の ioctl（Linux は TCGETS/TCSETS）
+const (
+	ioctlGetTermios = unix.TCGETS
+	ioctlSetTermios = unix.TCSETS
 )
-
-// restoreTerminalFlags は終了時にターミナルフラグを復元します
-// Linuxでは TCGETS/TCSETS を使用
-func restoreTerminalFlags(fd int) {
-	var termios unix.Termios
-	if _, _, err := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), syscall.TCGETS, uintptr(unsafe.Pointer(&termios))); err == 0 {
-		termios.Oflag |= unix.ONLCR // LFをCRLFに変換
-		syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), syscall.TCSETS, uintptr(unsafe.Pointer(&termios)))
-	}
-}

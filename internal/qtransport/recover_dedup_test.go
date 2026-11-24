@@ -8,7 +8,6 @@ package qtransport
 import (
 	"context"
 	"crypto/rand"
-	"net"
 	"sync"
 	"testing"
 	"time"
@@ -29,26 +28,25 @@ func TestQUICTransport_ConcurrentRecoverDedup(t *testing.T) {
 	if err := srv.Start(ctx); err != nil {
 		t.Fatalf("server Start: %v", err)
 	}
-	addr := srv.(interface{ Addr() net.Addr }).Addr().String()
+	addr := srv.Addr().String()
 
-	cli := NewClient(k, addr, 7, "")
+	cli := NewClient(ClientConfig{Key: k, Candidates: []string{addr}, ClientID: 7})
 	defer cli.Close()
 	if err := cli.Start(ctx); err != nil {
 		t.Fatalf("client Start: %v", err)
 	}
-	qc := cli.(*quicClient)
 
 	// 接続を殺してから recover を一斉に多数起動する。
-	qc.conn.Load().CloseWithError(0, "dead")
+	cli.conn.Load().CloseWithError(0, "dead")
 	deadline := time.Now().Add(3 * time.Second)
-	for !qc.connDead() && time.Now().Before(deadline) {
+	for !cli.connDead() && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
 	var wg sync.WaitGroup
 	for i := 0; i < 16; i++ {
 		wg.Add(1)
-		go func() { defer wg.Done(); qc.recover("storm") }()
+		go func() { defer wg.Done(); cli.recover("storm") }()
 	}
 	wg.Wait()
 

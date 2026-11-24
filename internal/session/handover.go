@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"github.com/kuriyama/tezzer/internal/qtransport"
-	"github.com/kuriyama/tezzer/internal/transport"
 	"github.com/vmihailenco/msgpack/v5"
 )
 
@@ -156,11 +155,7 @@ func (m *Manager) WriteHandover(w io.Writer) (abort func(), err error) {
 		SharedQuicFd: -1,
 	}
 	if m.sharedTransport != nil {
-		d, ok := m.sharedTransport.(transport.SocketHandover)
-		if !ok {
-			return fail(fmt.Errorf("shared transport does not support fd handover"))
-		}
-		fd, err := d.DupUDPSocketFd()
+		fd, err := m.sharedTransport.DupUDPSocketFd()
 		if err != nil {
 			return fail(fmt.Errorf("dup shared udp socket: %w", err))
 		}
@@ -220,11 +215,7 @@ func (m *Manager) WriteHandover(w io.Writer) (abort func(), err error) {
 			})
 		}
 		if s.st != nil && !s.usesSharedTransport {
-			d, ok := s.st.(transport.SocketHandover)
-			if !ok {
-				return fail(fmt.Errorf("session %s: transport does not support fd handover", s.ID))
-			}
-			fd, err := d.DupUDPSocketFd()
+			fd, err := s.st.DupUDPSocketFd()
 			if err != nil {
 				return fail(fmt.Errorf("session %s: dup udp socket: %w", s.ID, err))
 			}
@@ -244,17 +235,13 @@ func (m *Manager) WriteHandover(w io.Writer) (abort func(), err error) {
 	// クライアントは idle timeout（60秒）まで接続死に気づけないため、即時 reconnect を
 	// 誘発する。exec 失敗時（abort 経路）でもクライアントは旧プロセスへ再接続するだけで
 	// 実害はない。
-	disconnect := func(t transport.ServerTransport) {
-		if d, ok := t.(transport.SocketHandover); ok {
-			d.DisconnectAllClients("tezzerd restarting")
-		}
-	}
+	const reason = "tezzerd restarting"
 	if m.sharedTransport != nil {
-		disconnect(m.sharedTransport)
+		m.sharedTransport.DisconnectAllClients(reason)
 	}
 	for _, s := range m.sessions {
 		if s.st != nil && !s.usesSharedTransport {
-			disconnect(s.st)
+			s.st.DisconnectAllClients(reason)
 		}
 	}
 

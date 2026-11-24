@@ -16,13 +16,10 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
-	"net"
 	"os"
 	"strconv"
 	"testing"
 	"time"
-
-	"github.com/kuriyama/tezzer/internal/transport"
 )
 
 func chaosSeeds(t *testing.T, defaults []uint64) []uint64 {
@@ -64,12 +61,13 @@ func runChaosModerateLoss(t *testing.T, seed uint64) {
 		t.Fatalf("NewServer: %v", err)
 	}
 	defer srv.Close()
+	inputs := inputChan(srv)
 
 	// SendOutput はサーバー側に client がまだ登録されていない（s.clients[cid]==nil）と
 	// エラーなく黙ってスキップされる。cli.Start() が返っても、サーバー側の登録
 	// （Hello 処理）が終わっている保証はないため、OnClientConnect で明示的に待つ。
 	connected := make(chan struct{})
-	srv.OnClientConnect(func(transport.ClientID) { close(connected) })
+	srv.OnClientConnect(func(ClientID) { close(connected) })
 
 	// ctx は server/client の生存期間そのもの（内部で context.WithCancel(ctx) される）
 	// なので、下の受信待ちループの上限より確実に長く取る。
@@ -78,14 +76,14 @@ func runChaosModerateLoss(t *testing.T, seed uint64) {
 	if err := srv.Start(ctx); err != nil {
 		t.Fatalf("server Start: %v", err)
 	}
-	addr := srv.(interface{ Addr() net.Addr }).Addr().String()
+	addr := srv.Addr().String()
 
 	policy := chaosPolicy{LossRate: 0.10, DupRate: 0.05, MaxDelay: 30 * time.Millisecond}
 	relay := newChaosRelay(t, addr, seed, policy, policy)
 	defer relay.Close()
 
 	const clientID = uint16(9001)
-	cli := NewClient(k, relay.Addr(), clientID, "")
+	cli := NewClient(ClientConfig{Key: k, Candidates: []string{relay.Addr()}, ClientID: clientID})
 	defer cli.Close()
 	if err := cli.Start(ctx); err != nil {
 		t.Fatalf("client Start: %v", err)
@@ -105,7 +103,7 @@ func runChaosModerateLoss(t *testing.T, seed uint64) {
 	}
 	go func() {
 		for i := 1; i <= n; i++ {
-			_ = srv.SendOutput(uint64(i), []byte(fmt.Sprintf("out-%d\n", i)), []transport.ClientID{{Num: clientID}})
+			_ = srv.SendOutput(uint64(i), []byte(fmt.Sprintf("out-%d\n", i)), []ClientID{{Num: clientID}})
 			time.Sleep(2 * time.Millisecond)
 		}
 	}()
@@ -137,7 +135,7 @@ func runChaosModerateLoss(t *testing.T, seed uint64) {
 	go func() {
 		for {
 			select {
-			case in, ok := <-srv.Input():
+			case in, ok := <-inputs:
 				if !ok {
 					return
 				}

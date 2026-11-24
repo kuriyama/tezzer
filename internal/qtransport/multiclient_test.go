@@ -7,8 +7,6 @@ package qtransport
 import (
 	"context"
 	"crypto/rand"
-	"github.com/kuriyama/tezzer/internal/transport"
-	"net"
 	"testing"
 	"time"
 )
@@ -28,10 +26,10 @@ func TestQUICTransport_MultiClientIsolation(t *testing.T) {
 	if err := srv.Start(ctx); err != nil {
 		t.Fatalf("server Start: %v", err)
 	}
-	addr := srv.(interface{ Addr() net.Addr }).Addr().String()
+	addr := srv.Addr().String()
 
-	connect := func(id uint16) ClientTransportWithClose {
-		c := NewClient(k, addr, id, "")
+	connect := func(id uint16) *Client {
+		c := NewClient(ClientConfig{Key: k, Candidates: []string{addr}, ClientID: id})
 		if err := c.Start(ctx); err != nil {
 			t.Fatalf("client %d Start: %v", id, err)
 		}
@@ -53,7 +51,7 @@ func TestQUICTransport_MultiClientIsolation(t *testing.T) {
 	}
 
 	// clientID 101 だけに送る → c1 のみ受信、c2 は受信しないこと。
-	if err := srv.SendOutput(1, []byte("for-101"), []transport.ClientID{{Num: 101}}); err != nil {
+	if err := srv.SendOutput(1, []byte("for-101"), []ClientID{{Num: 101}}); err != nil {
 		t.Fatalf("SendOutput 101: %v", err)
 	}
 	select {
@@ -74,7 +72,7 @@ func TestQUICTransport_MultiClientIsolation(t *testing.T) {
 	}
 
 	// 逆向きも確認。
-	if err := srv.SendOutput(1, []byte("for-202"), []transport.ClientID{{Num: 202}}); err != nil {
+	if err := srv.SendOutput(1, []byte("for-202"), []ClientID{{Num: 202}}); err != nil {
 		t.Fatalf("SendOutput 202: %v", err)
 	}
 	select {
@@ -86,13 +84,6 @@ func TestQUICTransport_MultiClientIsolation(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("c2 did not receive its output")
 	}
-}
-
-// ClientTransportWithClose は test 内で Close を呼ぶための最小インターフェース。
-type ClientTransportWithClose interface {
-	Start(context.Context) error
-	Output() <-chan transport.OutputChunk
-	Close() error
 }
 
 // TestQUICTransport_SameNumDifferentSession は A（(SessionID, ClientID) routing）の回帰防止。
@@ -113,15 +104,15 @@ func TestQUICTransport_SameNumDifferentSession(t *testing.T) {
 	if err := srv.Start(ctx); err != nil {
 		t.Fatalf("server Start: %v", err)
 	}
-	addr := srv.(interface{ Addr() net.Addr }).Addr().String()
+	addr := srv.Addr().String()
 
 	// 同じ Num=7、別セッション "A" / "B"。
-	ca := NewClient(k, addr, 7, "A")
+	ca := NewClient(ClientConfig{Key: k, Candidates: []string{addr}, ClientID: 7, SessionID: "A"})
 	defer ca.Close()
 	if err := ca.Start(ctx); err != nil {
 		t.Fatalf("client A Start: %v", err)
 	}
-	cb := NewClient(k, addr, 7, "B")
+	cb := NewClient(ClientConfig{Key: k, Candidates: []string{addr}, ClientID: 7, SessionID: "B"})
 	defer cb.Close()
 	if err := cb.Start(ctx); err != nil {
 		t.Fatalf("client B Start: %v", err)
@@ -136,7 +127,7 @@ func TestQUICTransport_SameNumDifferentSession(t *testing.T) {
 	}
 
 	// セッション A の Num=7 だけに送る → ca のみ受信、cb には来ないこと。
-	if err := srv.SendOutput(1, []byte("for-A"), []transport.ClientID{{Session: "A", Num: 7}}); err != nil {
+	if err := srv.SendOutput(1, []byte("for-A"), []ClientID{{Session: "A", Num: 7}}); err != nil {
 		t.Fatalf("SendOutput A: %v", err)
 	}
 	select {

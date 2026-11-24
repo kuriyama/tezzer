@@ -12,8 +12,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/kuriyama/tezzer/internal/transport"
 )
 
 // blackholeRelay は 127.0.0.1 で受けた UDP を serverAddr へ中継する（1 クライアント専用）。
@@ -64,7 +62,7 @@ func (r *blackholeRelay) Addr() string { return r.conn.LocalAddr().String() }
 
 // setupLivenessPair は dual-stack のエコーサーバーと、中継経由（v4）で接続済みの
 // クライアントを返す。::1 が使えない環境では skip する。
-func setupLivenessPair(t *testing.T) (qc *quicClient, relay *blackholeRelay, port int) {
+func setupLivenessPair(t *testing.T) (qc *Client, relay *blackholeRelay, port int) {
 	t.Helper()
 	if c, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback}); err != nil {
 		t.Skipf("IPv6 loopback unavailable: %v", err)
@@ -87,6 +85,7 @@ func setupLivenessPair(t *testing.T) (qc *quicClient, relay *blackholeRelay, por
 		t.Fatalf("NewServer: %v", err)
 	}
 	t.Cleanup(func() { _ = srv.Close() })
+	inputs := inputChan(srv)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	t.Cleanup(cancel)
 	if err := srv.Start(ctx); err != nil {
@@ -94,20 +93,20 @@ func setupLivenessPair(t *testing.T) (qc *quicClient, relay *blackholeRelay, por
 	}
 	var off uint64
 	go func() {
-		for in := range srv.Input() {
+		for in := range inputs {
 			off++
-			_ = srv.SendOutput(off, in.Data, []transport.ClientID{in.Client})
+			_ = srv.SendOutput(off, in.Data, []ClientID{in.Client})
 		}
 	}()
-	port = srv.(interface{ Addr() net.Addr }).Addr().(*net.UDPAddr).Port
+	port = srv.Addr().(*net.UDPAddr).Port
 
 	relay = newBlackholeRelay(t, net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
-	cli := NewClient(k, relay.Addr(), 1, "")
+	cli := NewClient(ClientConfig{Key: k, Candidates: []string{relay.Addr()}, ClientID: 1})
 	t.Cleanup(func() { _ = cli.Close() })
 	if err := cli.Start(ctx); err != nil {
 		t.Fatalf("client Start: %v", err)
 	}
-	qc = cli.(*quicClient)
+	qc = cli
 	waitFor(t, 5*time.Second, "server features", func() bool {
 		return qc.serverFeatures.Load()&FeatureLiveness != 0
 	})
@@ -125,7 +124,7 @@ func waitFor(t *testing.T, d time.Duration, what string, cond func() bool) {
 	}
 }
 
-func echo(t *testing.T, qc *quicClient, msg string) {
+func echo(t *testing.T, qc *Client, msg string) {
 	t.Helper()
 	if err := qc.SendInput([]byte(msg)); err != nil {
 		t.Fatalf("SendInput: %v", err)
@@ -140,12 +139,6 @@ func echo(t *testing.T, qc *quicClient, msg string) {
 	}
 }
 
-func connAddrOf(qc *quicClient) string {
-	qc.migrateMu.Lock()
-	defer qc.migrateMu.Unlock()
-	return qc.connAddr
-}
-
 // v4 経路が死んだら pong 途絶を検知して v6 候補へ乗り換え、ストリームが継続すること。
 func TestLiveness_FailoverToOtherFamily(t *testing.T) {
 	qc, relay, port := setupLivenessPair(t)
@@ -156,8 +149,8 @@ func TestLiveness_FailoverToOtherFamily(t *testing.T) {
 	waitFor(t, 2*time.Second, "first pong", func() bool { return qc.lastPongNano.Load() != 0 })
 
 	relay.drop.Store(true)
-	waitFor(t, 5*time.Second, "failover to v6", func() bool { return connAddrOf(qc) == v6 })
-	if s := qc.State(); s != transport.StateConnected {
+	waitFor(t, 5*time.Second, "failover to v6", func() bool { return qc.RemoteAddr() == v6 })
+	if s := qc.State(); s != StateConnected {
 		t.Fatalf("state after failover = %v, want connected", s)
 	}
 	echo(t, qc, "after")
@@ -176,10 +169,10 @@ func TestLiveness_BothDownKeepsConn(t *testing.T) {
 	qc.SetRoamingCandidates([]string{relay.Addr(), dead.LocalAddr().String()})
 	echo(t, qc, "before")
 
-	orig := connAddrOf(qc)
+	orig := qc.RemoteAddr()
 	relay.drop.Store(true)
 	time.Sleep(3 * livenessTimeout.Get())
-	if s := qc.State(); s != transport.StateConnected {
+	if s := qc.State(); s != StateConnected {
 		t.Fatalf("state during outage = %v, want connected (unchanged)", s)
 	}
 	qc.backoffMu.Lock()
@@ -191,8 +184,8 @@ func TestLiveness_BothDownKeepsConn(t *testing.T) {
 
 	relay.drop.Store(false)
 	echo(t, qc, "after")
-	if got := connAddrOf(qc); got != orig {
-		t.Fatalf("connAddr = %q, want unchanged %q", got, orig)
+	if got := qc.RemoteAddr(); got != orig {
+		t.Fatalf("RemoteAddr = %q, want unchanged %q", got, orig)
 	}
 }
 

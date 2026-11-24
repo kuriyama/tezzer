@@ -16,8 +16,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/kuriyama/tezzer/internal/transport"
 )
 
 // forwardSpec は解析済みの -L 指定。
@@ -140,7 +138,7 @@ func (c *Client) acceptForwardLoop(sp forwardSpec, ln net.Listener) {
 
 // handleForwardConn は accept した TCP 接続 1 本を QUIC 転送ストリームへ中継する。
 func (c *Client) handleForwardConn(sp forwardSpec, tconn *net.TCPConn) {
-	fw, _ := c.transport().(transport.TCPForwarder)
+	fw := c.transport()
 	if fw == nil {
 		c.forwardWarn(fmt.Sprintf("forward %s: QUIC transport not ready", sp))
 		_ = tconn.Close()
@@ -231,8 +229,8 @@ func (c *Client) pollForFeatureSupport(check func() (supported, connected bool),
 // （旧サーバ or --no-tcp-forwarding）なら一度だけ警告する。
 func (c *Client) warnIfForwardingUnsupported() {
 	c.pollForFeatureSupport(func() (bool, bool) {
-		fw, ok := c.transport().(transport.TCPForwarder)
-		return ok && fw.ForwardingSupported(), c.transport() != nil
+		ct := c.transport()
+		return ct != nil && ct.ForwardingSupported(), ct != nil
 	},
 		"-L: server does not support TCP forwarding (old server or --no-tcp-forwarding)",
 		"-L: QUIC transport not established; forwarding unavailable")

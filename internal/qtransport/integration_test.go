@@ -6,8 +6,6 @@ package qtransport
 import (
 	"context"
 	"crypto/rand"
-	"github.com/kuriyama/tezzer/internal/transport"
-	"net"
 	"testing"
 	"time"
 )
@@ -21,9 +19,10 @@ func TestQUICTransport_EndToEnd(t *testing.T) {
 		t.Fatalf("NewServer: %v", err)
 	}
 	defer srv.Close()
+	inputs := inputChan(srv)
 
 	connected := make(chan uint16, 1)
-	srv.OnClientConnect(func(id transport.ClientID) { connected <- id.Num })
+	srv.OnClientConnect(func(id ClientID) { connected <- id.Num })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -31,13 +30,19 @@ func TestQUICTransport_EndToEnd(t *testing.T) {
 		t.Fatalf("server Start: %v", err)
 	}
 
-	addr := srv.(interface{ Addr() net.Addr }).Addr().String()
+	addr := srv.Addr().String()
 
 	const clientID = uint16(4242)
-	cli := NewClient(k, addr, clientID, "")
+	cli := NewClient(ClientConfig{Key: k, Candidates: []string{addr}, ClientID: clientID})
 	defer cli.Close()
+	if got := cli.RemoteAddr(); got != "" {
+		t.Fatalf("RemoteAddr before Start = %q, want empty", got)
+	}
 	if err := cli.Start(ctx); err != nil {
 		t.Fatalf("client Start: %v", err)
+	}
+	if got := cli.RemoteAddr(); got != addr {
+		t.Fatalf("RemoteAddr = %q, want %q", got, addr)
 	}
 
 	// OnClientConnect が clientID 付きで発火する
@@ -55,7 +60,7 @@ func TestQUICTransport_EndToEnd(t *testing.T) {
 		t.Fatalf("SendInput: %v", err)
 	}
 	select {
-	case in := <-srv.Input():
+	case in := <-inputs:
 		if in.Client.Num != clientID || string(in.Data) != "hello-input" {
 			t.Fatalf("server Input got {id=%d data=%q}", in.Client.Num, in.Data)
 		}
@@ -64,7 +69,7 @@ func TestQUICTransport_EndToEnd(t *testing.T) {
 	}
 
 	// 出力: server → client（fan-out 1 件）
-	if err := srv.SendOutput(1, []byte("hello-output"), []transport.ClientID{{Num: clientID}}); err != nil {
+	if err := srv.SendOutput(1, []byte("hello-output"), []ClientID{{Num: clientID}}); err != nil {
 		t.Fatalf("SendOutput: %v", err)
 	}
 	select {
@@ -93,4 +98,12 @@ func TestQUICTransport_EndToEnd(t *testing.T) {
 	if got := srv.ActiveClients(); len(got) != 1 || got[0].Num != clientID {
 		t.Fatalf("ActiveClientIDs=%v want [%d]", got, clientID)
 	}
+}
+
+// inputChan は OnInput で受けた入力をチャネルへ流す（テスト用）。Start より前に呼ぶ。
+// コールバックはチャネルが埋まるとブロックし、実際の PTY と同じく背圧がかかる。
+func inputChan(srv *Server) <-chan Input {
+	ch := make(chan Input, 256)
+	srv.OnInput(func(in Input) { ch <- in })
+	return ch
 }

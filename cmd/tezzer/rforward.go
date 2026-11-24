@@ -17,8 +17,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-
-	"github.com/kuriyama/tezzer/internal/transport"
 )
 
 // maxRemoteForwards は 1 クライアントで指定できる -R の数（サーバ側の上限と揃える）。
@@ -162,8 +160,8 @@ func remoteForwardTargets(specs []remoteForwardSpec) map[uint16]string {
 // （旧サーバ or --no-tcp-forwarding）なら一度だけ警告する。
 func (c *Client) warnIfRemoteForwardingUnsupported() {
 	c.pollForFeatureSupport(func() (bool, bool) {
-		rf, ok := c.transport().(transport.RemoteForwardClient)
-		return ok && rf.RemoteForwardingSupported(), c.transport() != nil
+		ct := c.transport()
+		return ct != nil && ct.RemoteForwardingSupported(), ct != nil
 	},
 		"-R: server does not support remote forwarding (old server or --no-tcp-forwarding)",
 		"-R: QUIC transport not established; remote forwarding unavailable")

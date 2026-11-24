@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"net"
 	"testing"
 	"time"
 )
@@ -118,15 +117,16 @@ func TestDatagramInput_EndToEnd(t *testing.T) {
 		t.Fatalf("NewServer: %v", err)
 	}
 	defer srv.Close()
+	inputs := inputChan(srv)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := srv.Start(ctx); err != nil {
 		t.Fatalf("server Start: %v", err)
 	}
-	addr := srv.(interface{ Addr() net.Addr }).Addr().String()
+	addr := srv.Addr().String()
 
-	cli := NewClient(k, addr, 7, "sess-dgram")
+	cli := NewClient(ClientConfig{Key: k, Candidates: []string{addr}, ClientID: 7, SessionID: "sess-dgram"})
 	defer cli.Close()
 	if err := cli.Start(ctx); err != nil {
 		t.Fatalf("client Start: %v", err)
@@ -154,7 +154,7 @@ func TestDatagramInput_EndToEnd(t *testing.T) {
 	deadline := time.After(10 * time.Second)
 	for got.Len() < want.Len() {
 		select {
-		case in := <-srv.Input():
+		case in := <-inputs:
 			got.Write(in.Data)
 		case <-deadline:
 			t.Fatalf("timeout: got %d bytes, want %d", got.Len(), want.Len())
@@ -166,7 +166,7 @@ func TestDatagramInput_EndToEnd(t *testing.T) {
 
 	// 重複が余分に届いていないこと（datagram の重複は dedup が落とすはず）
 	select {
-	case in := <-srv.Input():
+	case in := <-inputs:
 		t.Fatalf("unexpected extra input: %q", in.Data)
 	case <-time.After(300 * time.Millisecond):
 	}

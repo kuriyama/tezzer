@@ -1,7 +1,7 @@
 package qtransport
 
 // control ストリーム（bidi）上の制御メッセージの framing。
-// 4 バイト長プレフィックス + msgpack。Hello（接続→clientID 紐付け）と Resize を運ぶ。
+// 4 バイト長プレフィックス + msgpack。Hello（接続→clientID 紐付け）・Resize などの制御フレームを運ぶ。
 // 出力/入力のバルクは別の uni stream で生バイトとして流すので、ここは小さい制御のみ。
 
 import (
@@ -18,7 +18,7 @@ const (
 	ctrlHello       ctrlType = 1 // クライアント → サーバ: 接続を clientID へ紐付け
 	ctrlResize      ctrlType = 2 // クライアント → サーバ: 端末サイズ変更
 	ctrlServerMeta  ctrlType = 3 // サーバ → クライアント: ビルド情報・インスタンスID
-	ctrlSessionGone ctrlType = 4 // サーバ → クライアント: セッション消失（再起動/kill）
+	ctrlSessionGone ctrlType = 4 // サーバ → クライアント: セッション消失（終了・kill・再起動後に見つからない）
 	ctrlStatus      ctrlType = 5 // サーバ → クライアント: ステータスメッセージ
 	ctrlLog         ctrlType = 6 // サーバ → クライアント: ログメッセージ
 
@@ -43,6 +43,12 @@ const (
 	ctrlRFwdOpen    ctrlType = 15 // サーバ → クライアント: 着信の中継要求（Port = サーバ側 listen ポート）
 	ctrlRFwdOpenOK  ctrlType = 16 // クライアント → サーバ: dial 成功、以降は生バイトの中継
 	ctrlRFwdOpenErr ctrlType = 17 // クライアント → サーバ: 拒否/dial 失敗（Msg = 理由）
+
+	// サーバ → クライアント（control ストリーム上で使う）: 前の接続で PTY に渡した入力の位置
+	// （InputApplied。nil = 不明）。
+	// 接続のたびに ServerMeta の後で送る。クライアントは送ったつもりの位置との差を
+	// 「届かなかった入力」として知らせる（送り直しはしない）。
+	ctrlInputApplied ctrlType = 18
 )
 
 // FeatureTCPForward is a ctrlServerMeta.Features bit: TCP port forwarding is
@@ -63,6 +69,11 @@ const FeatureLiveness uint64 = 1 << 2
 // forwarding (-R) is supported. Not set when the server was started with
 // --no-tcp-forwarding.
 const FeatureRemoteForward uint64 = 1 << 3
+
+// FeatureInputApplied is a ctrlServerMeta.Features bit: after ServerMeta the
+// server sends ctrlInputApplied, telling a reconnecting client how much of its
+// input on the previous connection reached the session.
+const FeatureInputApplied uint64 = 1 << 4
 
 const maxCtrlFrame = 1 << 20    // 1 MiB（制御メッセージなので十分すぎる上限）
 const maxOutputFrame = 16 << 20 // 16 MiB（1 PTY 読み取りチャンクの上限）
@@ -95,6 +106,14 @@ type ctrlMsg struct {
 	// ExitCode はセッションプロセスの終了コード（SessionGone でのみ設定。
 	// nil = 不明。ポインタなのは exit 0 と未設定を区別するため。旧相手では単に無視される）。
 	ExitCode *int32 `msgpack:"ec,omitempty"`
+	// FinalOffset はセッションの最後の出力 offset（SessionGone でのみ設定。0 = 不明）。
+	// 出力ストリームと制御ストリームは別なので通知が出力を追い越しうる。クライアントは
+	// ここまで描画してから終了する（旧相手では単に無視される）。
+	FinalOffset uint64 `msgpack:"fo,omitempty"`
+	// InputApplied は前の接続で PTY に渡した入力のバイト数（ctrlInputApplied でのみ設定。
+	// nil = 不明: 初回接続・サーバ再起動後・prevConnKeep を過ぎた後、または前の接続の入力受信が
+	// inputAppliedWait 内に終わらなかったとき）。
+	InputApplied *uint64 `msgpack:"ia,omitempty"`
 }
 
 // 出力ストリームのフレーム: [offset:8][len:4][data]。

@@ -1,15 +1,3 @@
-// quicServer is the QUIC implementation of transport.ServerTransport.
-//
-// Protocol (v1, minimal):
-//   - The client opens the control bidi stream and sends Hello{ClientID},
-//     binding the connection to that clientID.
-//   - Input: the client opens a uni stream and sends raw bytes -> Input().
-//   - Output: the server opens a uni stream per clientID and sends raw bytes
-//     (SendOutput).
-//   - Resize: a control frame on the control stream -> Resize().
-//
-// Offset-based resynchronization (OnResyncNeeded) and migration tracking are
-// layered on top of this.
 package qtransport
 
 import (
@@ -23,14 +11,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/kuriyama/tezzer/internal/transport"
 	"github.com/quic-go/quic-go"
 )
 
 // serverClient は handleConn でだけ生成され、conn/out/ctrl は生成時に必ず設定されて以後
 // 変わらない（nil チェックは不要）。
 type serverClient struct {
-	id    transport.ClientID
+	id    ClientID
 	conn  *quic.Conn
 	out   *quic.SendStream
 	outMu sync.Mutex
@@ -42,10 +29,13 @@ type serverClient struct {
 	ctrlMu     sync.Mutex
 
 	// 入力の重複排除（ストリーム + DATAGRAM 二重送信の一度だけ適用）。
-	// inMu は dedup 状態と input チャネルへの送信順序の両方を守る
-	// （2 つの受信 goroutine が offset 順を崩さないよう、チャネル送信まで保持する）。
+	// inMu は dedup 状態と OnInput コールバックへの受け渡し順の両方を守る
+	// （2 つの受信 goroutine が offset 順を崩さないよう、コールバック（PTY 書き込み）が戻るまで保持する）。
 	inMu    sync.Mutex
 	inDedup inputDeduper
+	// inputDone は入力の受信 goroutine（readInput・readInputDatagrams）が両方終わると閉じる。
+	// 以後 inDedup.applied は変わらないので、前の接続で PTY に渡した入力の位置をここで確定できる。
+	inputDone chan struct{}
 
 	// 送信健全性（backpressure 観測用、atomic）
 	bytesSent    atomic.Uint64
@@ -76,22 +66,39 @@ type serverClient struct {
 	remoteForward bool
 }
 
-type quicServer struct {
+// Server is the server side of the QUIC terminal transport: it fans session
+// output out to multiple clients and collects their input.
+//
+// Protocol (v1, minimal):
+//   - The client opens the control bidi stream and sends Hello{ClientID},
+//     binding the connection to that clientID.
+//   - Input: the client opens a uni stream and sends raw bytes -> OnInput.
+//   - Output: the server opens a uni stream per clientID and sends raw bytes
+//     (SendOutput).
+//   - Resize: a control frame on the control stream -> Resize().
+//
+// Offset-based resynchronization (OnResyncNeeded) and migration tracking are
+// layered on top of this.
+type Server struct {
 	ln     *quic.Listener
 	tr     *quic.Transport // 自前 UDP ソケット上の transport（Close で明示的に閉じる）
 	uconn  net.PacketConn  // 待ち受け UDP ソケット（無停止再起動時に fd を継承する）
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	input  chan transport.Input
-	resize chan transport.Resize
+	resize chan Resize
 
 	mu      sync.Mutex
-	clients map[transport.ClientID]*serverClient
+	clients map[ClientID]*serverClient
 
-	onConnect func(transport.ClientID)
-	onExit    func(transport.ClientID)
-	onResync  func(transport.ClientID, uint64) ([]transport.OutputChunk, error)
+	onConnect func(ClientID)
+	onExit    func(ClientID)
+	onResync  func(ClientID, uint64) ([]OutputChunk, error)
+	onInput   func(Input)
+	// prevConns は意図せず切れた（意図した終了ではない）クライアントの最後の接続。再接続時に
+	// その接続で PTY に渡した入力の位置を ctrlInputApplied で伝えて消す。prevConnKeep を
+	// 過ぎたものは、次に切断を記録するとき（rememberPrevConnLocked）にまとめて消す。
+	prevConns map[ClientID]prevConn
 
 	// クライアント接続時に通知するサーバ情報（SetServerMeta で設定）
 	metaBuildID    string
@@ -103,16 +110,16 @@ type quicServer struct {
 	// agent forwarding の禁止フラグ（SetAgentForwarding。零値 = 許可。agent.go）
 	agentFwdDisabled atomic.Bool
 	// セッションごとの現在の agent forwarding provider（agent.go。mu で保護）
-	agentProviders map[string]transport.ClientID
+	agentProviders map[string]ClientID
 	// -R のコールバック（OnRemoteForward。rforward.go。mu で保護。nil = -R 無効）
-	rfwdHello func(transport.ClientID, string, []uint16)
-	rfwdGone  func(transport.ClientID, bool)
+	rfwdHello func(ClientID, string, []uint16)
+	rfwdGone  func(ClientID, bool)
 }
 
 // NewServer creates a QUIC server transport listening on listenAddr.
 // It opens its own UDP socket (so the fd can be extracted and inherited
 // across a zero-downtime restart).
-func NewServer(k []byte, listenAddr string) (transport.ServerTransport, error) {
+func NewServer(k []byte, listenAddr string) (*Server, error) {
 	addr, err := net.ResolveUDPAddr("udp", listenAddr)
 	if err != nil {
 		return nil, err
@@ -132,7 +139,7 @@ func NewServer(k []byte, listenAddr string) (transport.ServerTransport, error) {
 // NewServerFromPacketConn creates a QUIC server transport on an existing UDP
 // socket (for fd inheritance across a zero-downtime restart). Ownership of
 // the socket moves to the transport; Close closes it.
-func NewServerFromPacketConn(k []byte, uconn net.PacketConn) (transport.ServerTransport, error) {
+func NewServerFromPacketConn(k []byte, uconn net.PacketConn) (*Server, error) {
 	tlsConf, err := ServerTLS(k)
 	if err != nil {
 		return nil, err
@@ -142,21 +149,22 @@ func NewServerFromPacketConn(k []byte, uconn net.PacketConn) (transport.ServerTr
 	if err != nil {
 		return nil, err
 	}
-	return &quicServer{
+	return &Server{
 		ln:             ln,
 		tr:             tr,
 		uconn:          uconn,
-		input:          make(chan transport.Input, 256),
-		resize:         make(chan transport.Resize, 16),
-		clients:        make(map[transport.ClientID]*serverClient),
-		agentProviders: make(map[string]transport.ClientID),
+		resize:         make(chan Resize, 16),
+		clients:        make(map[ClientID]*serverClient),
+		agentProviders: make(map[string]ClientID),
+		prevConns:      make(map[ClientID]prevConn),
 	}, nil
 }
 
-// DisconnectAllClients は全クライアントの QUIC 接続を CONNECTION_CLOSE で切断する。
-// 無停止再起動の直前に呼ぶことで、クライアントは idle timeout（60秒）を待たずに
-// 即座に接続死を検知し、reconnect 機構で新プロセスへ再接続できる。
-func (s *quicServer) DisconnectAllClients(reason string) {
+// DisconnectAllClients immediately disconnects every client with
+// CONNECTION_CLOSE. Called right before a zero-downtime restart so clients
+// detect the dead connection without waiting for the idle timeout and
+// reconnect to the new process.
+func (s *Server) DisconnectAllClients(reason string) {
 	s.mu.Lock()
 	conns := make(map[*quic.Conn]bool)
 	for _, sc := range s.clients {
@@ -168,9 +176,9 @@ func (s *quicServer) DisconnectAllClients(reason string) {
 	}
 }
 
-// DupUDPSocketFd は待ち受け UDP ソケットを複製した fd（CLOEXEC なし）を返す。
-// 無停止再起動（self re-exec）で新プロセスへ継承するために使う。
-func (s *quicServer) DupUDPSocketFd() (int, error) {
+// DupUDPSocketFd returns a duplicate fd of the listening UDP socket without
+// CLOEXEC, to be inherited by the new process of a zero-downtime restart.
+func (s *Server) DupUDPSocketFd() (int, error) {
 	sc, ok := s.uconn.(syscall.Conn)
 	if !ok {
 		return -1, errors.New("udp socket does not support SyscallConn")
@@ -190,17 +198,19 @@ func (s *quicServer) DupUDPSocketFd() (int, error) {
 	return fd, dupErr
 }
 
-// Addr は待ち受けアドレスを返す（インターフェース外。bootstrap で client へ伝える用）。
-func (s *quicServer) Addr() net.Addr { return s.ln.Addr() }
+// Addr returns the actual listening address (to resolve the port after
+// binding to :0, and to tell clients during bootstrap).
+func (s *Server) Addr() net.Addr { return s.ln.Addr() }
 
-func (s *quicServer) Start(ctx context.Context) error {
+// Start starts accepting client connections.
+func (s *Server) Start(ctx context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
 	go s.acceptLoop()
 	go s.stallWatchdog()
 	return nil
 }
 
-func (s *quicServer) acceptLoop() {
+func (s *Server) acceptLoop() {
 	for {
 		conn, err := s.ln.Accept(s.ctx)
 		if err != nil {
@@ -210,7 +220,7 @@ func (s *quicServer) acceptLoop() {
 	}
 }
 
-func (s *quicServer) handleConn(conn *quic.Conn) {
+func (s *Server) handleConn(conn *quic.Conn) {
 	// 最初の bidi ストリーム = control。Hello を読んで clientID を確定する。
 	ctrl, err := conn.AcceptStream(s.ctx)
 	if err != nil {
@@ -225,7 +235,7 @@ func (s *quicServer) handleConn(conn *quic.Conn) {
 		_ = conn.CloseWithError(1, "expected hello")
 		return
 	}
-	cid := transport.ClientID{Session: m.SessionID, Num: m.ClientID}
+	cid := ClientID{Session: m.SessionID, Num: m.ClientID}
 
 	// このクライアントへの出力 uni ストリームを開く。
 	out, err := conn.OpenUniStreamSync(s.ctx)
@@ -233,13 +243,19 @@ func (s *quicServer) handleConn(conn *quic.Conn) {
 		return
 	}
 	rfwdHello := s.rfwdHelloFor(m)
-	sc := &serverClient{id: cid, conn: conn, out: out, ctrl: ctrl, agentForward: m.AgentForward, remoteForward: rfwdHello != nil}
+	sc := &serverClient{id: cid, conn: conn, out: out, ctrl: ctrl, agentForward: m.AgentForward, remoteForward: rfwdHello != nil, inputDone: make(chan struct{})}
 	connectedAt := time.Now()
 
 	s.mu.Lock()
 	// 再同期するなら追い付き中として登録する（古い接続を差し替えるため登録自体は遅らせない）
 	sc.catchingUp = s.onResync != nil
-	_, replacing := s.clients[cid]
+	// 前の接続: まだ登録されている（サーバが切断を検知する前の reconnect）か、切断済みで残したもの
+	old, replacing := s.clients[cid]
+	prev := old
+	if !replacing {
+		prev = s.prevConns[cid].sc
+	}
+	delete(s.prevConns, cid)
 	s.clients[cid] = sc
 	if m.AgentForward {
 		// 「最後の Hello が勝つ」: migration/reconnect でも同じ規約で上書きする。
@@ -249,8 +265,8 @@ func (s *quicServer) handleConn(conn *quic.Conn) {
 	onResync := s.onResync
 	buildID, buildTime, instanceID := s.metaBuildID, s.metaBuildTime, s.metaInstanceID
 	s.mu.Unlock()
-	// 接続イベントは常時ログに残す（従来は一切出ず、報告時に「QUIC が届いていたか」を
-	// サーバ側から判定できなかった）。replacing = 同一 clientID の reconnect。
+	// 接続イベントは常時ログに残す（報告時に「QUIC が届いていたか」をサーバ側から判定
+	// できるように）。replacing = 同一 clientID の reconnect。
 	kind := "connected"
 	if replacing {
 		kind = "reconnected"
@@ -264,6 +280,24 @@ func (s *quicServer) handleConn(conn *quic.Conn) {
 	// サーバ情報を control ストリームで通知（UDS 非依存。スリープで UDS が切れても届く）。
 	// Features（転送対応等）を運ぶため常に送る。
 	_ = s.writeCtrl(sc, &ctrlMsg{Type: ctrlServerMeta, BuildID: buildID, BuildTime: buildTime, InstanceID: instanceID, Features: s.features()})
+
+	// 前の接続で PTY に渡した入力の位置を伝える（ServerMeta の後）。古い接続がまだ生きて
+	// 見えるなら先に閉じる。位置は古い接続の入力の受信 goroutine が終わってから読む（読み
+	// 取り済みのバイトが後から PTY に渡り、届いたのに「届かなかった」と誤報しないように）。
+	// PTY が詰まって終わらなければ不明として送る（誤報より黙る方を選ぶ）。待つ間も出力の
+	// 再同期を止めないよう別 goroutine で送る。
+	go func() {
+		if replacing {
+			_ = old.conn.CloseWithError(0, "superseded by reconnect")
+		}
+		var applied *uint64
+		if prev != nil {
+			if a, ok := prev.appliedInput(inputAppliedWait); ok {
+				applied = &a
+			}
+		}
+		_ = s.writeCtrl(sc, &ctrlMsg{Type: ctrlInputApplied, InputApplied: applied})
+	}()
 
 	// -R の登録（reconnect のたびに再登録される）。ServerMeta の後に呼ぶので、
 	// コールバック内からの SendStatus（登録結果の通知）は ServerMeta より後に届く。
@@ -313,14 +347,18 @@ func (s *quicServer) handleConn(conn *quic.Conn) {
 	}
 
 	go s.readControl(sc, ctrl)
-	go s.readInput(sc)
-	go s.readInputDatagrams(sc)
+	var inputWG sync.WaitGroup
+	inputWG.Add(2)
+	go func() { defer inputWG.Done(); s.readInput(sc) }()
+	go func() { defer inputWG.Done(); s.readInputDatagrams(sc) }()
+	go func() { inputWG.Wait(); close(sc.inputDone) }()
 	go s.acceptForwardStreams(sc)
 
 	<-conn.Context().Done()
 
 	// 同一 clientID が別接続で再接続済みの場合、この古い接続の終了で新しい
 	// serverClient を消さないようにする（長スリープ後の reconnect 対策）。
+	clientExit := closedByClientExit(conn)
 	s.mu.Lock()
 	stillMine := s.clients[cid] == sc
 	if stillMine {
@@ -336,10 +374,14 @@ func (s *quicServer) handleConn(conn *quic.Conn) {
 			}
 		}
 	}
+	if stillMine && !clientExit {
+		// 意図しない切断なら、再接続に備えてこの接続を残す（入力の位置は再接続した側が、
+		// この接続の入力の受信 goroutine の終了を待ってから読む。ここでは待たない）
+		s.rememberPrevConnLocked(cid, sc)
+	}
 	rfwdGone := s.rfwdGone
 	onExit := s.onExit
 	s.mu.Unlock()
-	clientExit := closedByClientExit(conn)
 	if stillMine && sc.remoteForward && rfwdGone != nil {
 		rfwdGone(cid, clientExit)
 	}
@@ -356,7 +398,7 @@ func (s *quicServer) handleConn(conn *quic.Conn) {
 }
 
 // readControl は control ストリームの後続フレーム（Resize 等）を読む。
-func (s *quicServer) readControl(sc *serverClient, ctrl *quic.Stream) {
+func (s *Server) readControl(sc *serverClient, ctrl *quic.Stream) {
 	for {
 		m, err := readFrame(ctrl)
 		if err != nil {
@@ -366,7 +408,7 @@ func (s *quicServer) readControl(sc *serverClient, ctrl *quic.Stream) {
 		switch m.Type {
 		case ctrlResize:
 			select {
-			case s.resize <- transport.Resize{Client: sc.id, Cols: m.Cols, Rows: m.Rows}:
+			case s.resize <- Resize{Client: sc.id, Cols: m.Cols, Rows: m.Rows}:
 			case <-s.ctx.Done():
 				return
 			}
@@ -376,29 +418,77 @@ func (s *quicServer) readControl(sc *serverClient, ctrl *quic.Stream) {
 	}
 }
 
-// readInput はクライアントの入力 uni ストリームを受けて Input() へ流す。
+// inputAppliedWait は再接続時に、前の接続の入力の受信 goroutine が終わるのを待つ上限。
+// PTY 書き込みが詰まっていて終わらなければ、入力の位置は不明として伝える。
+const inputAppliedWait = 2 * time.Second
+
+// prevConnKeep は意図せず切れたクライアントの最後の接続を、再接続に備えて残しておく時間。
+const prevConnKeep = 24 * time.Hour
+
+type prevConn struct {
+	sc *serverClient
+	at time.Time
+}
+
+// rememberPrevConnLocked は意図せず切れたクライアントの最後の接続を残す（s.mu を保持して呼ぶ）。
+// 戻ってこないまま prevConnKeep を過ぎたものはここで消す。
+func (s *Server) rememberPrevConnLocked(cid ClientID, sc *serverClient) {
+	now := time.Now()
+	for id, p := range s.prevConns {
+		if now.Sub(p.at) > prevConnKeep {
+			delete(s.prevConns, id)
+		}
+	}
+	s.prevConns[cid] = prevConn{sc: sc, at: now}
+}
+
+// appliedInput はこの接続で PTY に渡した入力のバイト数を、入力の受信 goroutine が終わって
+// から返す（最大 wait 待つ。終わらなければ false）。
+func (sc *serverClient) appliedInput(wait time.Duration) (uint64, bool) {
+	select {
+	case <-sc.inputDone:
+	case <-time.After(wait):
+		return 0, false
+	}
+	sc.inMu.Lock()
+	defer sc.inMu.Unlock()
+	return sc.inDedup.applied, true
+}
+
+// inputHandler は OnInput で登録されたコールバックを返す（受信 goroutine の開始時に 1 回だけ
+// 読む。登録は Start 前の約束なので、入力のたびにサーバ全体のロックを取らない）。
+// コールバックは sc.inMu を保持して呼ぶ（ストリームと DATAGRAM の 2 つの受信 goroutine の間で
+// offset 順を保つ）。PTY への書き込みまで同期的に行うので、PTY が詰まるとこのクライアントの
+// 受信だけが止まり、QUIC のフロー制御でその接続にだけ背圧がかかる（共通のチャネルを挟むと、
+// 1 セッションの詰まりで全クライアントが止まる）。
+func (s *Server) inputHandler(sc *serverClient) func(data []byte) {
+	s.mu.Lock()
+	fn := s.onInput
+	s.mu.Unlock()
+	return func(data []byte) {
+		if fn != nil {
+			fn(Input{Client: sc.id, Data: data})
+		}
+	}
+}
+
+// readInput はクライアントの入力 uni ストリームを受けて OnInput へ渡す。
 // DATAGRAM で先に適用済みのバイトは dedup が落とす。
-func (s *quicServer) readInput(sc *serverClient) {
+func (s *Server) readInput(sc *serverClient) {
 	rs, err := sc.conn.AcceptUniStream(s.ctx)
 	if err != nil {
 		return
 	}
+	deliver := s.inputHandler(sc)
 	buf := make([]byte, 4096)
 	for {
 		n, err := rs.Read(buf)
 		if n > 0 {
 			sc.lastRecvNano.Store(time.Now().UnixNano())
 			sc.inMu.Lock()
-			out := sc.inDedup.fromStream(buf[:n])
-			if len(out) > 0 {
+			if out := sc.inDedup.fromStream(buf[:n]); len(out) > 0 {
 				// buf は再利用するのでコピーして渡す。
-				data := append([]byte(nil), out...)
-				select {
-				case s.input <- transport.Input{Client: sc.id, Data: data}:
-				case <-s.ctx.Done():
-					sc.inMu.Unlock()
-					return
-				}
+				deliver(append([]byte(nil), out...))
 			}
 			sc.inMu.Unlock()
 		}
@@ -408,12 +498,13 @@ func (s *quicServer) readInput(sc *serverClient) {
 	}
 }
 
-// readInputDatagrams は投機的二重送信された入力 DATAGRAM を受けて Input() へ流す。
+// readInputDatagrams は投機的二重送信された入力 DATAGRAM を受けて OnInput へ渡す。
 // ストリームより先に届いた場合だけ適用され、遅れて届いた重複は dedup が落とす。
-func (s *quicServer) readInputDatagrams(sc *serverClient) {
+func (s *Server) readInputDatagrams(sc *serverClient) {
 	if !sc.conn.ConnectionState().SupportsDatagrams.Local {
 		return
 	}
+	deliver := s.inputHandler(sc)
 	for {
 		b, err := sc.conn.ReceiveDatagram(s.ctx)
 		if err != nil {
@@ -425,15 +516,9 @@ func (s *quicServer) readInputDatagrams(sc *serverClient) {
 		}
 		sc.lastRecvNano.Store(time.Now().UnixNano())
 		sc.inMu.Lock()
-		out := sc.inDedup.fromDatagram(offset, data)
-		if len(out) > 0 {
+		if out := sc.inDedup.fromDatagram(offset, data); len(out) > 0 {
 			// b は ReceiveDatagram ごとに新規割り当てなのでコピー不要。
-			select {
-			case s.input <- transport.Input{Client: sc.id, Data: out}:
-			case <-s.ctx.Done():
-				sc.inMu.Unlock()
-				return
-			}
+			deliver(out)
 		}
 		sc.inMu.Unlock()
 	}
@@ -454,7 +539,7 @@ const slowWriteThreshold = 100 * time.Millisecond
 //
 // atomic なのはテスト間の競合対策: 前のテストのサーバが残した stallWatchdog
 // goroutine は Close で join されないため、次のテストの差し替え（書き込み）と
-// 同期関係がなく、生の var では -race に検出される（GitLab nightly で実検出）。
+// 同期関係がなく、生の var では -race に検出される。
 // 本番では初期値のまま読み取り専用。
 var (
 	stallWarnThreshold     = newAtomicDuration(2 * time.Second)
@@ -509,7 +594,9 @@ func (sc *serverClient) writeOutputLocked(offset uint64, data []byte) (time.Dura
 	return dur, err
 }
 
-func (s *quicServer) SendOutput(offset uint64, data []byte, clients []transport.ClientID) error {
+// SendOutput sends output at the session's logical offset to the given
+// clients.
+func (s *Server) SendOutput(offset uint64, data []byte, clients []ClientID) error {
 	for _, cid := range clients {
 		s.mu.Lock()
 		sc := s.clients[cid]
@@ -547,7 +634,7 @@ func (s *quicServer) SendOutput(offset uint64, data []byte, clients []transport.
 // 同期的に呼ばれるため、1 クライアントの stall はセッション全体の出力停止として
 // 他クライアントのユーザーに見えている（固まった画面の理由をその場で知らせる）。
 // critical 水位を超えたら当該クライアントを切断し、セッション全体を解放する。
-func (s *quicServer) stallWatchdog() {
+func (s *Server) stallWatchdog() {
 	// 水位はここで一度だけ読む（テストが Start 前に差し替え、終了後に復元するため）。
 	warnThreshold, warnRepeat := stallWarnThreshold.Get(), stallWarnRepeat.Get()
 	criticalThreshold := stallCriticalThreshold.Get()
@@ -617,10 +704,14 @@ func (s *quicServer) stallWatchdog() {
 	}
 }
 
-func (s *quicServer) ClientSendStats() []transport.ClientSendStat {
+// ClientSendStats reports per-client output-send health (backpressure
+// observability). A blocked write to a slow client can stall the whole PTY
+// reader, so SlowWrites/MaxWriteMs identify which client is stalling the
+// session.
+func (s *Server) ClientSendStats() []ClientSendStat {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	stats := make([]transport.ClientSendStat, 0, len(s.clients))
+	stats := make([]ClientSendStat, 0, len(s.clients))
 	for id, sc := range s.clients {
 		var lastUnix int64
 		if n := sc.lastSendNano.Load(); n != 0 {
@@ -643,7 +734,7 @@ func (s *quicServer) ClientSendStats() []transport.ClientSendStat {
 				curStallMs = uint64(d.Milliseconds())
 			}
 		}
-		stats = append(stats, transport.ClientSendStat{
+		stats = append(stats, ClientSendStat{
 			Client:                 id,
 			BytesSent:              sc.bytesSent.Load(),
 			LastSendUnix:           lastUnix,
@@ -662,13 +753,16 @@ func (s *quicServer) ClientSendStats() []transport.ClientSendStat {
 }
 
 // writeCtrl はクライアントの control bidi ストリームへ制御フレームを書く（server→client）。
-func (s *quicServer) writeCtrl(sc *serverClient, m *ctrlMsg) error {
+func (s *Server) writeCtrl(sc *serverClient, m *ctrlMsg) error {
 	sc.ctrlMu.Lock()
 	defer sc.ctrlMu.Unlock()
 	return writeFrame(sc.ctrl, m)
 }
 
-func (s *quicServer) SetServerMeta(buildID, buildTime string, instanceID []byte) {
+// SetServerMeta sets the server information announced to clients on
+// connect (build ID/time, instance ID). It is delivered over the QUIC path,
+// independent of the Unix socket.
+func (s *Server) SetServerMeta(buildID, buildTime string, instanceID []byte) {
 	s.mu.Lock()
 	s.metaBuildID = buildID
 	s.metaBuildTime = buildTime
@@ -676,14 +770,20 @@ func (s *quicServer) SetServerMeta(buildID, buildTime string, instanceID []byte)
 	s.mu.Unlock()
 }
 
-func (s *quicServer) SendSessionGone(client transport.ClientID, reason string, exitCode int) error {
+// SendSessionGone notifies the given client that the session is gone
+// (session exit, kill, or not found after a restart), even when the Unix
+// socket is dead. exitCode is the session process's exit status (-1 =
+// unknown); when >= 0 the client adopts it as its own exit status.
+// finalOffset is the offset of the session's last output (0 = unknown), which
+// the client renders before it exits.
+func (s *Server) SendSessionGone(client ClientID, reason string, exitCode int, finalOffset uint64) error {
 	s.mu.Lock()
 	sc := s.clients[client]
 	s.mu.Unlock()
 	if sc == nil {
 		return nil
 	}
-	m := &ctrlMsg{Type: ctrlSessionGone, Msg: reason}
+	m := &ctrlMsg{Type: ctrlSessionGone, Msg: reason, FinalOffset: finalOffset}
 	if exitCode >= 0 {
 		ec := int32(exitCode)
 		m.ExitCode = &ec
@@ -691,7 +791,9 @@ func (s *quicServer) SendSessionGone(client transport.ClientID, reason string, e
 	return s.writeCtrl(sc, m)
 }
 
-func (s *quicServer) SendStatus(client transport.ClientID, msg string) error {
+// SendStatus sends a status message to the given client, for example when
+// resync after a reconnect cannot fill an output gap (prompting a redraw).
+func (s *Server) SendStatus(client ClientID, msg string) error {
 	s.mu.Lock()
 	sc := s.clients[client]
 	s.mu.Unlock()
@@ -701,36 +803,67 @@ func (s *quicServer) SendStatus(client transport.ClientID, msg string) error {
 	return s.writeCtrl(sc, &ctrlMsg{Type: ctrlStatus, Msg: msg})
 }
 
-func (s *quicServer) Input() <-chan transport.Input   { return s.input }
-func (s *quicServer) Resize() <-chan transport.Resize { return s.resize }
+// Resize delivers terminal resize requests from all clients.
+func (s *Server) Resize() <-chan Resize { return s.resize }
 
-func (s *quicServer) OnClientConnect(fn func(transport.ClientID)) {
+// OnInput registers the callback that receives client input; register it
+// before Start. It is called synchronously from the client's receive
+// goroutine, in order, and may block (for example while writing to a PTY that
+// is not being read). The transport then blocks only that client's receive
+// goroutine, and QUIC flow control pushes back on that connection alone; the
+// callback decides whether other clients wait for the same resource.
+func (s *Server) OnInput(fn func(Input)) {
+	s.mu.Lock()
+	s.onInput = fn
+	s.mu.Unlock()
+}
+
+// OnClientConnect registers a callback called when a client connects
+// (including reconnects).
+func (s *Server) OnClientConnect(fn func(ClientID)) {
 	s.mu.Lock()
 	s.onConnect = fn
 	s.mu.Unlock()
 }
-func (s *quicServer) OnClientExit(fn func(transport.ClientID)) {
+
+// OnClientExit registers a callback called when a client closed its
+// connection on purpose (detach, Ctrl-C, session end). It is not called on
+// network loss: such a client keeps its ClientID and comes back through
+// reconnect.
+func (s *Server) OnClientExit(fn func(ClientID)) {
 	s.mu.Lock()
 	s.onExit = fn
 	s.mu.Unlock()
 }
-func (s *quicServer) OnResyncNeeded(fn func(transport.ClientID, uint64) ([]transport.OutputChunk, error)) {
+
+// OnResyncNeeded registers the callback that supplies output from
+// fromOffset onwards when a client asks to resynchronize (after a reconnect
+// or a long sleep). The session layer owns the output buffer and returns the
+// retained chunks; the server re-sends them. The callback may return only a
+// leading batch of the range: it is called repeatedly, with fromOffset set
+// to the last returned offset + 1, until it returns an empty slice. Chunks
+// must be in ascending offset order and >= fromOffset.
+func (s *Server) OnResyncNeeded(fn func(ClientID, uint64) ([]OutputChunk, error)) {
 	s.mu.Lock()
 	s.onResync = fn
 	s.mu.Unlock()
 }
 
-func (s *quicServer) ActiveClients() []transport.ClientID {
+// ActiveClients returns the clients that currently have a registered
+// connection, including ones whose path has silently died but whose
+// connection has not yet timed out.
+func (s *Server) ActiveClients() []ClientID {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ids := make([]transport.ClientID, 0, len(s.clients))
+	ids := make([]ClientID, 0, len(s.clients))
 	for id := range s.clients {
 		ids = append(ids, id)
 	}
 	return ids
 }
 
-func (s *quicServer) Close() error {
+// Close stops the server and closes its UDP socket.
+func (s *Server) Close() error {
 	if s.cancel != nil {
 		s.cancel()
 	}
@@ -749,10 +882,3 @@ func (s *quicServer) Close() error {
 	}
 	return err
 }
-
-var (
-	_ transport.ServerTransport  = (*quicServer)(nil)
-	_ transport.ForwardingPolicy = (*quicServer)(nil)
-	_ transport.SocketHandover   = (*quicServer)(nil)
-	_ transport.Addresser        = (*quicServer)(nil)
-)

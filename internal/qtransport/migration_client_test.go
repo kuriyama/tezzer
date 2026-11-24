@@ -6,8 +6,6 @@ package qtransport
 import (
 	"context"
 	"crypto/rand"
-	"github.com/kuriyama/tezzer/internal/transport"
-	"net"
 	"testing"
 	"time"
 )
@@ -25,6 +23,7 @@ func TestQUICTransport_ClientMigration(t *testing.T) {
 		t.Fatalf("NewServer: %v", err)
 	}
 	defer srv.Close()
+	inputs := inputChan(srv)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -36,22 +35,21 @@ func TestQUICTransport_ClientMigration(t *testing.T) {
 	var off uint64
 	go func() {
 		for {
-			in, ok := <-srv.Input()
+			in, ok := <-inputs
 			if !ok {
 				return
 			}
 			off++
-			_ = srv.SendOutput(off, in.Data, []transport.ClientID{in.Client})
+			_ = srv.SendOutput(off, in.Data, []ClientID{in.Client})
 		}
 	}()
 
-	addr := srv.(interface{ Addr() net.Addr }).Addr().String()
-	cli := NewClient(k, addr, 99, "")
+	addr := srv.Addr().String()
+	cli := NewClient(ClientConfig{Key: k, Candidates: []string{addr}, ClientID: 99})
 	defer cli.Close()
 	if err := cli.Start(ctx); err != nil {
 		t.Fatalf("client Start: %v", err)
 	}
-	qc := cli.(*quicClient)
 
 	roundTrip := func(msg string) {
 		t.Helper()
@@ -76,7 +74,7 @@ func TestQUICTransport_ClientMigration(t *testing.T) {
 	// クライアント実装の migrate() が成功し、同一ストリームで往復が継続することを検証する。
 	// 注: conn.LocalAddr() は migration 中に quic-go 内部で更新されるため、ここでは読まない
 	// （-race 競合になる。LocalAddr 変化の検証は spike B が担う）。
-	if err := qc.migrate("test"); err != nil {
+	if err := cli.migrate("test"); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 
@@ -88,19 +86,19 @@ func TestQUICTransport_ClientMigration(t *testing.T) {
 	// 登録されたままの conn ごと destroy される。実機で migration 成功の 30 秒後に
 	// 必ず connection lost → reconnect していた回帰の防止）。
 	time.Sleep(3 * transportRetireGrace.Get())
-	if qc.connDead() {
+	if cli.connDead() {
 		t.Fatal("connection died after the old transport's retire grace")
 	}
 	roundTrip("after-retire-grace")
 
 	// 上限（quic-go の接続 ID 枯渇で実際に migration できなくなる回数）に達したら
 	// migrate は Probe を待たずに失敗する（recover は即 reconnect にフォールバックする）。
-	for i := len(qc.pathTransports); i < maxPathTransports; i++ {
-		if err := qc.migrate("test"); err != nil {
+	for i := len(cli.pathTransports); i < maxPathTransports; i++ {
+		if err := cli.migrate("test"); err != nil {
 			t.Fatalf("migrate #%d: %v", i+1, err)
 		}
 	}
-	if err := qc.migrate("test"); err == nil {
+	if err := cli.migrate("test"); err == nil {
 		t.Fatalf("migrate beyond %d held paths succeeded, want error", maxPathTransports)
 	}
 	roundTrip("after-cap")

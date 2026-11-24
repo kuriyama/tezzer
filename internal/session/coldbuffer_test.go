@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kuriyama/tezzer/internal/transport"
+	"github.com/kuriyama/tezzer/internal/qtransport"
 )
 
 // mkChunks は seq=start から n 個の連番チャンクを作る。
@@ -139,7 +139,7 @@ func TestOutputFromOffsetSpansTiers(t *testing.T) {
 	s.outputChunks = mkChunks(211, 10, now)
 
 	// 再接続クライアント（fromOffset=150）: cold 途中から全層
-	out, err := s.outputFromOffset(transport.ClientID{}, 150)
+	out, err := s.outputFromOffset(qtransport.ClientID{}, 150)
 	if err != nil {
 		t.Fatalf("outputFromOffset: %v", err)
 	}
@@ -153,7 +153,7 @@ func TestOutputFromOffsetSpansTiers(t *testing.T) {
 	}
 
 	// 新規クライアント（fromOffset=1）: cold は再生せず raw 層のみ
-	out, err = s.outputFromOffset(transport.ClientID{}, 1)
+	out, err = s.outputFromOffset(qtransport.ClientID{}, 1)
 	if err != nil {
 		t.Fatalf("outputFromOffset(1): %v", err)
 	}
@@ -256,7 +256,7 @@ func TestFlushColdPendingConcurrentAppend(t *testing.T) {
 
 	// スナップショットに入った分はセグメントへ、それ以降は pending に残る。
 	// 境界は競合次第だが、全体として seq 1..200 が欠損なく引けること。
-	out, err := s.outputFromOffset(transport.ClientID{}, 2)
+	out, err := s.outputFromOffset(qtransport.ClientID{}, 2)
 	if err != nil {
 		t.Fatalf("outputFromOffset: %v", err)
 	}

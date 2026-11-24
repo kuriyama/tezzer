@@ -1,13 +1,11 @@
 package main
 
 // agent.go: SSH agent forwarding（-A）のクライアント側 CLI ヘルパー。
-// 実際の dial・中継は internal/qtransport/agent.go（quicClient）が担う。ここでは
+// 実際の dial・中継は internal/qtransport/agent.go（qtransport.Client）が担う。ここでは
 // ローカル $SSH_AUTH_SOCK の解決と、サーバ非対応時の警告のみを扱う。
 
 import (
 	"os"
-
-	"github.com/kuriyama/tezzer/internal/transport"
 )
 
 // resolveLocalAgentSockPath はローカルの $SSH_AUTH_SOCK が使えそうかを確認し、
@@ -31,8 +29,8 @@ func resolveLocalAgentSockPath() string {
 // pollForFeatureSupport を共用する。
 func (c *Client) warnIfAgentForwardingUnsupported() {
 	c.pollForFeatureSupport(func() (bool, bool) {
-		af, ok := c.transport().(transport.AgentForwardClient)
-		return ok && af.AgentForwardingSupported(), c.transport() != nil
+		ct := c.transport()
+		return ct != nil && ct.AgentForwardingSupported(), ct != nil
 	},
 		"-A: server does not support agent forwarding (old server or --no-agent-forwarding)",
 		"-A: QUIC transport not established; agent forwarding unavailable")

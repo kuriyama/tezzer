@@ -8,6 +8,58 @@ once it reaches a 1.0 release.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-24
+
+### Added
+
+- After a recovery, the client says how many bytes of input did not reach
+  the session: input typed while the connection was down, and input sent
+  just before it dropped that never arrived (which used to vanish without
+  notice). `Ctrl-^ i` shows the beginning of that input for ten minutes,
+  on screen only: it is never written to the client log. When more than the
+  last 64 KB sent was lost, only the count is shown. The input is still not
+  re-sent. Detecting input that was sent but never arrived needs an updated
+  server; with an older one only the input dropped while disconnected is
+  counted.
+- `Ctrl-^ i` shows which path the session is running over in a fixed
+  two-letter column: `Q4` / `Q6` for QUIC over IPv4 / IPv6, or `UD` for the
+  Unix socket only (over SSH, when attached while UDP cannot get through). A
+  state follows when the path is not connected, e.g. `Q4 recovering`,
+  `UD connecting QUIC` or `UD retrying QUIC`. It used to print only
+  `Connected` / `Recovering` or `UDS`.
+- When QUIC still cannot be established about a minute after attaching, the
+  client says so once on the status line: `No QUIC for 1m: running over SSH
+  only (no roaming). Still retrying`. The earlier failure message was easy to
+  miss.
+
+### Changed
+
+- While QUIC is being retried in the background (every 15 seconds), only the
+  first attempt shows its candidates, state changes and failure on the status
+  line. Later attempts write them to the client log only, so the status line
+  no longer flashes every 15 seconds. The `UD retrying QUIC` column in
+  `Ctrl-^ i` still shows that retries continue. A warning that the client ID
+  could not be sent is still shown, and when a retry succeeds the message
+  names the address it connected to.
+- The example systemd unit in the README sets `OOMPolicy=continue`. With the
+  default, the OOM killer killing any program inside a session made systemd
+  stop tezzerd and lose every session. Add the line to an existing unit and
+  run `systemctl --user daemon-reload`.
+
+### Fixed
+
+- While a client is connected over QUIC, the server no longer also sends the
+  session output over the Unix socket (over SSH when remote). Every output
+  was sent both ways, doubling the bandwidth; the client drew it only once.
+  As a result, while QUIC is down but SSH is still up, new output is no
+  longer shown until QUIC recovers (it then catches up).
+- With `--udp-port`, a session whose program is not reading its input (for
+  example while a long paste waits behind a running command) no longer
+  stops keyboard input to every other session.
+- `tezzerd --check-nat` now shows the same-LAN candidates the server actually
+  advertises. With both IPv4 and IPv6 available it used to report IPv6 as
+  "not used", although both are advertised.
+
 ## [0.2.3] - 2026-11-03
 
 ### Added

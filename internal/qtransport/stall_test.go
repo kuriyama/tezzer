@@ -8,12 +8,10 @@ package qtransport
 import (
 	"context"
 	"crypto/rand"
-	"net"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/kuriyama/tezzer/internal/transport"
 	"github.com/quic-go/quic-go"
 )
 
@@ -43,18 +41,20 @@ func TestQUICTransport_StallWarnsOtherClients(t *testing.T) {
 	if err := srv.Start(ctx); err != nil {
 		t.Fatalf("server Start: %v", err)
 	}
-	addr := srv.(interface{ Addr() net.Addr }).Addr().String()
+	addr := srv.Addr().String()
 
 	// 健全なクライアント（Num 7）: 出力を読み続け、status 通知を受け取る側。
-	healthy := NewClient(k, addr, 7, "s1")
-	defer healthy.Close()
 	statusCh := make(chan string, 16)
-	healthy.OnStatusMessage(func(msg string) {
-		select {
-		case statusCh <- msg:
-		default:
-		}
+	healthy := NewClient(ClientConfig{
+		Key: k, Candidates: []string{addr}, ClientID: 7, SessionID: "s1",
+		OnStatusMessage: func(msg string) {
+			select {
+			case statusCh <- msg:
+			default:
+			}
+		},
 	})
+	defer healthy.Close()
 	if err := healthy.Start(ctx); err != nil {
 		t.Fatalf("healthy Start: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestQUICTransport_StallWarnsOtherClients(t *testing.T) {
 	// PTY reader 相当の送信ループ: Num 8 への Write がブロックするとループごと止まる。
 	go func() {
 		payload := make([]byte, 64*1024)
-		targets := []transport.ClientID{{Session: "s1", Num: 7}, {Session: "s1", Num: 8}}
+		targets := []ClientID{{Session: "s1", Num: 7}, {Session: "s1", Num: 8}}
 		for i := uint64(1); ctx.Err() == nil; i++ {
 			_ = srv.SendOutput(i, payload, targets)
 		}
@@ -112,7 +112,7 @@ func TestQUICTransport_StallWarnsOtherClients(t *testing.T) {
 	}
 
 	// 統計: 詰まっているクライアントに stall が計上され、健全な側には付かないこと。
-	var stalledStat, healthyStat transport.ClientSendStat
+	var stalledStat, healthyStat ClientSendStat
 	for _, st := range srv.ClientSendStats() {
 		switch st.Client.Num {
 		case 8:
@@ -162,7 +162,7 @@ func TestQUICTransport_StallCriticalDisconnects(t *testing.T) {
 	if err := srv.Start(ctx); err != nil {
 		t.Fatalf("server Start: %v", err)
 	}
-	addr := srv.(interface{ Addr() net.Addr }).Addr().String()
+	addr := srv.Addr().String()
 
 	// 詰まるクライアント: Hello だけ送って以後何も読まない raw QUIC 接続。
 	tlsConf, err := ClientTLS(k)
@@ -193,7 +193,7 @@ func TestQUICTransport_StallCriticalDisconnects(t *testing.T) {
 	// PTY reader 相当の送信ループ: 受信ウィンドウを吸い切ると Write がブロックする。
 	go func() {
 		payload := make([]byte, 64*1024)
-		targets := []transport.ClientID{{Session: "s1", Num: 9}}
+		targets := []ClientID{{Session: "s1", Num: 9}}
 		for i := uint64(1); ctx.Err() == nil; i++ {
 			_ = srv.SendOutput(i, payload, targets)
 			time.Sleep(time.Millisecond) // 切断後の空回りを抑える

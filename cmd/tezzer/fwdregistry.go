@@ -224,6 +224,7 @@ func formatForwardRegistry(entries []fwdRegistryEntry) string {
 	return b.String()
 }
 
+// shortSessionID は表示用に session ID を先頭 6 文字に縮める（Ctrl-^ i と -list-forwards で共通）。
 func shortSessionID(id string) string {
 	if len(id) > 6 {
 		return id[:6]
